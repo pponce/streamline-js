@@ -35,7 +35,7 @@ test('only the loaded compatible plugin activates Auto Calc', () => {
 
 function harness() {
     let now = 1000;
-    let result = { durationSeconds: 30, milkGrams: 180, jug: 'small', calibrationRevision: 'v1', workflowPatch: { steamSettings: { duration: 30 } } };
+    let result = { apiVersion: 2, durationSeconds: 30, milkGrams: 180, jug: 'small', calibrationRevision: 'v1', workflowPatch: { steamSettings: { duration: 30, flow: 1.5, targetTemperature: 150 } } };
     let workflow = { id: 'one', profile: { title: 'A' }, steamSettings: { flow: 1.5, targetTemperature: 150, duration: 25, stopAtTemperature: 0 } };
     let state = 'idle';
     let failWrite = false;
@@ -49,7 +49,7 @@ function harness() {
             if (body.machineState !== 'idle') throw new Error('Machine not idle');
             return structuredClone(result);
         },
-        apply: async duration => { if (failWrite) throw new Error('Write failed'); writes.push(duration); },
+        apply: async result => { if (failWrite) throw new Error('Write failed'); writes.push(result.durationSeconds); },
         now: () => now,
     });
     return { controller, writes, changeResult: value => result = { ...result, ...value },
@@ -57,7 +57,7 @@ function harness() {
         failWrite: () => failWrite = true, disable: () => failCalculation = true, time: value => now = value };
 }
 
-test('preview never writes; applying rechecks and writes only the duration', async () => {
+test('preview never writes; applying rechecks and returns the verified calculation', async () => {
     const h = harness();
     const preview = await h.controller.preview('auto');
     assert.deepEqual(h.writes, []);

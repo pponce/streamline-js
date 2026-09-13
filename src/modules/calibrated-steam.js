@@ -56,7 +56,8 @@ export function createCalibratedSteamController({ getContext, getSamples, calcul
             !Number.isFinite(newestAge) || newestAge + receivedAt - sampledAt > 1500) {
             throw new Error('Scale or machine observations expired. Calculate again.');
         }
-        if (!Number.isInteger(result?.durationSeconds) || result.durationSeconds < 1 || result.durationSeconds > 255 || !Number.isFinite(result.milkGrams)) {
+        if (result?.apiVersion !== 2 || !Number.isFinite(result.workflowPatch?.steamSettings?.flow) ||
+            !Number.isInteger(result.workflowPatch?.steamSettings?.targetTemperature) || !Number.isInteger(result?.durationSeconds) || result.durationSeconds < 1 || result.durationSeconds > 255 || !Number.isFinite(result.milkGrams)) {
             throw new Error('The plugin returned an invalid calculation.');
         }
         return { result, jug, token, createdAt: now(), workflowKey: JSON.stringify(workflow) };
@@ -81,7 +82,7 @@ export function createCalibratedSteamController({ getContext, getSamples, calcul
                     throw new Error('The scale, jug or settings changed. Calculate again.');
                 }
                 check(preview.token);
-                await apply(next.durationSeconds);
+                await apply(next);
                 generation++;
                 return next;
             } finally { applying = false; }

@@ -15,7 +15,7 @@ function openNumpadModal(...args) {
         module.openModal(...args);
     });
 }
-import { getSupportedLanguages, getCurrentLanguage, setLanguage, getTranslation } from './i18n.js';
+import { getSupportedLanguages, getCurrentLanguage, setLanguage, getTranslation, fitTextToWidth } from './i18n.js';
 import { getTotalTime as getShotTotalTime } from './shotData.js';
 import { formatTemp, fromDisplayTemp, displayStepToCelsius, boundToDisplay, getTempUnit } from './units.js';
 
@@ -81,6 +81,9 @@ let steamMode = 'time'; // 'time' | 'flow' | 'temperature' (temperature = milk a
 let calibratedSteam = null;
 let calibratedSteamAvailable = false;
 let calibratedSteamApplying = false;
+let calibratedSteamJug = 'auto';
+
+export function isAutoSteamMode() { return steamMode === 'auto' || calibratedSteamApplying; }
 let currentMilkStop = 60; // milk auto-stop target °C (workflow.stopAtTemperature)
 let milkProbePresent = false; // live probe presence, fed by app.js (setMilkProbePresent)
 let milkStopArmed = false;    // workflow stopAtTemperature > 0, as last seen/written
@@ -295,6 +298,7 @@ function makeEditable(element, onCommit) {
     if (shouldUseNumpad()) return;
     
     element.addEventListener('click', () => {
+        if (['steam-duration-value', 'steam-flow-value'].includes(element.id) && isAutoSteamMode()) return;
         if (element.parentNode.querySelector('input')) return;
 
         let isProcessed = false;
@@ -659,6 +663,7 @@ function updateSteamModeOptions(milkAvailable) {
 export function setMilkProbePresent(present) {
     if (present === milkProbePresent) return;
     milkProbePresent = present;
+    if (isAutoSteamMode()) return;
     if (!isBengleMachine()) return; // milk stop is Bengle-only; the tile pair is Time|Flow regardless
     const fallback = readSteamStopFallback();
     if (!present && (milkStopArmed || steamMode === 'temperature')) {
@@ -723,11 +728,19 @@ export function updateSteamDisplay(data) {
     if (data.stopAtTemperature !== undefined) {
         milkStopArmed = data.stopAtTemperature > 0;
         if (milkStopArmed) currentMilkStop = Math.round(data.stopAtTemperature);
-        steamMode = resolveSteamTileMode(
+        if (steamMode !== 'auto') steamMode = resolveSteamTileMode(
             steamMode, isBengleMachine() && milkProbePresent, milkStopArmed, readSteamStopFallback());
     }
 
-    if (calibratedSteamAvailable) steamMode = 'time';
+    document.querySelectorAll('[data-steam-mode]').forEach(label => {
+        const selected = label.dataset.steamMode === steamMode || (label.dataset.steamMode === 'time' && steamMode === 'temperature');
+        label.style.color = selected ? 'var(--mimoja-blue-v2)' : '';
+        if (label.dataset.steamMode === 'time') {
+            const milk = isBengleMachine() && milkProbePresent;
+            label.textContent = milk ? 'M' : 'T';
+            label.title = getTranslation(milk ? 'Milk' : 'Time');
+        }
+    });
     flowEl.textContent = `${currentSteamFlow.toFixed(1)}`;
     const ACTIVE = 'text-[var(--mimoja-blue-v2)]';
     const INACTIVE = 'text-[var(--low-contrast-white)]';
@@ -742,7 +755,7 @@ export function updateSteamDisplay(data) {
         if (modeMilkEl) modeMilkEl.className = ACTIVE;
         modeTimeEl.className = INACTIVE;
         modeFlowEl.className = INACTIVE;
-    } else if (steamMode === 'time') {
+    } else if (steamMode === 'time' || steamMode === 'auto') {
         durationEl.textContent = formatSteamDuration(currentSteamDuration);
         durationEl.classList.remove('text-[20px]');
         durationEl.classList.add('text-[26px]', 'font-bold', 'text-[var(--text-primary)]');
@@ -818,6 +831,7 @@ export function pushSteamSetting(field, promise) {
 }
 
 async function runSteamSyncRetry() {
+    if (isAutoSteamMode()) return;
     try {
         await resyncSteamFromStore();
         applySteamSyncEvent({ type: 'retry-ok' });
@@ -833,6 +847,7 @@ async function runSteamSyncRetry() {
 }
 
 function scheduleSteamApi() {
+    if (isAutoSteamMode()) return;
     markTileInteraction();
     clearTimeout(steamApiDebounce);
     steamApiDebounce = setTimeout(() => {
@@ -853,6 +868,7 @@ function scheduleSteamApi() {
 }
 
 function syncSteamPresets() {
+    if (steamMode === 'auto') { updateSteamPresetDisplay(); return; }
     if (steamMode === 'temperature') {
         syncPresetHighlight(document.getElementById('steam-milk-presets'), t => t === formatTemp(currentMilkStop, 0));
     } else if (steamMode === 'time') {
@@ -863,7 +879,7 @@ function syncSteamPresets() {
 }
 
 function incrementSteam() {
-    if (calibratedSteamApplying) return;
+    if (isAutoSteamMode()) return;
     const steamPlusBtn = document.getElementById('steam-plus');
     if (steamPlusBtn) { flashPlusMinusButton(steamPlusBtn); }
     if (steamMode === 'time') {
@@ -881,7 +897,7 @@ function incrementSteam() {
 }
 
 function decrementSteam() {
-    if (calibratedSteamApplying) return;
+    if (isAutoSteamMode()) return;
     const steamMinusBtn = document.getElementById('steam-minus');
     if (steamMinusBtn) { flashPlusMinusButton(steamMinusBtn); }
     if (steamMode === 'time') {
@@ -907,7 +923,25 @@ function updateSteamPresetDisplay() {
     const timePresetContainer = document.getElementById('steam-presets');
     const flowPresetContainer = document.getElementById('steam-flow-presets');
     const milkPresetContainer = document.getElementById('steam-milk-presets');
+    const autoPresetContainer = document.getElementById('steam-auto-presets');
+    autoPresetContainer?.classList.toggle('hidden', steamMode !== 'auto');
+    document.querySelectorAll('[data-auto-jug]').forEach(button => {
+        const selected = button.dataset.autoJug === calibratedSteamJug;
+        button.classList.toggle('preset-active', selected);
+        button.setAttribute('aria-pressed', String(selected));
+        button.disabled = calibratedSteamApplying;
+    });
+    for (const id of ['steam-minus', 'steam-plus']) {
+        const button = document.getElementById(id);
+        if (button) button.disabled = isAutoSteamMode();
+    }
     if (!timePresetContainer || !flowPresetContainer) return;
+    if (steamMode === 'auto') {
+        timePresetContainer.classList.add('hidden');
+        flowPresetContainer.classList.add('hidden');
+        milkPresetContainer?.classList.add('hidden');
+        return;
+    }
 
     if (steamMode === 'temperature') {
         // Milk stop-target presets — same presentation as the Time presets.
@@ -1148,7 +1182,7 @@ export async function setSteamFlowPresetsFromMachineModel(model) {
     const bengle = isBengleModel(model);
     const milkAvailable = bengle && milkProbePresent;
     updateSteamModeOptions(milkAvailable);
-    steamMode = resolveSteamTileMode(steamMode, milkAvailable, milkStopArmed, readSteamStopFallback());
+    if (steamMode !== 'auto') steamMode = resolveSteamTileMode(steamMode, milkAvailable, milkStopArmed, readSteamStopFallback());
     try {
         await openDB();
         const baseline = resolveSteamFlowPresetsForModel(model);
@@ -1207,9 +1241,28 @@ export async function setSteamFlowPresetsFromMachineModel(model) {
     }
 }
 
-function toggleSteamMode() {
-    if (calibratedSteamAvailable) {
-        calibratedSteam?.open().catch(error => showToast(error.message, 4000, 'error'));
+async function toggleSteamMode() {
+    if (calibratedSteamApplying) return;
+    if (calibratedSteamAvailable || steamMode === 'auto') {
+        const manualTime = isBengleMachine() && milkProbePresent ? 'temperature' : 'time';
+        const next = steamMode === 'auto' ? 'flow' : steamMode === 'flow' ? manualTime : 'auto';
+        try {
+            clearTimeout(steamApiDebounce);
+            clearTimeout(steamSyncRetryTimer);
+            if (next === 'auto') {
+                await calibratedSteam.enter();
+                steamMode = 'auto';
+                milkStopLostToProbe = false;
+            } else {
+                if (steamMode === 'auto') await calibratedSteam.leave();
+                steamMode = next;
+                milkStopArmed = next === 'temperature';
+                await setStopAtTemperature(milkStopArmed ? currentMilkStop : 0);
+                recordSteamStopMode(milkStopArmed ? 'temperature' : (readSteamStopFallback() === 'off' ? 'off' : 'time'));
+            }
+        } catch (error) { showToast(error.message, 5000, 'error'); }
+        updateSteamDisplay({});
+        updateSteamPresetDisplay();
         return;
     }
     // Milk is only in the cycle while it's usable (Bengle + probe present);
@@ -2255,29 +2308,57 @@ export function initUI(callbacks) {
             const standard = document.getElementById('steam-mode-standard');
             const auto = document.getElementById('steam-mode-auto');
             if (standard) standard.style.display = available ? 'none' : '';
-            if (auto) auto.style.display = available ? '' : 'none';
-            steamModeToggle?.setAttribute('aria-label', getTranslation(available ? 'Calculate steam time' : 'Toggle Steam Mode'));
-            steamMode = available ? 'time' : resolveSteamTileMode(steamMode, isBengleMachine() && milkProbePresent, milkStopArmed, readSteamStopFallback());
+            if (auto) {
+                auto.style.display = available ? 'inline-block' : 'none';
+                if (available) fitTextToWidth(auto);
+            }
+            steamModeToggle?.setAttribute('aria-label', getTranslation(available ? 'Cycle Auto, Flow and Time' : 'Toggle Steam Mode'));
             updateSteamDisplay({});
             updateSteamPresetDisplay();
         },
-        onApplying(value) {
-            calibratedSteamApplying = value;
-            if (value) clearTimeout(steamApiDebounce);
+        onChange(state) {
+            calibratedSteamApplying = state.busy;
+            calibratedSteamJug = state.jug;
+            if (state.active) steamMode = 'auto';
+            else if (steamMode === 'auto') steamMode = 'time';
+            if (state.busy) {
+                clearTimeout(steamApiDebounce);
+                clearTimeout(steamSyncRetryTimer);
+            }
+            updateSteamDisplay({});
+            updateSteamPresetDisplay();
         },
-        onApplied(duration) {
-            currentSteamDuration = duration;
-            applySteamSyncEvent({ type: 'push-ok', field: 'duration' });
-            updateSteamDisplay({ targetSteamDuration: duration });
-            syncSteamPresets();
-            window.app?.saveContextToActiveProfile?.({ targetSteamDuration: duration });
+        onSteamSettings(steam) {
+            updateSteamDisplay({ targetSteamDuration: steam.duration, targetSteamFlow: steam.flow, stopAtTemperature: steam.stopAtTemperature });
+            updateSteamPresetDisplay();
         },
+        onError(error) { showToast(error.message, 5000, 'error'); },
     });
+    for (const button of document.querySelectorAll('[data-auto-jug]')) {
+        button.onclick = async () => {
+            try {
+                const result = await calibratedSteam.select(button.dataset.autoJug);
+                const jug = result.jugSource === 'tared' ? getTranslation('Milk only') : getTranslation(result.jug);
+                showToast(`${jug} · ${result.milkGrams} g · ${result.durationSeconds} s`, 4000);
+            } catch (error) { showToast(error.message, 5000, 'error'); }
+        };
+    }
+    const steamLabel = document.getElementById('steam-label');
+    if (steamLabel) {
+        steamLabel.style.cursor = 'pointer';
+        steamLabel.setAttribute('role', 'button');
+        steamLabel.setAttribute('tabindex', '0');
+        steamLabel.onclick = toggleSteamMode;
+        steamLabel.onkeydown = event => {
+            if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); toggleSteamMode(); }
+        };
+    }
 
     updateDrinkRatio(); // Initial calculation
 }
 
 export function updateSleepButton(state) {
+    calibratedSteam?.observeMachine(state);
     currentMachineState = state;
     const sleepButton = document.getElementById('sleep-button');
     if (sleepButton) {

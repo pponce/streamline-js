@@ -441,7 +441,20 @@ async function mountMaintenanceCategory(category, container) {
     }
 }
 
+let autoSteamCleanup = null;
+let autoSteamSequence = 0;
+
+async function mountAutoSteamCategory(container) {
+    const sequence = autoSteamSequence;
+    const module = await import('./categories/auto-steam.js');
+    if (sequence !== autoSteamSequence) return;
+    autoSteamCleanup = module.mountSettingsCategory({ container });
+}
+
 function updateSettingsContentArea(category) {
+    autoSteamSequence++;
+    autoSteamCleanup?.();
+    autoSteamCleanup = null;
     // Always tear the previous maintenance mount down, including when moving
     // between two maintenance pages — its poller and listeners are per-mount.
     maintenanceSequence += 1;
@@ -495,6 +508,7 @@ function updateSettingsContentArea(category) {
                 ui.initThemeToggle();
             }, 100);
         }
+        if (category === 'autosteam') mountAutoSteamCategory(contentArea).catch(error => logger.error(error));
         if (category === 'plugins') {
             setTimeout(() => window.loadPluginList?.(), 0);
         }
@@ -774,6 +788,8 @@ export function renderSettingsContent(category) {
         case 'language':
         case 'selectlanguage':
             return renderLanguageSettings();
+        case 'autosteam':
+            return '';
         case 'plugins':
             return renderPluginManagerSettings();
         case 'shotupload':
@@ -9347,6 +9363,9 @@ function setupSettingsSearch(activateResult) {
 }
 
 export function cleanupSettings() {
+    autoSteamSequence++;
+    autoSteamCleanup?.();
+    autoSteamCleanup = null;
     stopCupWarmerPoll();
     clearTimeout(_settingsNumpadTimer);
     _settingsNumpadTimer = null;

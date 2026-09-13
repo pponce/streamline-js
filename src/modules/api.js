@@ -2,6 +2,7 @@ import * as ui from './ui.js';
 import { logger ,setDebug} from './logger.js';
 import { createSocketSlot } from './socket-slot.js';
 import { CALIBRATED_STEAM_PLUGIN, createScaleSampleBuffer } from './calibrated-steam.js';
+import { AUTO_STEAM_SESSION_KEY, readAutoSteamSession } from './auto-steam-session.js';
 import { openDB, getSetting, setSetting } from './idb.js';
 import { buildCalibrateBody, classifyCalState } from './loadcell-cal.js';
 import { deriveDisplayAction, isScreensaverSuppressed } from './screensaver-policy.js';
@@ -1540,7 +1541,9 @@ export async function readSharedValue(key) {
 // is the source of truth so a phone and a tablet agree on the target;
 // IndexedDB is only consulted if the store can't be reached.
 export async function resyncIfDrifted(key, fetchedValue, pushFn) {
+    if (isAutoSteamActive() && [STEAM_DURATION_LAST_VALUE_KEY, STEAM_FLOW_LAST_VALUE_KEY, MILK_STOP_LAST_VALUE_KEY].includes(key)) return null;
     const remembered = await readSharedValue(key);
+    if (isAutoSteamActive() && [STEAM_DURATION_LAST_VALUE_KEY, STEAM_FLOW_LAST_VALUE_KEY, MILK_STOP_LAST_VALUE_KEY].includes(key)) return null;
     // No record of the user ever setting this -> whatever the machine holds
     // stands. Otherwise the remembered value wins, INCLUDING when the workflow
     // has no value at all (fetchedValue null/undefined): a missing field is not
@@ -1629,16 +1632,26 @@ async function steamHeaterFor(duration) {
 // Writing it first makes the store the record of intent, which is what
 // resyncSteamFromStore replays when a push doesn't land.
 export async function setTargetSteamDuration(duration) {
+    if (isAutoSteamActive()) throw new Error('Use a jug preset in Auto mode, or switch to Flow or Time.');
     const value = parseFloat(duration);
     await persistSharedValue(STEAM_DURATION_LAST_VALUE_KEY, value);
     return updateWorkflow({ steamSettings: { duration: value, ...(await steamHeaterFor(value)) } });
 }
 
-export async function setCalibratedSteamDuration(duration) {
-    if (!Number.isInteger(duration) || duration < 1 || duration > 255) throw new Error('Invalid calibrated steam duration.');
-    const result = await updateWorkflow({ steamSettings: { duration } });
-    await persistSharedValue(STEAM_DURATION_LAST_VALUE_KEY, duration);
-    return result;
+export function isAutoSteamActive() {
+    return readAutoSteamSession(localStorage.getItem(AUTO_STEAM_SESSION_KEY)).active === true;
+}
+
+export async function writeAutoSteamSettings(steam) {
+    const { duration, flow, targetTemperature, stopAtTemperature } = steam;
+    if (!Number.isInteger(duration) || duration < 0 || duration > 255 ||
+        !Number.isFinite(flow) || flow < 0 || flow > 2.5 ||
+        !Number.isInteger(targetTemperature) || targetTemperature < 0 || targetTemperature > 165 ||
+        (stopAtTemperature !== undefined && (!Number.isFinite(stopAtTemperature) || stopAtTemperature < 0 || stopAtTemperature > 80))) {
+        throw new Error('Invalid Auto steam settings.');
+    }
+    return updateWorkflow({ steamSettings: { duration, flow, targetTemperature,
+        ...(stopAtTemperature === undefined ? {} : { stopAtTemperature }) } });
 }
 
 // Steam-heater switch for procedures that must not run against a hot steam
@@ -1650,6 +1663,7 @@ export async function setSteamHeaterEnabled(enabled) {
 }
 
 export async function setTargetSteamFlow(flow) {
+    if (isAutoSteamActive()) throw new Error('Use a jug preset in Auto mode, or switch to Flow or Time.');
     const value = parseFloat(flow);
     await persistSharedValue(STEAM_FLOW_LAST_VALUE_KEY, value);
     return updateWorkflow({ steamSettings: { flow: value } });
