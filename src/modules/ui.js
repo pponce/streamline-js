@@ -5,6 +5,7 @@ import { isBengleMachine, isBengleModel } from './machine.js';
 import { STEAM_FLOW_PRESETS_BY_MODEL, MILK_STOP_PRESETS, resolveSteamFlowPresetsForModel, resolveSteamTileMode, milkTelemetryValue, steamFlowHighlightIndex, STEAM_SYNC_SYNCED, steamSyncField, foldSteamSyncState, shouldRetrySteamSync } from './steam-mode.js';
 import { shouldUseNumpad } from './numpad-policy.js';
 import { openContextMenu } from './context-menu.js';
+import { initCalibratedSteam } from './calibrated-steam-ui.js';
 import { logger } from './logger.js';
 import * as chart from './chart.js';
 
@@ -77,6 +78,9 @@ const DEFAULT_HOT_WATER_VOL_PRESETS = [50, 100, 150, 200];
 let currentSteamDuration = 0;
 let currentSteamFlow = 1.5;
 let steamMode = 'time'; // 'time' | 'flow' | 'temperature' (temperature = milk auto-stop, Bengle only)
+let calibratedSteam = null;
+let calibratedSteamAvailable = false;
+let calibratedSteamApplying = false;
 let currentMilkStop = 60; // milk auto-stop target °C (workflow.stopAtTemperature)
 let milkProbePresent = false; // live probe presence, fed by app.js (setMilkProbePresent)
 let milkStopArmed = false;    // workflow stopAtTemperature > 0, as last seen/written
@@ -723,6 +727,7 @@ export function updateSteamDisplay(data) {
             steamMode, isBengleMachine() && milkProbePresent, milkStopArmed, readSteamStopFallback());
     }
 
+    if (calibratedSteamAvailable) steamMode = 'time';
     flowEl.textContent = `${currentSteamFlow.toFixed(1)}`;
     const ACTIVE = 'text-[var(--mimoja-blue-v2)]';
     const INACTIVE = 'text-[var(--low-contrast-white)]';
@@ -858,6 +863,7 @@ function syncSteamPresets() {
 }
 
 function incrementSteam() {
+    if (calibratedSteamApplying) return;
     const steamPlusBtn = document.getElementById('steam-plus');
     if (steamPlusBtn) { flashPlusMinusButton(steamPlusBtn); }
     if (steamMode === 'time') {
@@ -875,6 +881,7 @@ function incrementSteam() {
 }
 
 function decrementSteam() {
+    if (calibratedSteamApplying) return;
     const steamMinusBtn = document.getElementById('steam-minus');
     if (steamMinusBtn) { flashPlusMinusButton(steamMinusBtn); }
     if (steamMode === 'time') {
@@ -1201,6 +1208,10 @@ export async function setSteamFlowPresetsFromMachineModel(model) {
 }
 
 function toggleSteamMode() {
+    if (calibratedSteamAvailable) {
+        calibratedSteam?.open().catch(error => showToast(error.message, 4000, 'error'));
+        return;
+    }
     // Milk is only in the cycle while it's usable (Bengle + probe present);
     // without the probe the tile cycles Time|Flow like a non-Bengle.
     const modes = (isBengleMachine() && milkProbePresent) ? ['temperature', 'flow'] : ['time', 'flow'];
@@ -2236,6 +2247,32 @@ export function initUI(callbacks) {
         steamModeToggle.addEventListener('click', toggleSteamMode);
         steamModeToggle.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleSteamMode(); } });
     }
+
+    calibratedSteam?.dispose();
+    calibratedSteam = initCalibratedSteam({
+        onAvailability(available) {
+            calibratedSteamAvailable = available;
+            const standard = document.getElementById('steam-mode-standard');
+            const auto = document.getElementById('steam-mode-auto');
+            if (standard) standard.style.display = available ? 'none' : '';
+            if (auto) auto.style.display = available ? '' : 'none';
+            steamModeToggle?.setAttribute('aria-label', getTranslation(available ? 'Calculate steam time' : 'Toggle Steam Mode'));
+            steamMode = available ? 'time' : resolveSteamTileMode(steamMode, isBengleMachine() && milkProbePresent, milkStopArmed, readSteamStopFallback());
+            updateSteamDisplay({});
+            updateSteamPresetDisplay();
+        },
+        onApplying(value) {
+            calibratedSteamApplying = value;
+            if (value) clearTimeout(steamApiDebounce);
+        },
+        onApplied(duration) {
+            currentSteamDuration = duration;
+            applySteamSyncEvent({ type: 'push-ok', field: 'duration' });
+            updateSteamDisplay({ targetSteamDuration: duration });
+            syncSteamPresets();
+            window.app?.saveContextToActiveProfile?.({ targetSteamDuration: duration });
+        },
+    });
 
     updateDrinkRatio(); // Initial calculation
 }

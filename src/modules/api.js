@@ -1,6 +1,7 @@
 import * as ui from './ui.js';
 import { logger ,setDebug} from './logger.js';
 import { createSocketSlot } from './socket-slot.js';
+import { CALIBRATED_STEAM_PLUGIN, createScaleSampleBuffer } from './calibrated-steam.js';
 import { openDB, getSetting, setSetting } from './idb.js';
 import { buildCalibrateBody, classifyCalState } from './loadcell-cal.js';
 import { deriveDisplayAction, isScreensaverSuppressed } from './screensaver-policy.js';
@@ -39,6 +40,27 @@ export let reconnectingWebSocket = null; // Exporting for app.js access
 export let currentMachineState = null;
 let previousMachineState = null;
 let scaleWebSocket = null;
+const calibratedSteamSamples = createScaleSampleBuffer();
+
+export function getCalibratedSteamSamples() {
+    return calibratedSteamSamples.read();
+}
+
+export async function calibratedSteamRequest(endpoint, body) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    try {
+        const response = await fetch(`${API_BASE_URL}/plugins/${CALIBRATED_STEAM_PLUGIN}/${endpoint}`, {
+            method: body === undefined ? 'GET' : 'POST',
+            headers: { 'content-type': 'application/json' },
+            ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+            signal: controller.signal,
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.message || data.error || 'Enable the calibrated steam extension in Plugins.');
+        return data;
+    } finally { clearTimeout(timeout); }
+}
 let sensorSnapshotWebSocket = null;
 let sensorSnapshotWebSocketId = null; // sensor `id` the open socket is bound to
 let displayWebSocket = null;
@@ -500,6 +522,7 @@ export function connectWebSocket(onData, onReconnect) {
 }
 
 export function connectScaleWebSocket(onData, onReconnect, onDisconnect) {
+    calibratedSteamSamples.clear();
     if (scaleWebSocket) {
         logger.info('Closing existing scale WebSocket before creating a new one.');
         scaleWebSocket.close();
@@ -510,6 +533,7 @@ export function connectScaleWebSocket(onData, onReconnect, onDisconnect) {
     });
 
     scaleWebSocket.onopen = () => {
+        calibratedSteamSamples.clear();
         logger.info('Scale WebSocket (re)connected.');
         if (onReconnect) {
             onReconnect();
@@ -520,12 +544,15 @@ export function connectScaleWebSocket(onData, onReconnect, onDisconnect) {
         try {
             const data = JSON.parse(event.data);
             if (data.status === 'disconnected') {
+                calibratedSteamSamples.clear();
                 logger.info('Scale disconnected (server status frame).');
                 if (onDisconnect) onDisconnect();
             } else if (data.status === 'connected') {
+                calibratedSteamSamples.clear();
                 logger.info('Scale connected (server status frame).');
                 if (onReconnect) onReconnect();
             } else {
+                calibratedSteamSamples.push(data);
                 onData(data);
             }
         } catch (error) {
@@ -534,6 +561,7 @@ export function connectScaleWebSocket(onData, onReconnect, onDisconnect) {
     };
 
     scaleWebSocket.onclose = () => {
+        calibratedSteamSamples.clear();
         logger.info('Scale WebSocket disconnected.');
         if (onDisconnect) {
             onDisconnect();
@@ -1604,6 +1632,13 @@ export async function setTargetSteamDuration(duration) {
     const value = parseFloat(duration);
     await persistSharedValue(STEAM_DURATION_LAST_VALUE_KEY, value);
     return updateWorkflow({ steamSettings: { duration: value, ...(await steamHeaterFor(value)) } });
+}
+
+export async function setCalibratedSteamDuration(duration) {
+    if (!Number.isInteger(duration) || duration < 1 || duration > 255) throw new Error('Invalid calibrated steam duration.');
+    const result = await updateWorkflow({ steamSettings: { duration } });
+    await persistSharedValue(STEAM_DURATION_LAST_VALUE_KEY, duration);
+    return result;
 }
 
 // Steam-heater switch for procedures that must not run against a hot steam

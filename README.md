@@ -378,6 +378,11 @@ blocked until one is connected — from the Coffee button and the keyboard short
 
 ## 9. Steam, hot water, and flush
 
+With Decaid's optional **Calibrated Steam Timer** plugin enabled, **Auto Calc**
+replaces the steam Time/Flow selector. It estimates time from milk weight and your
+calibration, with automatic jug selection inspired by Damian's DSx2. See the
+[setup and usage guide](docs/calibrated-steam.md).
+
 **Steam.** Set the value in the left column (tap the *Steam* label to switch between temperature,
 duration and flow). Start from the GHC or the **Steam** button. Steam stops on its duration limit,
 or when you stop it.
