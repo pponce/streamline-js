@@ -43,7 +43,11 @@ export function initCalibratedSteam({ onAvailability, onChange, onSteamSettings,
             const available = isCalibratedSteamAvailable(plugins);
             onAvailability(available);
             if (!available) await session.disable();
-            else if (!resumed && session.snapshot().active) {
+            else if (!session.snapshot().active) {
+                const status = await calibratedSteamRequest('status');
+                if (!disposed) session.updateStatus(status);
+                resumed = true;
+            } else if (!resumed && session.snapshot().active) {
                 await session.enter();
                 resumed = true;
             } else {

@@ -6,12 +6,13 @@ function harness(saved = null) {
     let machine = 'idle';
     let workflow = { steamSettings: { duration: 45, flow: 0.6, targetTemperature: 150, stopAtTemperature: 0 } };
     let fail = false;
+    let status = { apiVersion: 2, ready: true, availablePitchers: ['small', 'medium', 'large', 'auto'], settings: { referenceFlow: 0.8 } };
     const writes = [];
     let stored = saved;
     const session = createAutoSteamSession({
         saved,
         getContext: async () => ({ workflow: structuredClone(workflow), machine: { state: machine } }),
-        getStatus: async () => ({ apiVersion: 2, ready: true, settings: { referenceFlow: 0.8 } }),
+        getStatus: async () => status,
         write: async steam => { writes.push(structuredClone(steam)); workflow.steamSettings = { ...workflow.steamSettings, ...steam }; },
         calculate: async jug => {
             if (fail) throw new Error('Unstable scale');
@@ -20,7 +21,7 @@ function harness(saved = null) {
         persist: value => { stored = structuredClone(value); },
         onChange: () => {},
     });
-    return { session, writes, stored: () => stored, machine: value => { machine = value; return session.observeMachine(value); }, fail: () => fail = true };
+    return { session, writes, status: value => { status = value; }, stored: () => stored, machine: value => { machine = value; return session.observeMachine(value); }, fail: () => fail = true };
 }
 
 test('Auto enters Off at calibration flow, remembers manual settings and restores them on exit', async () => {
@@ -112,4 +113,30 @@ test('settings refresh resets an armed timer and preserves the selected jug', as
     await h.session.invalidate();
     assert.equal(h.writes.at(-1).duration, 0);
     assert.equal(h.stored().jug, 'large');
+});
+
+
+test('unconfigured Auto stays Off and exposes no pitcher presets', async () => {
+    const h = harness();
+    h.status({ apiVersion: 2, ready: false, settings: {}, availablePitchers: [] });
+    await h.session.enter();
+    assert.equal(h.writes.at(-1).duration, 0);
+    assert.equal(h.session.snapshot().configurationReady, false);
+    assert.deepEqual(h.session.snapshot().availablePitchers, []);
+    await assert.rejects(h.session.select('small'), /calibration/);
+    assert.equal(h.writes.at(-1).duration, 0);
+    await h.session.leave();
+    assert.equal(h.writes.at(-1).duration, 45);
+});
+
+test('removed saved pitcher falls back to configured default and cannot be calculated', async () => {
+    const h = harness({ jug: 'auto' });
+    h.status({ apiVersion: 2, ready: true, settings: { defaultJug: 'medium' }, availablePitchers: ['medium'] });
+    await h.session.enter();
+    assert.equal(h.session.snapshot().jug, 'medium');
+    assert.deepEqual(h.session.snapshot().availablePitchers, ['medium']);
+    await assert.rejects(h.session.select('auto'), /configured pitcher/);
+    assert.equal(h.writes.at(-1).duration, 0);
+    await h.session.select('medium');
+    assert.equal(h.writes.at(-1).duration, 30);
 });

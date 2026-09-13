@@ -81,7 +81,9 @@ let steamMode = 'time'; // 'time' | 'flow' | 'temperature' (temperature = milk a
 let calibratedSteam = null;
 let calibratedSteamAvailable = false;
 let calibratedSteamApplying = false;
-let calibratedSteamJug = 'auto';
+let calibratedSteamJug = null;
+let calibratedSteamPitchers = [];
+let calibratedSteamConfigured = false;
 
 export function isAutoSteamMode() { return steamMode === 'auto' || calibratedSteamApplying; }
 let currentMilkStop = 60; // milk auto-stop target °C (workflow.stopAtTemperature)
@@ -929,8 +931,11 @@ function updateSteamPresetDisplay() {
         const selected = button.dataset.autoJug === calibratedSteamJug;
         button.classList.toggle('preset-active', selected);
         button.setAttribute('aria-pressed', String(selected));
-        button.disabled = calibratedSteamApplying;
+        button.style.display = calibratedSteamPitchers.includes(button.dataset.autoJug) ? '' : 'none';
+        button.disabled = calibratedSteamApplying || !calibratedSteamConfigured;
     });
+    const setup = document.getElementById('steam-auto-setup');
+    if (setup) setup.style.display = calibratedSteamPitchers.length ? 'none' : '';
     for (const id of ['steam-minus', 'steam-plus']) {
         const button = document.getElementById(id);
         if (button) button.disabled = isAutoSteamMode();
@@ -2319,6 +2324,8 @@ export function initUI(callbacks) {
         onChange(state) {
             calibratedSteamApplying = state.busy;
             calibratedSteamJug = state.jug;
+            calibratedSteamPitchers = state.availablePitchers;
+            calibratedSteamConfigured = state.configurationReady;
             if (state.active) steamMode = 'auto';
             else if (steamMode === 'auto') steamMode = 'time';
             if (state.busy) {

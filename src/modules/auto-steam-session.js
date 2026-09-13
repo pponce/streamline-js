@@ -20,10 +20,20 @@ export function createAutoSteamSession({ saved = {}, getContext, getStatus, writ
     let state = null;
     let disposed = false;
     let applied = null;
-    const snapshot = () => ({ active, busy, ready, jug: jug ?? 'auto', manual, applied, disabled });
+    let availablePitchers = [];
+    let configurationReady = false;
+    const snapshot = () => ({ active, busy, ready, jug, manual, applied, disabled, availablePitchers: [...availablePitchers], configurationReady });
     function publish() {
-        persist({ active, manual, jug: jug ?? 'auto' });
+        persist({ active, manual, jug });
         if (!disposed) onChange(snapshot());
+    }
+    function updateStatus(status) {
+        availablePitchers = Array.isArray(status.availablePitchers) ? AUTO_STEAM_JUGS.filter(choice => status.availablePitchers.includes(choice)) : [];
+        configurationReady = status.apiVersion === 2 && status.ready === true && availablePitchers.length > 0;
+        if (!availablePitchers.includes(jug)) {
+            jug = availablePitchers.includes(status.settings?.defaultJug) ? status.settings.defaultJug : (availablePitchers[0] ?? null);
+        }
+        publish();
     }
     async function context() {
         const value = await getContext();
@@ -43,9 +53,10 @@ export function createAutoSteamSession({ saved = {}, getContext, getStatus, writ
         const current = await context();
         const status = await getStatus();
         if (status.apiVersion !== 2) throw new Error('Update the Auto Steam Calculator extension.');
+        updateStatus(status);
         const flow = status.settings?.referenceFlow;
         const steam = { duration: 0, targetTemperature: 0, stopAtTemperature: 0, flow: current.workflow.steamSettings.flow };
-        if (Number.isFinite(flow) && flow >= 0.1 && flow <= 2.5) steam.flow = flow;
+        if (Number.isFinite(flow) && flow >= 0.4 && flow <= 2.5) steam.flow = flow;
         ready = false;
         applied = null;
         await write(steam);
@@ -70,6 +81,7 @@ export function createAutoSteamSession({ saved = {}, getContext, getStatus, writ
     }
     return {
         snapshot,
+        updateStatus,
         async enter() {
             disabled = false;
             return run(async () => {
@@ -81,8 +93,7 @@ export function createAutoSteamSession({ saved = {}, getContext, getStatus, writ
                     active = true;
                     publish();
                 }
-                const status = await off();
-                if (jug === null) jug = AUTO_STEAM_JUGS.includes(status.settings?.defaultJug) ? status.settings.defaultJug : 'auto';
+                await off();
             });
         },
         leave,
@@ -91,9 +102,10 @@ export function createAutoSteamSession({ saved = {}, getContext, getStatus, writ
             if (!AUTO_STEAM_JUGS.includes(choice)) throw new Error('Choose Small, Medium, Large or Auto.');
             return run(async () => {
                 await context();
+                await off();
+                if (!configurationReady) throw new Error('Complete Auto Steam Calculator calibration in Settings > Extensions.');
+                if (!availablePitchers.includes(choice)) throw new Error('Choose a configured pitcher selection.');
                 jug = choice;
-                const status = await off();
-                if (!status.ready) throw new Error('Complete Auto Steam Calculator calibration in Settings > Extensions.');
                 const result = await calculate(jug);
                 await context();
                 if (disabled) throw new Error('Auto Steam Calculator was disabled.');

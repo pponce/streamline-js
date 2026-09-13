@@ -1632,7 +1632,7 @@ async function steamHeaterFor(duration) {
 // Writing it first makes the store the record of intent, which is what
 // resyncSteamFromStore replays when a push doesn't land.
 export async function setTargetSteamDuration(duration) {
-    if (isAutoSteamActive()) throw new Error('Use a jug preset in Auto mode, or switch to Flow or Time.');
+    if (isAutoSteamActive()) throw new Error('Use a pitcher preset in Auto mode, or switch to Flow or Time.');
     const value = parseFloat(duration);
     await persistSharedValue(STEAM_DURATION_LAST_VALUE_KEY, value);
     return updateWorkflow({ steamSettings: { duration: value, ...(await steamHeaterFor(value)) } });
@@ -1663,7 +1663,7 @@ export async function setSteamHeaterEnabled(enabled) {
 }
 
 export async function setTargetSteamFlow(flow) {
-    if (isAutoSteamActive()) throw new Error('Use a jug preset in Auto mode, or switch to Flow or Time.');
+    if (isAutoSteamActive()) throw new Error('Use a pitcher preset in Auto mode, or switch to Flow or Time.');
     const value = parseFloat(flow);
     await persistSharedValue(STEAM_FLOW_LAST_VALUE_KEY, value);
     return updateWorkflow({ steamSettings: { flow: value } });

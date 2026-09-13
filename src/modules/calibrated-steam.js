@@ -79,7 +79,7 @@ export function createCalibratedSteamController({ getContext, getSamples, calcul
                 const next = fresh.result;
                 if (preview.workflowKey !== fresh.workflowKey || old.calibrationRevision !== next.calibrationRevision ||
                     old.jug !== next.jug || old.durationSeconds !== next.durationSeconds || Math.abs(old.milkGrams - next.milkGrams) > 2) {
-                    throw new Error('The scale, jug or settings changed. Calculate again.');
+                    throw new Error('The scale, pitcher or settings changed. Calculate again.');
                 }
                 check(preview.token);
                 await apply(next);
