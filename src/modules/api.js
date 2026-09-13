@@ -58,7 +58,7 @@ export async function calibratedSteamRequest(endpoint, body) {
             signal: controller.signal,
         });
         const data = await response.json();
-        if (!response.ok) throw new Error(data.message || data.error || 'Enable the calibrated steam extension in Plugins.');
+        if (!response.ok) throw Object.assign(new Error(data.message || data.error || 'Enable the calibrated steam extension in Plugins.'), { status: response.status });
         return data;
     } finally { clearTimeout(timeout); }
 }
@@ -1640,6 +1640,13 @@ export async function setTargetSteamDuration(duration) {
 
 export function isAutoSteamActive() {
     return readAutoSteamSession(localStorage.getItem(AUTO_STEAM_SESSION_KEY)).active === true;
+}
+
+export async function getCalibrationHeaterTemperature() {
+    const saved = readAutoSteamSession(localStorage.getItem(AUTO_STEAM_SESSION_KEY));
+    const value = saved.active && saved.manual?.targetTemperature > 0
+        ? saved.manual.targetTemperature : await readSharedValue(STEAM_TEMP_LAST_VALUE_KEY);
+    return Number.isInteger(value) && value >= 135 && value <= 165 ? value : null;
 }
 
 export async function writeAutoSteamSettings(steam) {

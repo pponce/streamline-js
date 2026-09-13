@@ -11,7 +11,7 @@ function harness(saved = null, initialHeater = 150, rememberedHeater = null) {
     let stored = saved;
     const session = createAutoSteamSession({
         saved,
-        getContext: async () => ({ workflow: structuredClone(workflow), machine: { state: machine } }),
+        getContext: async () => ({ workflow: structuredClone(workflow), machine: { state: machine }, calibrationActive: status.calibrationActive }),
         getStatus: async () => status,
         getHeaterTemperature: async () => rememberedHeater,
         write: async steam => { writes.push(structuredClone(steam)); workflow.steamSettings = { ...workflow.steamSettings, ...steam }; },
@@ -169,4 +169,16 @@ test('missing normal heater setting never invents one or arms the timer', async 
     await assert.rejects(h.session.select('small'), /normal Steam settings/);
     assert.equal(h.writes.at(-1).duration, 0);
     assert.equal(h.writes.at(-1).targetTemperature, 0);
+});
+
+
+test('guided calibration blocks Auto entry, recalculation, reset and manual restoration', async () => {
+    const h = harness();
+    await h.session.enter();
+    h.status({ apiVersion: 3, calibrationActive: true, ready: true, availablePitchers: ['small'] });
+    const before = h.writes.length;
+    for (const action of [() => h.session.enter(), () => h.session.select('small'), () => h.session.invalidate(), () => h.session.leave()]) {
+        await assert.rejects(action(), /guided calibration/);
+    }
+    assert.equal(h.writes.length, before);
 });

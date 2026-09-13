@@ -10,7 +10,11 @@ export function initCalibratedSteam({ onAvailability, onChange, onSteamSettings,
     let machineState = null;
     const context = async () => {
         const [workflow, machine] = await Promise.all([getWorkflow(), getMachineState()]);
-        return { workflow, machine };
+        const status = await calibratedSteamRequest('status').catch(error => {
+            if (error.status === 404 || error.status === 503) return null;
+            throw error;
+        });
+        return { workflow, machine, calibrationActive: status?.calibrationActive === true };
     };
     const calculator = createCalibratedSteamController({
         getContext: context, getSamples: getCalibratedSteamSamples,

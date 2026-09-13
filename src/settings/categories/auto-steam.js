@@ -1,4 +1,4 @@
-import { API_BASE_URL, getPlugins, enablePlugin, disablePlugin, calibratedSteamRequest } from '../../modules/api.js';
+import { API_BASE_URL, getPlugins, enablePlugin, disablePlugin, calibratedSteamRequest, getCalibrationHeaterTemperature } from '../../modules/api.js';
 import { CALIBRATED_STEAM_PLUGIN } from '../../modules/calibrated-steam.js';
 import { pluginSettingsUrl } from '../../modules/plugin-settings-navigation.js';
 import { getTranslation } from '../../modules/i18n.js';
@@ -20,8 +20,14 @@ export function mountSettingsCategory({ container }) {
     const open = document.createElement('a');
     open.textContent = getTranslation('Open settings');
     open.style.cssText = 'display:none;margin:20px 0;padding:16px 24px;border-radius:10px;background:#385a92;color:white;text-decoration:none;min-height:32px';
-    const settingsUrl = () => pluginSettingsUrl(API_BASE_URL, CALIBRATED_STEAM_PLUGIN, new URL('?page=settings', window.location.href).href);
-    open.onclick = () => { open.href = settingsUrl(); };
+    const settingsUrl = heater => pluginSettingsUrl(API_BASE_URL, CALIBRATED_STEAM_PLUGIN, new URL('?page=settings', window.location.href).href, heater);
+    open.onclick = async event => {
+        event.preventDefault();
+        try {
+            const heater = await getCalibrationHeaterTemperature();
+            if (!disposed) window.location.assign(settingsUrl(heater));
+        } catch (error) { if (!disposed) message.textContent = error.message; }
+    };
     root.append(title, toggle, message, open);
     container.replaceChildren(root);
     const current = () => !disposed && container.contains(root);

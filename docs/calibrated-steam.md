@@ -8,7 +8,23 @@ supply a return address: **Return to settings** exits without saving; a successf
 form open. No iframe is used.
 
 Enter at least one Small, Medium or Large empty-pitcher weight, calibration
-milk-only weight, seconds to your desired temperature, and the flow used. Leave unused sizes blank or 0. Calibrate in manual steam mode.
+milk-only weight, seconds to your desired temperature, and the flow used. Leave unused sizes blank or 0.
+
+The shared Decaid page now has **Tare empty scale** and **Set from scale** controls
+for pitcher weights. Tare with nothing on the scale and wait for confirmed zero
+before placing the pitcher. **Guided calibration** offers another tare button:
+choose a configured pitcher, weigh pitcher plus cold milk, capture its milk-only
+weight, then prepare and start steam. Stop at your desired temperature using the
+page or machine control. Warm-up is excluded; the measured weight, time and flow
+are filled in for review. Manual entry remains available.
+
+Decaid restores the previous steam settings before exposing the measured result.
+Return to settings cancels an active run and waits for restoration. Page closure
+expires the session; interrupted runs cannot become calibrations. Both Streamline
+Open settings links pass its remembered normal heater target when needed after
+Auto Off. While guided calibration is active, Streamline defers its Auto writes
+and resets. The extension uses machine-event permission in v0.5.0; an installed
+plugin update may require approval for the additional permission.
 
 **Offer Auto pitcher selection** is optional and initially off. Enabling it
 reveals the required usual milk per drink and Small/Medium pitcher normally used

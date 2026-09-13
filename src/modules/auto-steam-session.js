@@ -29,7 +29,7 @@ export function createAutoSteamSession({ saved = {}, getContext, getStatus, getH
     }
     function updateStatus(status) {
         availablePitchers = Array.isArray(status.availablePitchers) ? AUTO_STEAM_JUGS.filter(choice => status.availablePitchers.includes(choice)) : [];
-        configurationReady = status.apiVersion === 3 && status.ready === true && availablePitchers.length > 0;
+        configurationReady = status.calibrationActive !== true && status.apiVersion === 3 && status.ready === true && availablePitchers.length > 0;
         if (!availablePitchers.includes(jug)) {
             jug = availablePitchers.includes(status.settings?.defaultJug) ? status.settings.defaultJug : (availablePitchers[0] ?? null);
         }
@@ -37,6 +37,7 @@ export function createAutoSteamSession({ saved = {}, getContext, getStatus, getH
     }
     async function context() {
         const value = await getContext();
+        if (value.calibrationActive) throw new Error('Finish or cancel guided calibration in the extension settings first.');
         state = typeof value.machine?.state === 'object' ? value.machine.state.state : value.machine?.state;
         if (state !== 'idle') throw new Error('Wait until the machine is idle.');
         if (disposed) throw new Error('Auto steam session closed.');
@@ -54,6 +55,7 @@ export function createAutoSteamSession({ saved = {}, getContext, getStatus, getH
         const status = await getStatus();
         if (status.apiVersion !== 3) throw new Error('Update the Auto Steam Calculator extension.');
         updateStatus(status);
+        if (status.calibrationActive) throw new Error('Finish or cancel guided calibration in the extension settings first.');
         const flow = status.settings?.referenceFlow;
         const steam = { duration: 0, targetTemperature: 0, stopAtTemperature: 0, flow: current.workflow.steamSettings.flow };
         if (Number.isFinite(flow) && flow >= 0.4 && flow <= 2.5) steam.flow = flow;
