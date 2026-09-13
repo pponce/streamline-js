@@ -8,8 +8,7 @@ supply a return address: **Return to settings** exits without saving; a successf
 form open. No iframe is used.
 
 Enter at least one Small, Medium or Large empty-pitcher weight, calibration
-milk-only weight, seconds to your desired temperature, and the flow and heater
-target used. Leave unused sizes blank or 0. Calibrate in manual steam mode.
+milk-only weight, seconds to your desired temperature, and the flow used. Leave unused sizes blank or 0. Calibrate in manual steam mode.
 
 **Offer Auto pitcher selection** is optional and initially off. Enabling it
 reveals the required usual milk per drink and Small/Medium pitcher normally used
@@ -38,8 +37,11 @@ Auto starts at **Off** and returns to Off after steaming, when resuming after a
 reload, and after returning from settings/focus refresh. Off writes duration 0
 and heater target 0, matching Streamline's existing Off behavior. It is a reminder,
 not a hardware start lock; a physical start can still produce a short burst.
-A successful calculation applies the calibration flow and heater target with the
-duration. Auto flow is configured in the extension settings: **0.4–2.5 ml/s**,
+A successful calculation applies the configured flow and calculated duration,
+and restores the normal heater setting saved before Auto entry. If manual steam
+was already Off, it uses Streamline’s existing remembered heater setting. No heater
+calibration field or temperature compensation is used; keep the same normal heater
+setting as the calibration run. There is no configurable maximum duration. Auto flow is configured in the extension settings: **0.4–2.5 ml/s**,
 default **0.4 ml/s**. Measure calibration time at that flow; recalibrate after
 changing it. Plus/minus and direct number editors are inactive in Auto.
 
@@ -63,8 +65,8 @@ existing API/scale socket and UI. `api.js` suppresses manual steam reconciliatio
 while the persisted Auto session owns the settings. `settings/categories/auto-steam.js`
 is shared by the shell and legacy settings navigation paths.
 
-Requires calculator API version 2 with `status.availablePitchers`, introduced in
-Decaid's bundled plugin v0.3.0. Empty setup keeps top-level Auto available and Off,
+Requires calculator API version 3 in Decaid's bundled plugin v0.4.0;
+`status.availablePitchers` still determines the configured presets. Empty setup keeps top-level Auto available and Off,
 with a setup reminder instead of pitcher buttons. Incomplete calibration disables
 calculation; manual Flow and Time continue to work. Settings and API keys retain
 legacy `jug` names for compatibility; displayed text uses “pitcher.”

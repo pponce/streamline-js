@@ -35,7 +35,7 @@ test('only the loaded compatible plugin activates Auto Calc', () => {
 
 function harness() {
     let now = 1000;
-    let result = { apiVersion: 2, durationSeconds: 30, milkGrams: 180, jug: 'small', calibrationRevision: 'v1', workflowPatch: { steamSettings: { duration: 30, flow: 1.5, targetTemperature: 150 } } };
+    let result = { apiVersion: 3, durationSeconds: 30, milkGrams: 180, jug: 'small', calibrationRevision: 'v1', workflowPatch: { steamSettings: { duration: 30, flow: 1.5 } } };
     let workflow = { id: 'one', profile: { title: 'A' }, steamSettings: { flow: 1.5, targetTemperature: 150, duration: 25, stopAtTemperature: 0 } };
     let state = 'idle';
     let failWrite = false;
@@ -105,4 +105,12 @@ test('a slow calculation response cannot revive expired observations', async () 
         apply: async () => assert.fail('expired'), now: () => clock,
     });
     await assert.rejects(controller.preview(), /expired/i);
+});
+
+
+test('older calculator contract is rejected before applying', async () => {
+    const h = harness();
+    h.changeResult({ apiVersion: 2 });
+    await assert.rejects(h.controller.preview('small'), /invalid calculation/);
+    assert.deepEqual(h.writes, []);
 });

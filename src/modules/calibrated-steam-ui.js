@@ -1,4 +1,4 @@
-import { getPlugins, getWorkflow, getMachineState, getCalibratedSteamSamples, calibratedSteamRequest, writeAutoSteamSettings } from './api.js';
+import { getPlugins, getWorkflow, getMachineState, getCalibratedSteamSamples, calibratedSteamRequest, writeAutoSteamSettings, readSharedValue, STEAM_TEMP_LAST_VALUE_KEY } from './api.js';
 import { createCalibratedSteamController, isCalibratedSteamAvailable } from './calibrated-steam.js';
 import { AUTO_STEAM_SESSION_KEY, createAutoSteamSession, readAutoSteamSession } from './auto-steam-session.js';
 import { settingsReady } from './settingsSync.js';
@@ -22,6 +22,7 @@ export function initCalibratedSteam({ onAvailability, onChange, onSteamSettings,
             saved: readAutoSteamSession(localStorage.getItem(AUTO_STEAM_SESSION_KEY)),
             getContext: context,
             getStatus: () => calibratedSteamRequest('status'),
+            getHeaterTemperature: () => readSharedValue(STEAM_TEMP_LAST_VALUE_KEY),
             write: async steam => {
                 await writeAutoSteamSettings(steam);
                 if (!disposed) onSteamSettings(steam);

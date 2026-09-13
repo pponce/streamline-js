@@ -8,7 +8,7 @@ export function readAutoSteamSession(value) {
     } catch { return {}; }
 }
 
-export function createAutoSteamSession({ saved = {}, getContext, getStatus, write, calculate, persist, onChange }) {
+export function createAutoSteamSession({ saved = {}, getContext, getStatus, getHeaterTemperature = async () => null, write, calculate, persist, onChange }) {
     saved ||= {};
     let active = saved.active === true;
     let manual = saved.manual ?? null;
@@ -29,7 +29,7 @@ export function createAutoSteamSession({ saved = {}, getContext, getStatus, writ
     }
     function updateStatus(status) {
         availablePitchers = Array.isArray(status.availablePitchers) ? AUTO_STEAM_JUGS.filter(choice => status.availablePitchers.includes(choice)) : [];
-        configurationReady = status.apiVersion === 2 && status.ready === true && availablePitchers.length > 0;
+        configurationReady = status.apiVersion === 3 && status.ready === true && availablePitchers.length > 0;
         if (!availablePitchers.includes(jug)) {
             jug = availablePitchers.includes(status.settings?.defaultJug) ? status.settings.defaultJug : (availablePitchers[0] ?? null);
         }
@@ -52,7 +52,7 @@ export function createAutoSteamSession({ saved = {}, getContext, getStatus, writ
     async function off() {
         const current = await context();
         const status = await getStatus();
-        if (status.apiVersion !== 2) throw new Error('Update the Auto Steam Calculator extension.');
+        if (status.apiVersion !== 3) throw new Error('Update the Auto Steam Calculator extension.');
         updateStatus(status);
         const flow = status.settings?.referenceFlow;
         const steam = { duration: 0, targetTemperature: 0, stopAtTemperature: 0, flow: current.workflow.steamSettings.flow };
@@ -106,13 +106,18 @@ export function createAutoSteamSession({ saved = {}, getContext, getStatus, writ
                 if (!configurationReady) throw new Error('Complete Auto Steam Calculator calibration in Settings > Extensions.');
                 if (!availablePitchers.includes(choice)) throw new Error('Choose a configured pitcher selection.');
                 jug = choice;
+                const targetTemperature = manual?.targetTemperature > 0 ? manual.targetTemperature : await getHeaterTemperature();
+                if (!Number.isInteger(targetTemperature) || targetTemperature < 135 || targetTemperature > 165) {
+                    throw new Error('Set the heater temperature in normal Steam settings, then calculate again.');
+                }
                 const result = await calculate(jug);
                 await context();
                 if (disabled) throw new Error('Auto Steam Calculator was disabled.');
-                await write(result.workflowPatch.steamSettings);
-                applied = result;
+                const steamSettings = { ...result.workflowPatch.steamSettings, targetTemperature };
+                await write(steamSettings);
+                applied = { ...result, workflowPatch: { steamSettings } };
                 ready = true;
-                return result;
+                return applied;
             });
         },
         async observeMachine(next) {
