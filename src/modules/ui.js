@@ -1,3 +1,4 @@
+import { steamAdjustmentControls } from './auto-steam-flow.js';
 import { getProfile, getWorkflow, updateWorkflow, setMachineState, setTargetHotWaterVolume, setTargetHotWaterTemp, setTargetHotWaterDuration, setDe1Settings, setTargetSteamFlow, setTargetSteamDuration, setStopAtTemperature, resyncSteamFromStore, MachineState, getPlugins, persistSharedValue, FLUSH_DURATION_LAST_VALUE_KEY, isBlackScreenSaver } from './api.js';
 import { openDB, getSetting, setSetting } from './idb.js';
 import { deriveSleepButtonAction, isWakePending } from './screensaver-policy.js';
@@ -84,6 +85,7 @@ let calibratedSteamApplying = false;
 let calibratedSteamJug = null;
 let calibratedSteamPitchers = [];
 let calibratedSteamConfigured = false;
+let calibratedSteamState = {};
 
 export function isAutoSteamMode() { return steamMode === 'auto' || calibratedSteamApplying; }
 let currentMilkStop = 60; // milk auto-stop target °C (workflow.stopAtTemperature)
@@ -881,6 +883,7 @@ function syncSteamPresets() {
 }
 
 function incrementSteam() {
+    if (steamMode === 'auto') { adjustAutoSteamFlow(0.1); return; }
     if (isAutoSteamMode()) return;
     const steamPlusBtn = document.getElementById('steam-plus');
     if (steamPlusBtn) { flashPlusMinusButton(steamPlusBtn); }
@@ -899,6 +902,7 @@ function incrementSteam() {
 }
 
 function decrementSteam() {
+    if (steamMode === 'auto') { adjustAutoSteamFlow(-0.1); return; }
     if (isAutoSteamMode()) return;
     const steamMinusBtn = document.getElementById('steam-minus');
     if (steamMinusBtn) { flashPlusMinusButton(steamMinusBtn); }
@@ -921,6 +925,12 @@ function decrementSteam() {
     syncSteamPresets();
 }
 
+async function adjustAutoSteamFlow(delta) {
+    if (calibratedSteamApplying || !calibratedSteamState.adjustableFlow || currentMachineState !== 'idle') return;
+    try { await calibratedSteam.adjustFlow(delta); }
+    catch (error) { showToast(error.message, 5000, 'error'); }
+}
+
 function updateSteamPresetDisplay() {
     const timePresetContainer = document.getElementById('steam-presets');
     const flowPresetContainer = document.getElementById('steam-flow-presets');
@@ -936,9 +946,14 @@ function updateSteamPresetDisplay() {
     });
     const setup = document.getElementById('steam-auto-setup');
     if (setup) setup.style.display = calibratedSteamPitchers.length ? 'none' : '';
+    const adjustment = steamAdjustmentControls(steamMode, calibratedSteamState, currentMachineState);
     for (const id of ['steam-minus', 'steam-plus']) {
         const button = document.getElementById(id);
-        if (button) button.disabled = isAutoSteamMode();
+        if (button) {
+            button.style.display = adjustment.visible ? '' : 'none';
+            button.disabled = id === 'steam-minus' ? adjustment.minusDisabled : adjustment.plusDisabled;
+            button.setAttribute('aria-label', getTranslation(id === 'steam-minus' ? (steamMode === 'auto' ? 'Decrease Auto steam flow' : 'Decrease steam setting') : (steamMode === 'auto' ? 'Increase Auto steam flow' : 'Increase steam setting')));
+        }
     }
     if (!timePresetContainer || !flowPresetContainer) return;
     if (steamMode === 'auto') {
@@ -2321,6 +2336,7 @@ export function initUI(callbacks) {
             updateSteamPresetDisplay();
         },
         onChange(state) {
+            calibratedSteamState = state;
             calibratedSteamApplying = state.busy;
             calibratedSteamJug = state.jug;
             calibratedSteamPitchers = state.availablePitchers;
@@ -2366,7 +2382,9 @@ export function initUI(callbacks) {
 
 export function updateSleepButton(state) {
     calibratedSteam?.observeMachine(state);
+    const machineStateChanged = currentMachineState !== state;
     currentMachineState = state;
+    if (machineStateChanged) updateSteamPresetDisplay();
     const sleepButton = document.getElementById('sleep-button');
     if (sleepButton) {
         if (state === 'sleeping') {

@@ -65,6 +65,23 @@ test('preview never writes; applying rechecks and returns the verified calculati
     assert.deepEqual(h.writes, [30]);
 });
 
+test('requested Auto flow is sent on both reads and a different returned flow cannot be applied', async () => {
+    const requests = [], writes = [];
+    let returnedFlow = 1.1;
+    const controller = createCalibratedSteamController({
+        getContext: async () => ({ workflow: { steamSettings: { stopAtTemperature: 0 } }, machine: { state: 'idle' } }),
+        getSamples: () => [800, 400, 0].map(ageMs => ({ weightGrams: 350, ageMs })),
+        calculate: async body => { requests.push(body); return { apiVersion: 3, jug: 'small', milkGrams: 200, durationSeconds: 20, calibrationRevision: 'one', workflowPatch: { steamSettings: { flow: returnedFlow, duration: 20 } } }; },
+        apply: async result => writes.push(result), now: () => 1000,
+    });
+    await controller.apply(await controller.preview('small', 1.1));
+    assert.deepEqual(requests.map(r => r.flow), [1.1, 1.1]);
+    assert.equal(writes.length, 1);
+    returnedFlow = 0.4;
+    await assert.rejects(controller.preview('small', 1.1), /invalid calculation/);
+    assert.equal(writes.length, 1);
+});
+
 test('changed scale, jug, settings, workflow or machine state prevents an old preview applying', async () => {
     for (const change of [h => h.changeResult({ milkGrams: 190 }), h => h.changeResult({ jug: 'medium' }),
         h => h.changeResult({ calibrationRevision: 'v2' }), h => h.state('steam'),

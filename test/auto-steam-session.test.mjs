@@ -15,9 +15,9 @@ function harness(saved = null, initialHeater = 150, rememberedHeater = null) {
         getStatus: async () => status,
         getHeaterTemperature: async () => rememberedHeater,
         write: async steam => { writes.push(structuredClone(steam)); workflow.steamSettings = { ...workflow.steamSettings, ...steam }; },
-        calculate: async jug => {
+        calculate: async (jug, flow = 0.8) => {
             if (fail) throw new Error('Unstable scale');
-            return { jug, milkGrams: 180, durationSeconds: 30, workflowPatch: { steamSettings: { duration: 30, flow: 0.8 } } };
+            return { jug, milkGrams: 180, durationSeconds: 30, workflowPatch: { steamSettings: { duration: 30, flow } } };
         },
         persist: value => { stored = structuredClone(value); },
         onChange: () => {},
@@ -33,6 +33,48 @@ test('Auto enters Off at calibration flow, remembers manual settings and restore
     await h.session.leave();
     assert.deepEqual(h.writes.at(-1), { duration: 45, flow: 0.6, targetTemperature: 150, stopAtTemperature: 0 });
     assert.equal(h.stored().active, false);
+});
+
+const multiStatus = () => ({ apiVersion: 3, ready: true, availablePitchers: ['small', 'medium'],
+    settings: { referenceFlow: 0.8, calibrationMode: 'multiple' },
+    flowCalibration: { mode: 'multiple', adjustable: true, minimum: 0.4, maximum: 2.5, defaultFlow: 0.8 } });
+
+test('multiple Auto flow changes write Off at the selected flow and require a new pitcher calculation', async () => {
+    const h = harness(); h.status(multiStatus());
+    await h.session.enter(); await h.session.select('small');
+    await h.session.adjustFlow(0.1);
+    assert.equal(h.writes.at(-1).flow, 0.9);
+    assert.equal(h.writes.at(-1).duration, 0);
+    assert.equal(h.session.snapshot().ready, false);
+    await h.session.select('small');
+    assert.equal(h.writes.at(-1).flow, 0.9);
+    assert.equal(h.writes.at(-1).duration, 30);
+    assert.equal(h.session.snapshot().ready, true);
+    await h.session.invalidate();
+    assert.equal(h.writes.at(-1).flow, 0.9);
+    await h.session.leave();
+    assert.equal(h.writes.at(-1).flow, 0.6);
+    assert.equal(h.writes.at(-1).duration, 45);
+});
+
+test('Auto adjustments are bounded, fixed calibrations cannot change, and busy machines refuse writes', async () => {
+    const h = harness(); await h.session.enter();
+    await assert.rejects(h.session.adjustFlow(0.1), /multiple-flow/);
+    h.status(multiStatus());
+    await h.session.adjustFlow(10); assert.equal(h.session.snapshot().flow, 2.5);
+    await h.session.adjustFlow(-10); assert.equal(h.session.snapshot().flow, 0.4);
+    await h.machine('steam'); const count = h.writes.length;
+    await assert.rejects(h.session.adjustFlow(0.1), /idle/);
+    assert.equal(h.writes.length, count);
+});
+
+test('selected Auto flow survives reload; changed calibration adopts its new default', async () => {
+    const h = harness(); h.status(multiStatus()); await h.session.enter(); await h.session.adjustFlow(0.2);
+    const resumed = harness(h.stored()); resumed.status(multiStatus()); await resumed.session.enter();
+    assert.equal(resumed.writes.at(-1).flow, 1);
+    const status = multiStatus(); status.settings.referenceFlow = 1.5; status.flowCalibration.defaultFlow = 1.5;
+    resumed.status(status); resumed.session.updateStatus(status); await resumed.session.invalidate({ verify: true });
+    assert.equal(resumed.writes.at(-1).flow, 1.5);
 });
 
 test('each preset tap calculates even when already selected, and a failed calculation remains Off', async () => {
@@ -132,7 +174,7 @@ test('unconfigured Auto stays Off and exposes no pitcher presets', async () => {
 
 test('removed saved pitcher falls back to configured default and cannot be calculated', async () => {
     const h = harness({ jug: 'auto' });
-    h.status({ apiVersion: 3, ready: true, settings: { defaultJug: 'medium' }, availablePitchers: ['medium'] });
+    h.status({ apiVersion: 3, ready: true, settings: { defaultJug: 'medium', referenceFlow: 0.8 }, availablePitchers: ['medium'] });
     await h.session.enter();
     assert.equal(h.session.snapshot().jug, 'medium');
     assert.deepEqual(h.session.snapshot().availablePitchers, ['medium']);

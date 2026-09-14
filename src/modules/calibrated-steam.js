@@ -36,7 +36,7 @@ export function createCalibratedSteamController({ getContext, getSamples, calcul
     function check(token) {
         if (token !== generation) throw new Error('Calculation cancelled.');
     }
-    async function capture(jug, token) {
+    async function capture(jug, token, flow) {
         const startedAt = now();
         const { workflow, machine } = await getContext();
         check(token);
@@ -44,7 +44,7 @@ export function createCalibratedSteamController({ getContext, getSamples, calcul
         const sampledAt = now();
         const samples = getSamples();
         const result = await calculate({
-            samples, jug,
+            samples, jug, ...(flow === undefined ? {} : { flow }),
             machineState: typeof machine?.state === 'object' ? machine.state.state : machine?.state,
             stopAtTemperature: steam?.stopAtTemperature ?? 0,
         });
@@ -56,16 +56,17 @@ export function createCalibratedSteamController({ getContext, getSamples, calcul
             throw new Error('Scale or machine observations expired. Calculate again.');
         }
         if (result?.apiVersion !== 3 || !Number.isFinite(result.workflowPatch?.steamSettings?.flow) ||
+            (flow !== undefined && result.workflowPatch.steamSettings.flow !== flow) ||
             !Number.isInteger(result?.durationSeconds) || result.durationSeconds < 1 || result.durationSeconds > 255 || !Number.isFinite(result.milkGrams)) {
             throw new Error('The plugin returned an invalid calculation.');
         }
-        return { result, jug, token, createdAt: now(), workflowKey: JSON.stringify(workflow) };
+        return { result, jug, flow, token, createdAt: now(), workflowKey: JSON.stringify(workflow) };
     }
     return {
         cancel() { generation++; },
-        preview(jug = 'auto') {
+        preview(jug = 'auto', flow) {
             if (applying) return Promise.reject(new Error('A steam time is already being applied.'));
-            return capture(jug, ++generation);
+            return capture(jug, ++generation, flow);
         },
         async apply(preview) {
             if (applying) throw new Error('A steam time is already being applied.');
@@ -73,11 +74,11 @@ export function createCalibratedSteamController({ getContext, getSamples, calcul
             if (now() - preview.createdAt > 15000 || now() < preview.createdAt) throw new Error('Preview expired. Calculate again.');
             applying = true;
             try {
-                const fresh = await capture(preview.jug, preview.token);
+                const fresh = await capture(preview.jug, preview.token, preview.flow);
                 const old = preview.result;
                 const next = fresh.result;
                 if (preview.workflowKey !== fresh.workflowKey || old.calibrationRevision !== next.calibrationRevision ||
-                    old.jug !== next.jug || old.durationSeconds !== next.durationSeconds || Math.abs(old.milkGrams - next.milkGrams) > 2) {
+                    old.jug !== next.jug || old.durationSeconds !== next.durationSeconds || old.workflowPatch.steamSettings.flow !== next.workflowPatch.steamSettings.flow || Math.abs(old.milkGrams - next.milkGrams) > 2) {
                     throw new Error('The scale, pitcher or settings changed. Calculate again.');
                 }
                 check(preview.token);

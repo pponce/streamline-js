@@ -7,9 +7,10 @@ supply a return address: **Return to settings** exits without saving; a successf
 **Save calibration** returns to the calling settings category. Errors keep the
 form open. No iframe is used.
 
-The v0.6.0 page has compact **General**, **Pitchers & Auto**, and **Calibration**
+The v0.7.0 page has compact **General**, **Pitchers & Auto**, and **Calibration**
 tabs. Both Flow fields edit one saved plugin default; changing it clears the old
-calibration time. Tare stays beside the pitcher controls, capture buttons work
+calibration time only in Single flow. Multiple flows preserves measurements when
+the default changes within the calibrated range. Tare stays beside the pitcher controls, capture buttons work
 without field focus, and errors appear beside the action. The summary shows which
 choices are configured and whether calibration is ready. Invalid saves open the
 relevant tab and field.
@@ -73,7 +74,10 @@ was already Off, it uses Streamline’s existing remembered heater setting. No h
 calibration field or temperature compensation is used; keep the same normal heater
 setting as the calibration run. There is no configurable maximum duration. Auto flow is configured in the extension settings: **0.4–2.5 ml/s**,
 default **0.4 ml/s**. Measure calibration time at that flow; recalibrate after
-changing it. Plus/minus and direct number editors are inactive in Auto.
+changing it in Single flow. Direct number editors are inactive in Auto. Single-flow
+Auto hides − / +. Multiple-flow Auto shows − / + to adjust flow in 0.1 ml/s steps
+within measured bounds while idle; changing flow resets time to Off and requires
+a fresh pitcher tap. Manual Flow and Time keep their normal − / + controls.
 
 Switching to Flow or Time restores the previous manual steam settings, including
 flow. Auto's values never overwrite manual preferences or profile values. Plugin
@@ -86,9 +90,27 @@ only when the scale reports milk alone; pitcher inference is then unavailable. U
 similar milk, starting temperature and technique to the calibration run. This is
 a temperature estimate through time, not a temperature measurement.
 
+## Multiple-flow calibration
+
+Calibration offers **Single flow** (one fixed measured flow) and **Multiple
+flows** (2–4 measurements, with 3 recommended). Select minimum/maximum flow,
+reading count, target milk weight and default Auto flow. The page suggests evenly
+spaced points including both endpoints. Each point supports manual time entry or
+a guided run, using fresh milk at the same starting temperature each time.
+Guided Prepare applies that reading's flow before enabling Start. Start checks
+that the calibration settings remain applied. Use each reading, review the set,
+then Save. The old saved calibration remains active until the full draft saves.
+
+At intermediate flows the plugin interpolates seconds per gram between adjacent
+readings; it does not extrapolate beyond the measured range. Auto's selected flow
+is stored separately from manual preferences and survives ordinary navigation
+and reload. A changed calibration adopts its new default. Existing installations
+remain Single flow after upgrading.
+
 ## Developer notes
 
-`auto-steam-session.js` owns Auto entry, preset actions, reset and restore, with a
+`auto-steam-flow.js` validates the optional status flow capability and owns
+adjustment-control visibility/bounds. `auto-steam-session.js` owns Auto entry, preset actions, reset and restore, with a
 persisted manual backup and pitcher choice. One session is retained for the app
 lifetime. `auto-steam-lifecycle.js` coordinates page visibility, actual settings
 changes and connection changes; background errors are deferred while off-page.
@@ -100,7 +122,9 @@ while the persisted Auto session owns the settings. `settings/categories/auto-st
 is shared by the shell and legacy settings navigation paths.
 
 Requires calculator API version 3 (introduced in v0.4.0); use bundled plugin
-v0.6.0 for the compact settings page and concise pitcher errors;
+v0.7.0 for multiple-flow calibration. New requests include the selected `flow` on
+both calculation passes, verify the returned flow, and apply its duration/flow
+pair. Status without `flowCalibration` falls back to fixed-flow controls;
 `status.availablePitchers` still determines the configured presets. Empty setup keeps top-level Auto available and Off,
 with a setup reminder instead of pitcher buttons. Incomplete calibration disables
 calculation; manual Flow and Time continue to work. Settings and API keys retain
