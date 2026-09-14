@@ -22,18 +22,26 @@ export function createAutoSteamSession({ saved = {}, getContext, getStatus, getH
     let applied = null;
     let availablePitchers = [];
     let configurationReady = false;
+    let operationPromise = null, resetPromise = null;
+    let offConfirmed = false, needsReset = false, retryBlocked = false;
+    let cancellation = 0, configurationKey = null;
     const snapshot = () => ({ active, busy, ready, jug, manual, applied, disabled, availablePitchers: [...availablePitchers], configurationReady });
     function publish() {
         persist({ active, manual, jug });
         if (!disposed) onChange(snapshot());
     }
     function updateStatus(status) {
+        const key = JSON.stringify(status.settings ?? {});
+        const changed = configurationKey !== null && configurationKey !== key;
+        configurationKey = key;
+        if (changed) offConfirmed = false;
         availablePitchers = Array.isArray(status.availablePitchers) ? AUTO_STEAM_JUGS.filter(choice => status.availablePitchers.includes(choice)) : [];
         configurationReady = status.calibrationActive !== true && status.apiVersion === 3 && status.ready === true && availablePitchers.length > 0;
         if (!availablePitchers.includes(jug)) {
             jug = availablePitchers.includes(status.settings?.defaultJug) ? status.settings.defaultJug : (availablePitchers[0] ?? null);
         }
         publish();
+        return changed;
     }
     async function context() {
         const value = await getContext();
@@ -43,42 +51,68 @@ export function createAutoSteamSession({ saved = {}, getContext, getStatus, getH
         if (disposed) throw new Error('Auto steam session closed.');
         return value;
     }
-    async function run(operation) {
-        if (busy) throw new Error('Wait for the steam setting to finish.');
+    function run(operation) {
+        if (busy) return Promise.reject(new Error('Wait for the steam setting to finish.'));
         busy = true;
         publish();
-        try { return await operation(); }
-        finally { busy = false; publish(); }
+        operationPromise = Promise.resolve().then(operation).finally(() => {
+            busy = false; operationPromise = null; publish();
+        });
+        return operationPromise;
     }
-    async function off() {
-        const current = await context();
-        const status = await getStatus();
+    async function off(current) {
+        current ||= await context();
+        const status = current.pluginStatus || await getStatus();
         if (status.apiVersion !== 3) throw new Error('Update the Auto Steam Calculator extension.');
         updateStatus(status);
         if (status.calibrationActive) throw new Error('Finish or cancel guided calibration in the extension settings first.');
         const flow = status.settings?.referenceFlow;
         const steam = { duration: 0, targetTemperature: 0, stopAtTemperature: 0, flow: current.workflow.steamSettings.flow };
         if (Number.isFinite(flow) && flow >= 0.4 && flow <= 2.5) steam.flow = flow;
-        ready = false;
-        applied = null;
-        await write(steam);
-        used = false;
+        ready = false; applied = null;
+        if (!Object.entries(steam).every(([key, value]) => (current.workflow.steamSettings[key] ?? (key === 'stopAtTemperature' ? 0 : undefined)) === value)) {
+            offConfirmed = false;
+            await write(steam);
+        }
+        offConfirmed = true; used = false; retryBlocked = false;
         publish();
         return status;
+    }
+    async function restoreManual() {
+        if (!manual || !Number.isFinite(manual.duration) || !Number.isFinite(manual.flow) || !Number.isFinite(manual.targetTemperature)) {
+            throw new Error('Manual steam settings are unavailable. Restore them in Settings.');
+        }
+        await write(manual);
+        applied = { workflowPatch: { steamSettings: manual } };
+        active = false; manual = null; ready = false; used = false; needsReset = false; offConfirmed = false;
+    }
+    function resetInBackground() {
+        if (resetPromise) return resetPromise;
+        resetPromise = Promise.resolve().then(async () => {
+            while (active && !disposed && needsReset) {
+                while (operationPromise) await operationPromise.catch(() => {});
+                if (!active || disposed || !needsReset) break;
+                let completed = false;
+                await run(async () => {
+                    const current = await getContext();
+                    state = typeof current.machine?.state === 'object' ? current.machine.state.state : current.machine?.state;
+                    if (state !== 'idle' || current.calibrationActive) return;
+                    needsReset = false;
+                    if (disabled) await restoreManual();
+                    else await off(current);
+                    completed = true;
+                });
+                if (!completed) break;
+            }
+        }).catch(error => { needsReset = active; retryBlocked = true; throw error; }).finally(() => { resetPromise = null; });
+        return resetPromise;
     }
     async function leave() {
         if (!active) return;
         return run(async () => {
             await context();
-            if (!manual || !Number.isFinite(manual.duration) || !Number.isFinite(manual.flow) || !Number.isFinite(manual.targetTemperature)) {
-                throw new Error('Manual steam settings are unavailable. Restore them in Settings.');
-            }
-            await write(manual);
-            applied = { workflowPatch: { steamSettings: manual } };
-            active = false;
-            manual = null;
-            ready = false;
-            used = false;
+            cancellation++;
+            await restoreManual();
         });
     }
     return {
@@ -95,16 +129,18 @@ export function createAutoSteamSession({ saved = {}, getContext, getStatus, getH
                     active = true;
                     publish();
                 }
-                await off();
+                await off(current);
+                needsReset = false;
             });
         },
         leave,
         async select(choice) {
             if (!active || disabled) throw new Error('Select Auto steam mode first.');
             if (!AUTO_STEAM_JUGS.includes(choice)) throw new Error('Choose Small, Medium, Large or Auto.');
+            const startedAt = cancellation;
             return run(async () => {
-                await context();
-                await off();
+                const current = await context();
+                await off(current);
                 if (!configurationReady) throw new Error('Complete Auto Steam Calculator calibration in Settings > Extensions.');
                 if (!availablePitchers.includes(choice)) throw new Error('Choose a configured pitcher selection.');
                 jug = choice;
@@ -114,38 +150,40 @@ export function createAutoSteamSession({ saved = {}, getContext, getStatus, getH
                 }
                 const result = await calculate(jug);
                 await context();
+                if (startedAt !== cancellation) return null;
                 if (disabled) throw new Error('Auto Steam Calculator was disabled.');
                 const steamSettings = { ...result.workflowPatch.steamSettings, targetTemperature };
+                offConfirmed = false;
                 await write(steamSettings);
+                if (startedAt !== cancellation) { ready = false; return null; }
                 applied = { ...result, workflowPatch: { steamSettings } };
                 ready = true;
                 return applied;
             });
         },
         async observeMachine(next) {
+            const previous = state;
             state = next;
-            if (active && state === 'steam') { used = true; ready = false; }
-            if (!active || busy || state !== 'idle') return;
-            if (disabled) return leave();
-            if (used) return run(off);
+            if (active && state === 'steam') { used = true; ready = false; offConfirmed = false; needsReset = true; }
+            if (!active || state !== 'idle' || retryBlocked || !needsReset) return;
+            if (resetPromise) return resetPromise;
+            if (previous !== 'idle') return resetInBackground();
         },
-        async invalidate() {
-            if (!active) return;
-            used = true;
-            ready = false;
-            if (busy) return;
-            const current = await getContext();
-            state = typeof current.machine?.state === 'object' ? current.machine.state.state : current.machine?.state;
-            if (state === 'idle') return run(off);
-        },
-        async disable() {
-            disabled = true;
-            if (!active || busy) return;
-            const current = await getContext();
-            state = typeof current.machine?.state === 'object' ? current.machine.state.state : current.machine?.state;
-            if (state === 'idle') return leave();
+        invalidate({ verify = false } = {}) {
+            if (!active) return Promise.resolve();
+            if (verify) { offConfirmed = false; retryBlocked = false; }
+            if (!verify && ((offConfirmed && !busy) || retryBlocked)) return Promise.resolve();
+            cancellation++; needsReset = true; ready = false; applied = null;
             publish();
+            return resetInBackground();
         },
+        disable() {
+            disabled = true; ready = false; cancellation++;
+            if (!active) return Promise.resolve();
+            needsReset = true; retryBlocked = false;
+            return resetInBackground();
+        },
+        connectionLost() { cancellation++; offConfirmed = false; ready = false; configurationReady = false; needsReset = active; retryBlocked = true; publish(); },
         dispose() { disposed = true; },
     };
 }

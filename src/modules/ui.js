@@ -2306,8 +2306,7 @@ export function initUI(callbacks) {
         steamModeToggle.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleSteamMode(); } });
     }
 
-    calibratedSteam?.dispose();
-    calibratedSteam = initCalibratedSteam({
+    if (!calibratedSteam) calibratedSteam = initCalibratedSteam({
         onAvailability(available) {
             calibratedSteamAvailable = available;
             const standard = document.getElementById('steam-mode-standard');
@@ -2345,6 +2344,7 @@ export function initUI(callbacks) {
         button.onclick = async () => {
             try {
                 const result = await calibratedSteam.select(button.dataset.autoJug);
+                if (!result) return;
                 const jug = result.jugSource === 'tared' ? getTranslation('Milk only') : getTranslation(result.jug);
                 showToast(`${jug} · ${result.milkGrams} g · ${result.durationSeconds} s`, 4000);
             } catch (error) { showToast(error.message, 5000, 'error'); }

@@ -173,6 +173,7 @@ export async function loadPage(pageUrl, { history = 'push' } = {}) {
             cleanupCurrentPage = cleanupSettingsShell;
         }
 
+        if (mainPage?.style.display !== 'none') document.dispatchEvent(new Event('streamline:mainpagehidden'));
         if (mainPage) mainPage.style.display = 'none';
         subpageHost.style.display = '';
 

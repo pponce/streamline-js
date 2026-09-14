@@ -7,6 +7,13 @@ supply a return address: **Return to settings** exits without saving; a successf
 **Save calibration** returns to the calling settings category. Errors keep the
 form open. No iframe is used.
 
+The v0.6.0 page has compact **General**, **Pitchers & Auto**, and **Calibration**
+tabs. Both Flow fields edit one saved plugin default; changing it clears the old
+calibration time. Tare stays beside the pitcher controls, capture buttons work
+without field focus, and errors appear beside the action. The summary shows which
+choices are configured and whether calibration is ready. Invalid saves open the
+relevant tab and field.
+
 Enter at least one Small, Medium or Large empty-pitcher weight, calibration
 milk-only weight, seconds to your desired temperature, and the flow used. Leave unused sizes blank or 0.
 
@@ -48,9 +55,16 @@ subtracts its weight. The actual resulting milk mass determines time in all mode
 The choice remains highlighted and saved. Tap it again for the next pitcher: every
 tap recalculates and applies, with a brief pitcher/milk/time confirmation. There is
 no calculator pop-up or Use time button. Starting steam is a separate action.
+Low milk errors use **Milk < 10 g · Medium pitcher**, including the inferred
+pitcher when Auto is selected.
 
 Auto starts at **Off** and returns to Off after steaming, when resuming after a
-reload, and after returning from settings/focus refresh. Off writes duration 0
+reload, and when leaving an armed calculation on the main page. Navigation does
+not wait for resets. Once Off is confirmed, repeated navigation performs no reset
+reads or writes. Focus and settings-category mount/unmount do not trigger refresh.
+Actual plugin changes and reconnection revalidate state; duplicate reset requests
+share one operation. Genuine background failures are shown once on the main page,
+with no contention popup for routine navigation. Off writes duration 0
 and heater target 0, matching Streamline's existing Off behavior. It is a reminder,
 not a hardware start lock; a physical start can still produce a short burst.
 A successful calculation applies the configured flow and calculated duration,
@@ -75,13 +89,18 @@ a temperature estimate through time, not a temperature measurement.
 ## Developer notes
 
 `auto-steam-session.js` owns Auto entry, preset actions, reset and restore, with a
-persisted manual backup and pitcher choice. `calibrated-steam.js` owns sample buffering
+persisted manual backup and pitcher choice. One session is retained for the app
+lifetime. `auto-steam-lifecycle.js` coordinates page visibility, actual settings
+changes and connection changes; background errors are deferred while off-page.
+`subscribeMachineConnectionChanges` uses existing device-stream subscriptions and
+returns a cleanup callback. Revalidation waits for machine telemetry to resume. `calibrated-steam.js` owns sample buffering
 and fresh calculation validation. `calibrated-steam-ui.js` connects these to the
 existing API/scale socket and UI. `api.js` suppresses manual steam reconciliation
 while the persisted Auto session owns the settings. `settings/categories/auto-steam.js`
 is shared by the shell and legacy settings navigation paths.
 
-Requires calculator API version 3 in Decaid's bundled plugin v0.4.0;
+Requires calculator API version 3 (introduced in v0.4.0); use bundled plugin
+v0.6.0 for the compact settings page and concise pitcher errors;
 `status.availablePitchers` still determines the configured presets. Empty setup keeps top-level Auto available and Off,
 with a setup reminder instead of pitcher buttons. Incomplete calibration disables
 calculation; manual Flow and Time continue to work. Settings and API keys retain

@@ -750,6 +750,19 @@ const deviceReconnectListeners = new Set();
 const deviceDisconnectListeners = new Set();
 const deviceErrorListeners = new Set();
 
+export function subscribeMachineConnectionChanges(listener) {
+    const identity = data => JSON.stringify((data?.devices || []).filter(device => device.type === 'machine' && device.state === 'connected').map(device => device.id).sort());
+    let previous = identity(lastDeviceData);
+    const onData = data => {
+        const next = identity(data);
+        if (next !== previous) { previous = next; listener(); }
+    };
+    const onDisconnect = () => { previous = 'disconnected'; listener(); };
+    deviceDataListeners.add(onData);
+    deviceDisconnectListeners.add(onDisconnect);
+    return () => { deviceDataListeners.delete(onData); deviceDisconnectListeners.delete(onDisconnect); };
+}
+
 export function connectDeviceWebSocket(onData, onReconnect, onDisconnect, onError) {
     // Every caller is a subscriber (mirrors connectDisplayWebSocket). This used to
     // close and replace the whole connection per call, so app.js connecting at boot
@@ -2466,6 +2479,7 @@ export async function setPluginSettings(pluginId, settings) {
             throw new Error(`Failed to set plugin settings for ${pluginId}. Status: ${response.status}, Body: ${errorBody}`);
         }
         logger.info(`Plugin settings for ${pluginId} updated successfully:`, settings);
+        if (pluginId === CALIBRATED_STEAM_PLUGIN) document.dispatchEvent(new Event('streamline:auto-steam-settings'));
         return true;
     } catch (error) {
         throw error; // Re-throw to allow calling code to handle
@@ -2903,13 +2917,17 @@ export async function setDefaultSkin(skinId) {
 export async function enablePlugin(pluginId) {
     const response = await fetch(`${API_BASE_URL}/plugins/${encodeURIComponent(pluginId)}/enable`, { method: 'POST' });
     if (!response.ok) throw new Error(`Failed to enable plugin ${pluginId}: ${response.status} ${response.statusText}`);
-    return response.json();
+    const result = await response.json();
+    if (pluginId === CALIBRATED_STEAM_PLUGIN) document.dispatchEvent(new Event('streamline:auto-steam-settings'));
+    return result;
 }
 
 export async function disablePlugin(pluginId) {
     const response = await fetch(`${API_BASE_URL}/plugins/${encodeURIComponent(pluginId)}/disable`, { method: 'POST' });
     if (!response.ok) throw new Error(`Failed to disable plugin ${pluginId}: ${response.status} ${response.statusText}`);
-    return response.json();
+    const result = await response.json();
+    if (pluginId === CALIBRATED_STEAM_PLUGIN) document.dispatchEvent(new Event('streamline:auto-steam-settings'));
+    return result;
 }
 
 // Plugin distribution is Decaid's job: it records where each plugin came from

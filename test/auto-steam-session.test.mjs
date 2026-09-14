@@ -177,8 +177,85 @@ test('guided calibration blocks Auto entry, recalculation, reset and manual rest
     await h.session.enter();
     h.status({ apiVersion: 3, calibrationActive: true, ready: true, availablePitchers: ['small'] });
     const before = h.writes.length;
-    for (const action of [() => h.session.enter(), () => h.session.select('small'), () => h.session.invalidate(), () => h.session.leave()]) {
+    for (const action of [() => h.session.enter(), () => h.session.select('small'), () => h.session.leave()]) {
         await assert.rejects(action(), /guided calibration/);
     }
+    await h.session.invalidate({ verify: true });
     assert.equal(h.writes.length, before);
+});
+
+test('repeated navigation while already Off performs no additional reads or writes', async () => {
+    let reads = 0;
+    let steam = { duration: 30, flow: 1, targetTemperature: 145, stopAtTemperature: 0 };
+    const writes = [];
+    const session = createAutoSteamSession({ getContext: async () => { reads++; return { machine: { state: 'idle' }, workflow: { steamSettings: steam } }; },
+        getStatus: async () => ({ apiVersion: 3, ready: true, settings: { referenceFlow: 0.4 }, availablePitchers: ['small'] }),
+        write: async value => { steam = value; writes.push(value); }, calculate: async () => {}, persist() {}, onChange() {} });
+    await session.enter(); const before = reads;
+    await Promise.all(Array.from({ length: 12 }, () => session.invalidate()));
+    assert.equal(reads, before); assert.equal(writes.length, 1);
+});
+
+test('idle telemetry racing a navigation reset shares one operation', async () => {
+    const h = harness(); await h.session.enter(); await h.session.select('small');
+    const before = h.writes.length;
+    await Promise.all([h.session.invalidate(), h.machine('idle'), h.session.invalidate(), h.machine('idle')]);
+    assert.equal(h.writes.length, before + 1);
+    assert.equal(h.writes.at(-1).duration, 0);
+});
+
+test('revalidation reads live settings but skips a redundant Off write', async () => {
+    const h = harness(); await h.session.enter(); const before = h.writes.length;
+    await h.session.invalidate({ verify: true });
+    assert.equal(h.writes.length, before);
+    h.status({ apiVersion: 3, ready: true, settings: { referenceFlow: 1.2 }, availablePitchers: ['small'] });
+    await h.session.invalidate({ verify: true });
+    assert.equal(h.writes.at(-1).flow, 1.2);
+    assert.equal(h.writes.length, before + 1);
+});
+
+test('navigation during a slow calculation cancels arming without a contention error', async () => {
+    let release;
+    let steam = { duration: 30, flow: 1, targetTemperature: 145, stopAtTemperature: 0 };
+    const writes = [];
+    const session = createAutoSteamSession({ getContext: async () => ({ machine: { state: 'idle' }, workflow: { steamSettings: steam } }),
+        getStatus: async () => ({ apiVersion: 3, ready: true, settings: { referenceFlow: 0.4 }, availablePitchers: ['small'] }),
+        write: async value => { steam = value; writes.push(value); },
+        calculate: async () => { await new Promise(resolve => { release = resolve; }); return { workflowPatch: { steamSettings: { duration: 20, flow: 0.4 } } }; }, persist() {}, onChange() {} });
+    await session.enter(); const selecting = session.select('small');
+    await new Promise(resolve => setImmediate(resolve));
+    const resetting = session.invalidate(); release();
+    assert.equal(await selecting, null); await resetting;
+    assert.equal(writes.some(value => value.duration === 20), false);
+    assert.equal(steam.duration, 0);
+});
+
+test('a failed background reset is reported once and is not retried on each navigation', async () => {
+    let failing = false, writes = 0;
+    let steam = { duration: 30, flow: 1, targetTemperature: 145, stopAtTemperature: 0 };
+    const session = createAutoSteamSession({ getContext: async () => ({ machine: { state: 'idle' }, workflow: { steamSettings: steam } }),
+        getStatus: async () => ({ apiVersion: 3, ready: true, settings: { referenceFlow: 0.4 }, availablePitchers: ['small'] }),
+        write: async value => { writes++; if (failing) throw new Error('Machine write failed'); steam = value; },
+        calculate: async () => ({ workflowPatch: { steamSettings: { duration: 20, flow: 0.4 } } }), persist() {}, onChange() {} });
+    await session.enter(); await session.select('small'); failing = true;
+    await assert.rejects(session.invalidate(), /Machine write failed/); const before = writes;
+    await session.invalidate(); await session.observeMachine('idle'); await session.invalidate();
+    assert.equal(writes, before);
+    failing = false; await session.invalidate({ verify: true }); assert.equal(steam.duration, 0);
+});
+
+test('a pending Off reset survives rapid navigation and coalesces further requests', async () => {
+    let release, delay = false;
+    let steam = { duration: 30, flow: 1, targetTemperature: 145, stopAtTemperature: 0 };
+    const writes = [];
+    const session = createAutoSteamSession({ getContext: async () => ({ machine: { state: 'idle' }, workflow: { steamSettings: steam } }),
+        getStatus: async () => ({ apiVersion: 3, ready: true, settings: { referenceFlow: 0.4 }, availablePitchers: ['small'] }),
+        write: async value => { writes.push(value); if (delay) await new Promise(resolve => { release = resolve; }); steam = value; },
+        calculate: async () => ({ workflowPatch: { steamSettings: { duration: 20, flow: 0.4 } } }), persist() {}, onChange() {} });
+    await session.enter(); await session.select('small'); delay = true;
+    const first = session.invalidate(); await new Promise(resolve => setImmediate(resolve));
+    const second = session.invalidate(); const idle = session.observeMachine('idle');
+    delay = false; release(); await Promise.all([first, second, idle]);
+    assert.equal(writes.filter(value => value.duration === 0).length, 2);
+    assert.equal(steam.duration, 0);
 });

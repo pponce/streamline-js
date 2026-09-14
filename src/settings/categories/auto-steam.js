@@ -62,7 +62,6 @@ export function mountSettingsCategory({ container }) {
             await (loaded ? disablePlugin(CALIBRATED_STEAM_PLUGIN) : enablePlugin(CALIBRATED_STEAM_PLUGIN));
             if (!current()) return;
             loaded = !loaded;
-            document.dispatchEvent(new Event('streamline:auto-steam-settings'));
             await paint();
         } catch (error) { if (current()) message.textContent = error.message; }
         finally { if (current()) toggle.disabled = false; }
@@ -72,6 +71,5 @@ export function mountSettingsCategory({ container }) {
         toggle.onclick = null;
         open.onclick = null;
         root.remove();
-        document.dispatchEvent(new Event('streamline:auto-steam-settings'));
     };
 }
