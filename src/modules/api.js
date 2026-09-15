@@ -1,6 +1,8 @@
 import * as ui from './ui.js';
 import { logger ,setDebug} from './logger.js';
 import { createSocketSlot } from './socket-slot.js';
+import { CALIBRATED_STEAM_PLUGIN, createScaleSampleBuffer } from './calibrated-steam.js';
+import { AUTO_STEAM_SESSION_KEY, readAutoSteamSession } from './auto-steam-session.js';
 import { openDB, getSetting, setSetting } from './idb.js';
 import { buildCalibrateBody, classifyCalState } from './loadcell-cal.js';
 import { deriveDisplayAction, isScreensaverSuppressed } from './screensaver-policy.js';
@@ -39,6 +41,27 @@ export let reconnectingWebSocket = null; // Exporting for app.js access
 export let currentMachineState = null;
 let previousMachineState = null;
 let scaleWebSocket = null;
+const calibratedSteamSamples = createScaleSampleBuffer();
+
+export function getCalibratedSteamSamples() {
+    return calibratedSteamSamples.read();
+}
+
+export async function calibratedSteamRequest(endpoint, body) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    try {
+        const response = await fetch(`${API_BASE_URL}/plugins/${CALIBRATED_STEAM_PLUGIN}/${endpoint}`, {
+            method: body === undefined ? 'GET' : 'POST',
+            headers: { 'content-type': 'application/json' },
+            ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+            signal: controller.signal,
+        });
+        const data = await response.json();
+        if (!response.ok) throw Object.assign(new Error(data.message || data.error || 'Enable the calibrated steam extension in Plugins.'), { status: response.status });
+        return data;
+    } finally { clearTimeout(timeout); }
+}
 let sensorSnapshotWebSocket = null;
 let sensorSnapshotWebSocketId = null; // sensor `id` the open socket is bound to
 let displayWebSocket = null;
@@ -500,6 +523,7 @@ export function connectWebSocket(onData, onReconnect) {
 }
 
 export function connectScaleWebSocket(onData, onReconnect, onDisconnect) {
+    calibratedSteamSamples.clear();
     if (scaleWebSocket) {
         logger.info('Closing existing scale WebSocket before creating a new one.');
         scaleWebSocket.close();
@@ -510,6 +534,7 @@ export function connectScaleWebSocket(onData, onReconnect, onDisconnect) {
     });
 
     scaleWebSocket.onopen = () => {
+        calibratedSteamSamples.clear();
         logger.info('Scale WebSocket (re)connected.');
         if (onReconnect) {
             onReconnect();
@@ -520,12 +545,15 @@ export function connectScaleWebSocket(onData, onReconnect, onDisconnect) {
         try {
             const data = JSON.parse(event.data);
             if (data.status === 'disconnected') {
+                calibratedSteamSamples.clear();
                 logger.info('Scale disconnected (server status frame).');
                 if (onDisconnect) onDisconnect();
             } else if (data.status === 'connected') {
+                calibratedSteamSamples.clear();
                 logger.info('Scale connected (server status frame).');
                 if (onReconnect) onReconnect();
             } else {
+                calibratedSteamSamples.push(data);
                 onData(data);
             }
         } catch (error) {
@@ -534,6 +562,7 @@ export function connectScaleWebSocket(onData, onReconnect, onDisconnect) {
     };
 
     scaleWebSocket.onclose = () => {
+        calibratedSteamSamples.clear();
         logger.info('Scale WebSocket disconnected.');
         if (onDisconnect) {
             onDisconnect();
@@ -720,6 +749,19 @@ const deviceDataListeners = new Set();
 const deviceReconnectListeners = new Set();
 const deviceDisconnectListeners = new Set();
 const deviceErrorListeners = new Set();
+
+export function subscribeMachineConnectionChanges(listener) {
+    const identity = data => JSON.stringify((data?.devices || []).filter(device => device.type === 'machine' && device.state === 'connected').map(device => device.id).sort());
+    let previous = identity(lastDeviceData);
+    const onData = data => {
+        const next = identity(data);
+        if (next !== previous) { previous = next; listener(); }
+    };
+    const onDisconnect = () => { previous = 'disconnected'; listener(); };
+    deviceDataListeners.add(onData);
+    deviceDisconnectListeners.add(onDisconnect);
+    return () => { deviceDataListeners.delete(onData); deviceDisconnectListeners.delete(onDisconnect); };
+}
 
 export function connectDeviceWebSocket(onData, onReconnect, onDisconnect, onError) {
     // Every caller is a subscriber (mirrors connectDisplayWebSocket). This used to
@@ -1512,7 +1554,9 @@ export async function readSharedValue(key) {
 // is the source of truth so a phone and a tablet agree on the target;
 // IndexedDB is only consulted if the store can't be reached.
 export async function resyncIfDrifted(key, fetchedValue, pushFn) {
+    if (isAutoSteamActive() && [STEAM_DURATION_LAST_VALUE_KEY, STEAM_FLOW_LAST_VALUE_KEY, MILK_STOP_LAST_VALUE_KEY].includes(key)) return null;
     const remembered = await readSharedValue(key);
+    if (isAutoSteamActive() && [STEAM_DURATION_LAST_VALUE_KEY, STEAM_FLOW_LAST_VALUE_KEY, MILK_STOP_LAST_VALUE_KEY].includes(key)) return null;
     // No record of the user ever setting this -> whatever the machine holds
     // stands. Otherwise the remembered value wins, INCLUDING when the workflow
     // has no value at all (fetchedValue null/undefined): a missing field is not
@@ -1601,9 +1645,33 @@ async function steamHeaterFor(duration) {
 // Writing it first makes the store the record of intent, which is what
 // resyncSteamFromStore replays when a push doesn't land.
 export async function setTargetSteamDuration(duration) {
+    if (isAutoSteamActive()) throw new Error('Use a pitcher preset in Auto mode, or switch to Flow or Time.');
     const value = parseFloat(duration);
     await persistSharedValue(STEAM_DURATION_LAST_VALUE_KEY, value);
     return updateWorkflow({ steamSettings: { duration: value, ...(await steamHeaterFor(value)) } });
+}
+
+export function isAutoSteamActive() {
+    return readAutoSteamSession(localStorage.getItem(AUTO_STEAM_SESSION_KEY)).active === true;
+}
+
+export async function getCalibrationHeaterTemperature() {
+    const saved = readAutoSteamSession(localStorage.getItem(AUTO_STEAM_SESSION_KEY));
+    const value = saved.active && saved.manual?.targetTemperature > 0
+        ? saved.manual.targetTemperature : await readSharedValue(STEAM_TEMP_LAST_VALUE_KEY);
+    return Number.isInteger(value) && value >= 135 && value <= 165 ? value : null;
+}
+
+export async function writeAutoSteamSettings(steam) {
+    const { duration, flow, targetTemperature, stopAtTemperature } = steam;
+    if (!Number.isInteger(duration) || duration < 0 || duration > 255 ||
+        !Number.isFinite(flow) || flow < 0 || flow > 2.5 ||
+        !Number.isInteger(targetTemperature) || targetTemperature < 0 || targetTemperature > 165 ||
+        (stopAtTemperature !== undefined && (!Number.isFinite(stopAtTemperature) || stopAtTemperature < 0 || stopAtTemperature > 80))) {
+        throw new Error('Invalid Auto steam settings.');
+    }
+    return updateWorkflow({ steamSettings: { duration, flow, targetTemperature,
+        ...(stopAtTemperature === undefined ? {} : { stopAtTemperature }) } });
 }
 
 // Steam-heater switch for procedures that must not run against a hot steam
@@ -1615,6 +1683,7 @@ export async function setSteamHeaterEnabled(enabled) {
 }
 
 export async function setTargetSteamFlow(flow) {
+    if (isAutoSteamActive()) throw new Error('Use a pitcher preset in Auto mode, or switch to Flow or Time.');
     const value = parseFloat(flow);
     await persistSharedValue(STEAM_FLOW_LAST_VALUE_KEY, value);
     return updateWorkflow({ steamSettings: { flow: value } });
@@ -2410,6 +2479,7 @@ export async function setPluginSettings(pluginId, settings) {
             throw new Error(`Failed to set plugin settings for ${pluginId}. Status: ${response.status}, Body: ${errorBody}`);
         }
         logger.info(`Plugin settings for ${pluginId} updated successfully:`, settings);
+        if (pluginId === CALIBRATED_STEAM_PLUGIN) document.dispatchEvent(new Event('streamline:auto-steam-settings'));
         return true;
     } catch (error) {
         throw error; // Re-throw to allow calling code to handle
@@ -2847,13 +2917,17 @@ export async function setDefaultSkin(skinId) {
 export async function enablePlugin(pluginId) {
     const response = await fetch(`${API_BASE_URL}/plugins/${encodeURIComponent(pluginId)}/enable`, { method: 'POST' });
     if (!response.ok) throw new Error(`Failed to enable plugin ${pluginId}: ${response.status} ${response.statusText}`);
-    return response.json();
+    const result = await response.json();
+    if (pluginId === CALIBRATED_STEAM_PLUGIN) document.dispatchEvent(new Event('streamline:auto-steam-settings'));
+    return result;
 }
 
 export async function disablePlugin(pluginId) {
     const response = await fetch(`${API_BASE_URL}/plugins/${encodeURIComponent(pluginId)}/disable`, { method: 'POST' });
     if (!response.ok) throw new Error(`Failed to disable plugin ${pluginId}: ${response.status} ${response.statusText}`);
-    return response.json();
+    const result = await response.json();
+    if (pluginId === CALIBRATED_STEAM_PLUGIN) document.dispatchEvent(new Event('streamline:auto-steam-settings'));
+    return result;
 }
 
 // Plugin distribution is Decaid's job: it records where each plugin came from

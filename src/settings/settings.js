@@ -1,5 +1,6 @@
+import { pluginSettingsUrl } from '../modules/plugin-settings-navigation.js';
 import { isEcoSteamEnabled, setEcoSteamEnabled } from '../modules/eco-steam.js';
-import {  getReaSettings, getDe1Settings, getDe1AdvancedSettings, setReaSettings, setDe1Settings, setDe1AdvancedSettings, resetDe1Settings, setMachineState, connectScaleDevice, connectDeviceWebSocket, sendDeviceCommand, awaitDeviceConnectResult, dimDisplay, restoreDisplay, isBlackScreenSaver, setBlackScreenSaver as apiSetBlackScreenSaver, rememberBrightness, getLastDisplayState, currentMachineState, signalHeartbeat, MachineState, getDeviceWebSocket, initDeviceWebSocketWithCallback, saveScaleDeviceId, getScaleDeviceId, connectDisplayWebSocket, sendDisplayCommand, connectUpdateWebSocket, sendUpdateCommand, enableWakeLock, disableWakeLock, isWakeLockEnabled, isWakeProfileEnabled, getWakeProfileId, getPresenceSettings, setPresenceSettings, getPresenceSchedules, createPresenceSchedule, updatePresenceSchedule, deletePresenceSchedule, getAppInfo, getMachineInfo, getWorkflow, updateWorkflow, getAllSkins, getDefaultSkin, setDefaultSkin, updateSkins, stopWebuiServer, startWebuiServer, getWebuiServerStatus, uploadFirmware, applyFirmware, cancelFirmwareUpdate, getFirmwareCatalog, setWaterLevels, API_BASE_URL, listWifiScales, addWifiScale, removeWifiScale, forgetDevice, getLedStrip, setLedStrip, commitLedStrip, getCupWarmer, setCupWarmer, setCupWarmerPrewarm, calibrateScale, tareScale, getSensorCalibration, setSensorCalibration, getLastMachineSnapshot, ensureMachineSnapshotSocket, connectScaleWebSocket, setFirmwareFlashInFlight, persistSharedValue, MILK_STOP_LAST_VALUE_KEY, STEAM_DURATION_LAST_VALUE_KEY, STEAM_FLOW_LAST_VALUE_KEY, STEAM_TEMP_LAST_VALUE_KEY, HOT_WATER_VOLUME_LAST_VALUE_KEY, HOT_WATER_TEMP_LAST_VALUE_KEY, approvePluginUpdate, getPlugins, getDecentAccountStatus, getPluginSettings, setPluginSettings, callPluginEndpoint, enablePlugin } from '../modules/api.js';
+import {  getCalibrationHeaterTemperature, getReaSettings, getDe1Settings, getDe1AdvancedSettings, setReaSettings, setDe1Settings, setDe1AdvancedSettings, resetDe1Settings, setMachineState, connectScaleDevice, connectDeviceWebSocket, sendDeviceCommand, awaitDeviceConnectResult, dimDisplay, restoreDisplay, isBlackScreenSaver, setBlackScreenSaver as apiSetBlackScreenSaver, rememberBrightness, getLastDisplayState, currentMachineState, signalHeartbeat, MachineState, getDeviceWebSocket, initDeviceWebSocketWithCallback, saveScaleDeviceId, getScaleDeviceId, connectDisplayWebSocket, sendDisplayCommand, connectUpdateWebSocket, sendUpdateCommand, enableWakeLock, disableWakeLock, isWakeLockEnabled, isWakeProfileEnabled, getWakeProfileId, getPresenceSettings, setPresenceSettings, getPresenceSchedules, createPresenceSchedule, updatePresenceSchedule, deletePresenceSchedule, getAppInfo, getMachineInfo, getWorkflow, updateWorkflow, getAllSkins, getDefaultSkin, setDefaultSkin, updateSkins, stopWebuiServer, startWebuiServer, getWebuiServerStatus, uploadFirmware, applyFirmware, cancelFirmwareUpdate, getFirmwareCatalog, setWaterLevels, API_BASE_URL, listWifiScales, addWifiScale, removeWifiScale, forgetDevice, getLedStrip, setLedStrip, commitLedStrip, getCupWarmer, setCupWarmer, setCupWarmerPrewarm, calibrateScale, tareScale, getSensorCalibration, setSensorCalibration, getLastMachineSnapshot, ensureMachineSnapshotSocket, connectScaleWebSocket, setFirmwareFlashInFlight, persistSharedValue, MILK_STOP_LAST_VALUE_KEY, STEAM_DURATION_LAST_VALUE_KEY, STEAM_FLOW_LAST_VALUE_KEY, STEAM_TEMP_LAST_VALUE_KEY, HOT_WATER_VOLUME_LAST_VALUE_KEY, HOT_WATER_TEMP_LAST_VALUE_KEY, approvePluginUpdate, getPlugins, getDecentAccountStatus, getPluginSettings, setPluginSettings, callPluginEndpoint, enablePlugin } from '../modules/api.js';
 import * as ui from '../modules/ui.js';
 import { availableProfiles, translateProfileTitle, loadAvailableProfiles } from '../modules/profileManager.js';
 import { initScaling } from '../modules/scaling.js';
@@ -441,7 +442,20 @@ async function mountMaintenanceCategory(category, container) {
     }
 }
 
+let autoSteamCleanup = null;
+let autoSteamSequence = 0;
+
+async function mountAutoSteamCategory(container) {
+    const sequence = autoSteamSequence;
+    const module = await import('./categories/auto-steam.js');
+    if (sequence !== autoSteamSequence) return;
+    autoSteamCleanup = module.mountSettingsCategory({ container });
+}
+
 function updateSettingsContentArea(category) {
+    autoSteamSequence++;
+    autoSteamCleanup?.();
+    autoSteamCleanup = null;
     // Always tear the previous maintenance mount down, including when moving
     // between two maintenance pages — its poller and listeners are per-mount.
     maintenanceSequence += 1;
@@ -495,6 +509,7 @@ function updateSettingsContentArea(category) {
                 ui.initThemeToggle();
             }, 100);
         }
+        if (category === 'autosteam') mountAutoSteamCategory(contentArea).catch(error => logger.error(error));
         if (category === 'plugins') {
             setTimeout(() => window.loadPluginList?.(), 0);
         }
@@ -774,6 +789,8 @@ export function renderSettingsContent(category) {
         case 'language':
         case 'selectlanguage':
             return renderLanguageSettings();
+        case 'autosteam':
+            return '';
         case 'plugins':
             return renderPluginManagerSettings();
         case 'shotupload':
@@ -6156,6 +6173,9 @@ export function renderExtensionsSettings() {
 function pluginUiUrl(plugin) {
     const endpoints = Array.isArray(plugin?.api) ? plugin.api : [];
     const hasUi = endpoints.some(e => e?.type === 'http' && e?.id === 'ui');
+    if (hasUi && plugin.id === 'calibrated-steam.reaplugin') {
+        return pluginSettingsUrl(API_BASE_URL, plugin.id, new URL('?page=settings', window.location.href).href);
+    }
     return hasUi ? `${API_BASE_URL}/plugins/${encodeURIComponent(plugin.id)}/ui` : null;
 }
 
@@ -7858,6 +7878,17 @@ export async function initializeSettings({ initialMainCategory = null, initialCa
                 </div>
             `;
             }).join('');
+            for (const link of container.querySelectorAll('a[href]')) {
+                if (!link.href.includes('/plugins/calibrated-steam.reaplugin/ui')) continue;
+                link.onclick = async event => {
+                    event.preventDefault();
+                    try {
+                        const heater = await getCalibrationHeaterTemperature();
+                        window.location.assign(pluginSettingsUrl(API_BASE_URL, 'calibrated-steam.reaplugin', new URL('?page=settings', window.location.href).href, heater));
+                    } catch (error) { ui.showToast(error.message, 3000, 'error'); }
+                };
+            }
+
 
             // Listener rather than an inline onchange: the id is manifest text, and
             // Decaid's id rule allows an apostrophe, which would end the JS string
@@ -9347,6 +9378,9 @@ function setupSettingsSearch(activateResult) {
 }
 
 export function cleanupSettings() {
+    autoSteamSequence++;
+    autoSteamCleanup?.();
+    autoSteamCleanup = null;
     stopCupWarmerPoll();
     clearTimeout(_settingsNumpadTimer);
     _settingsNumpadTimer = null;
