@@ -950,7 +950,9 @@ function updateSteamPresetDisplay() {
     for (const id of ['steam-minus', 'steam-plus']) {
         const button = document.getElementById(id);
         if (button) {
-            button.style.display = adjustment.visible ? '' : 'none';
+            button.style.display = '';
+            const icon = button.querySelector('svg');
+            if (icon) icon.style.visibility = adjustment.visible ? '' : 'hidden';
             button.disabled = id === 'steam-minus' ? adjustment.minusDisabled : adjustment.plusDisabled;
             button.setAttribute('aria-label', getTranslation(id === 'steam-minus' ? (steamMode === 'auto' ? 'Decrease Auto steam flow' : 'Decrease steam setting') : (steamMode === 'auto' ? 'Increase Auto steam flow' : 'Increase steam setting')));
         }

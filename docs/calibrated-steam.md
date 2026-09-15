@@ -75,7 +75,8 @@ calibration field or temperature compensation is used; keep the same normal heat
 setting as the calibration run. There is no configurable maximum duration. Auto flow is configured in the extension settings: **0.4–2.5 ml/s**,
 default **0.4 ml/s**. Measure calibration time at that flow; recalibrate after
 changing it in Single flow. Direct number editors are inactive in Auto. Single-flow
-Auto hides − / +. Multiple-flow Auto shows − / + to adjust flow in 0.1 ml/s steps
+Auto hides only the − / + icons, keeping their gray button backgrounds visible and
+disabled. Multiple-flow Auto shows − / + to adjust flow in 0.1 ml/s steps
 within measured bounds while idle; changing flow resets time to Off and requires
 a fresh pitcher tap. Manual Flow and Time keep their normal − / + controls.
 
