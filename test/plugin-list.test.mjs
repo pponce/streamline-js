@@ -1,3 +1,4 @@
+import { pluginSettingsUrl } from '../src/modules/plugin-settings-navigation.js';
 import { readFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -11,7 +12,7 @@ import { test } from 'node:test';
 const source = readFileSync(new URL('../src/settings/settings.js', import.meta.url), 'utf8');
 const match = source.match(/^function pluginUiUrl\(plugin\) \{[\s\S]*?\r?\n\}/m);
 assert.ok(match, 'pluginUiUrl not found in settings.js');
-const pluginUiUrl = new Function('API_BASE_URL', `${match[0]}\nreturn pluginUiUrl;`)('http://x:8080/api/v1');
+const pluginUiUrl = new Function('API_BASE_URL', 'pluginSettingsUrl', 'window', `${match[0]}\nreturn pluginUiUrl;`)('http://x:8080/api/v1', pluginSettingsUrl, { location: { href: 'http://x:43210/?page=settings' } });
 
 test('a plugin declaring a ui endpoint gets a link to it', () => {
     assert.equal(
@@ -188,4 +189,11 @@ test('a link to somewhere other than the bridge survives', () => {
 test('a missing description reads as empty, not "undefined"', () => {
     assert.equal(pluginDescription({}), '');
     assert.equal(pluginDescription(null), '');
+});
+
+
+
+test('calculator Open button supplies the calling settings page as returnTo', () => {
+    const url = new URL(pluginUiUrl({ id: 'calibrated-steam.reaplugin', api: [{ id: 'ui', type: 'http' }] }));
+    assert.equal(url.searchParams.get('returnTo'), 'http://x:43210/?page=settings');
 });

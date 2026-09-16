@@ -110,7 +110,9 @@ async function renderCategory(mainCategory, category) {
     if (!content) return;
     const sequence = ++renderSequence;
     try {
-        const module = await CATEGORY_LOADERS[mainCategory]();
+        const module = category === 'autosteam'
+            ? await import('./categories/auto-steam.js')
+            : await CATEGORY_LOADERS[mainCategory]();
         if (sequence !== renderSequence) return;
         currentCleanup = await module.mountSettingsCategory({
             container: content,
