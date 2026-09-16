@@ -82,7 +82,7 @@ let steamMode = 'time'; // 'time' | 'flow' | 'temperature' (temperature = milk a
 let calibratedSteam = null;
 let calibratedSteamAvailable = false;
 let calibratedSteamApplying = false;
-let calibratedSteamJug = null;
+let calibratedSteamPitcher = null;
 let calibratedSteamPitchers = [];
 let calibratedSteamConfigured = false;
 let calibratedSteamState = {};
@@ -937,11 +937,11 @@ function updateSteamPresetDisplay() {
     const milkPresetContainer = document.getElementById('steam-milk-presets');
     const autoPresetContainer = document.getElementById('steam-auto-presets');
     autoPresetContainer?.classList.toggle('hidden', steamMode !== 'auto');
-    document.querySelectorAll('[data-auto-jug]').forEach(button => {
-        const selected = button.dataset.autoJug === calibratedSteamJug;
+    document.querySelectorAll('[data-auto-pitcher]').forEach(button => {
+        const selected = button.dataset.autoPitcher === calibratedSteamPitcher;
         button.classList.toggle('preset-active', selected);
         button.setAttribute('aria-pressed', String(selected));
-        button.style.display = calibratedSteamPitchers.includes(button.dataset.autoJug) ? '' : 'none';
+        button.style.display = calibratedSteamPitchers.includes(button.dataset.autoPitcher) ? '' : 'none';
         button.disabled = calibratedSteamApplying || !calibratedSteamConfigured;
     });
     const setup = document.getElementById('steam-auto-setup');
@@ -2340,7 +2340,7 @@ export function initUI(callbacks) {
         onChange(state) {
             calibratedSteamState = state;
             calibratedSteamApplying = state.busy;
-            calibratedSteamJug = state.jug;
+            calibratedSteamPitcher = state.pitcher;
             calibratedSteamPitchers = state.availablePitchers;
             calibratedSteamConfigured = state.configurationReady;
             if (state.active) steamMode = 'auto';
@@ -2358,13 +2358,13 @@ export function initUI(callbacks) {
         },
         onError(error) { showToast(error.message, 5000, 'error'); },
     });
-    for (const button of document.querySelectorAll('[data-auto-jug]')) {
+    for (const button of document.querySelectorAll('[data-auto-pitcher]')) {
         button.onclick = async () => {
             try {
-                const result = await calibratedSteam.select(button.dataset.autoJug);
+                const result = await calibratedSteam.select(button.dataset.autoPitcher);
                 if (!result) return;
-                const jug = result.jugSource === 'tared' ? getTranslation('Milk only') : getTranslation(result.jug);
-                showToast(`${jug} · ${result.milkGrams} g · ${result.durationSeconds} s`, 4000);
+                const pitcher = result.pitcherSource === 'tared' ? getTranslation('Milk only') : getTranslation(result.pitcher);
+                showToast(`${pitcher} · ${result.milkGrams} g · ${result.durationSeconds} s`, 4000);
             } catch (error) { showToast(error.message, 5000, 'error'); }
         };
     }

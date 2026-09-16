@@ -7,12 +7,13 @@ supply a return address: **Return to settings** exits without saving; a successf
 **Save calibration** returns to the calling settings category. Errors keep the
 form open. No iframe is used.
 
-The v0.7.0 page has compact **General**, **Pitchers & Auto**, and **Calibration**
+The settings page has compact **General**, **Pitchers & Auto**, and **Calibration**
 tabs. Both Flow fields edit one saved plugin default; changing it clears the old
 calibration time only in Single flow. Multiple flows preserves measurements when
 the default changes within the calibrated range. Tare stays beside the pitcher controls, capture buttons work
 without field focus, and errors appear beside the action. The summary shows which
-choices are configured and whether calibration is ready. Invalid saves open the
+choices are configured using green S, M, L and Auto badges, with calibration
+readiness and flow displayed separately. Invalid saves open the
 relevant tab and field.
 
 Enter at least one Small, Medium or Large empty-pitcher weight, calibration
@@ -31,8 +32,7 @@ Return to settings cancels an active run and waits for restoration. Page closure
 expires the session; interrupted runs cannot become calibrations. Both Streamline
 Open settings links pass its remembered normal heater target when needed after
 Auto Off. While guided calibration is active, Streamline defers its Auto writes
-and resets. The extension uses machine-event permission in v0.5.0; an installed
-plugin update may require approval for the additional permission.
+and resets. The extension uses machine events to follow the guided calibration.
 
 **Offer Auto pitcher selection** is optional and initially off. Enabling it
 reveals the required usual milk per drink and Small/Medium pitcher normally used
@@ -122,14 +122,13 @@ existing API/scale socket and UI. `api.js` suppresses manual steam reconciliatio
 while the persisted Auto session owns the settings. `settings/categories/auto-steam.js`
 is shared by the shell and legacy settings navigation paths.
 
-Requires calculator API version 3 (introduced in v0.4.0); use bundled plugin
-v0.7.0 for multiple-flow calibration. New requests include the selected `flow` on
-both calculation passes, verify the returned flow, and apply its duration/flow
-pair. Status without `flowCalibration` falls back to fixed-flow controls;
-`status.availablePitchers` still determines the configured presets. Empty setup keeps top-level Auto available and Off,
-with a setup reminder instead of pitcher buttons. Incomplete calibration disables
-calculation; manual Flow and Time continue to work. Settings and API keys retain
-legacy `jug` names for compatibility; displayed text uses “pitcher.”
+Requires calculator API version 4. Requests include the selected `pitcher` and
+`flow` on both calculation passes, verify the returned pitcher and flow, and apply
+the duration/flow pair. `status.flowCalibration` determines whether flow is
+adjustable; `status.availablePitchers` determines the configured presets. Empty
+setup keeps top-level Auto available and Off, with a setup reminder instead of
+pitcher buttons. Incomplete calibration disables calculation; manual Flow and Time
+continue to work. Settings, API fields and UI labels use pitcher terminology.
 Calculation/settings remain maintained in Decaid, with no separate extension repo.
 Inspired by [Damian / Damian-AU's DSx2](https://github.com/Damian-AU/DSx2).
 
