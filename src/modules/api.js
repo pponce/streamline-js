@@ -2956,6 +2956,17 @@ export async function installPluginFromRelease(repo, { assetName, includePrerele
     return body;
 }
 
+export async function installPluginFromBranch(repo, branch = 'main') {
+    const response = await fetch(`${API_BASE_URL}/plugins/install/github-branch`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ repo, branch })
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.error || `Failed to install ${repo}: ${response.status} ${response.statusText}`);
+    return body;
+}
+
 // Checks every GitHub-backed plugin. Updates that need no new permission are
 // installed by Decaid during this call; ones that do land as pendingUpdate on
 // GET /plugins, so re-read the list afterwards to see what happened.

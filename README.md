@@ -378,7 +378,7 @@ blocked until one is connected — from the Coffee button and the keyboard short
 
 ## 9. Steam, hot water, and flush
 
-With Decaid's optional **Auto Steam Calculator** enabled, the Steam heading
+With the independently installed **Auto Steam Calculator** plugin enabled, the Steam heading
 cycles **Auto | F | T**. Auto shows configured **S / M / L** pitcher presets, plus **Auto** when opted in and configured; tapping one
 calculates and applies time and calibration flow. Auto uses Off until calculated
 and resets after steaming. Configure it at **Settings > Extensions > Auto Steam

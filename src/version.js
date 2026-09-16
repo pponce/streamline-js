@@ -6,4 +6,4 @@
 export const APP_VERSION = '0.1.111';
 
 // Our skin id as registered with Streamline-Bridge (matches manifest.json / reaMetadata.skinId).
-export const SKIN_ID = 'streamline.js';
+export const SKIN_ID = 'pponce.streamline-auto-steam';

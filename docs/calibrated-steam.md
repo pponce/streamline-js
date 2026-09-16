@@ -1,15 +1,27 @@
 # Auto Steam Calculator
 
-Open **Settings > Extensions > Auto Steam Calculator** to enable the bundled
-Decaid extension. Choose **Open settings** to open its standalone calibration
-page. **Extensions > Plugins > Open** reaches the same form. Both entry points
+The calculator is an independent [Decaid plugin](https://github.com/pponce/decentAutoSteamCalculator).
+It works with the official Android Decaid v0.8.6 release or newer; no custom APK
+is needed. Install this Streamline fork from `pponce/streamline-js`, branch
+`feature/calibrated-steam-timer`, using Decaid's skin selector → Install skin →
+GitHub Branch. Select **Streamline.js — Auto Steam**. Its test-only ID,
+`pponce.streamline-auto-steam`, keeps it separate from the official skin; restore
+the upstream skin identity before submitting that manifest change upstream.
+
+Open **Settings > Extensions > Auto Steam Calculator**. If absent, choose
+**Install Auto Steam Calculator**, then **Enable Auto Steam Calculator**.
+Installation uses Decaid's existing GitHub branch endpoint for
+`pponce/decentAutoSteamCalculator`, branch `main`. It does not enable the plugin
+or start steam automatically. An unreachable Decaid is reported as an error,
+not mistaken for a missing installation. Choose **Open settings** to open its
+standalone calibration page. **Extensions > Plugins > Open** reaches the same form. Both entry points
 supply a return address: **Return to settings** exits without saving; a successful
 **Save calibration** returns to the calling settings category. Errors keep the
 form open. No iframe is used.
 
-The settings page has compact **General**, **Pitchers & Auto**, and **Calibration**
+The settings page has compact **General**, **Pitchers & Auto**, **Calibration**, **Instructions**, and **Glossary**
 tabs. Both Flow fields edit one saved plugin default; changing it clears the old
-calibration time only in Single flow. Multiple flows preserves measurements when
+calibration weight and time only in Single flow. Multiple flows preserves measurements when
 the default changes within the calibrated range. Tare stays beside the pitcher controls, capture buttons work
 without field focus, and errors appear beside the action. The summary shows which
 choices are configured using green S, M, L and Auto badges, with calibration
@@ -95,7 +107,9 @@ a temperature estimate through time, not a temperature measurement.
 
 Calibration offers **Single flow** (one fixed measured flow) and **Multiple
 flows** (2–4 measurements, with 3 recommended). Select minimum/maximum flow,
-reading count, target milk weight and default Auto flow. The page suggests evenly
+reading count and default Auto flow. Record the actual milk-only weight for each reading;
+new manual readings start blank. An optional target milk temperature note is
+shown in summaries and does not control steaming. The page suggests evenly
 spaced points including both endpoints. Each point supports manual time entry or
 a guided run, using fresh milk at the same starting temperature each time.
 Guided Prepare applies that reading's flow before enabling Start. Start checks
@@ -129,7 +143,12 @@ adjustable; `status.availablePitchers` determines the configured presets. Empty
 setup keeps top-level Auto available and Off, with a setup reminder instead of
 pitcher buttons. Incomplete calibration disables calculation; manual Flow and Time
 continue to work. Settings, API fields and UI labels use pitcher terminology.
-Calculation/settings remain maintained in Decaid, with no separate extension repo.
+Calculations and settings are maintained in
+[pponce/decentAutoSteamCalculator](https://github.com/pponce/decentAutoSteamCalculator).
+The plugin ID and API contract are unchanged by separate installation. Decaid
+preserves existing settings when replacing that ID within the same application
+installation and tracks subsequent updates from the plugin's GitHub source.
+See its [installation and developer guide](https://github.com/pponce/decentAutoSteamCalculator/blob/main/docs/CalibratedSteam.md).
 Inspired by [Damian / Damian-AU's DSx2](https://github.com/Damian-AU/DSx2).
 
 Run `node --test test/auto-steam*.test.mjs test/calibrated-steam*.test.mjs test/steam-mode.test.mjs test/settings-sync.test.mjs test/settings-route-split.test.mjs`.
