@@ -2932,8 +2932,9 @@ export async function disablePlugin(pluginId) {
 
 // Plugin distribution is Decaid's job: it records where each plugin came from
 // (.rea_source.json) and installs updates itself on its normal update cadence.
-// These three cover everything Streamline needs — no direct GitHub calls, so no
-// rate limits, and no second opinion about what "latest" means.
+// Streamline normally reads that state. The Auto Steam settings card also reads
+// its canonical branch manifest so it can offer an update without invoking
+// Decaid's all-plugin update operation first.
 // Whether a Decent account is linked. Linking itself happens in Decaid's own
 // settings -- the bridge exposes only this status read (GET /account/decent), no
 // login endpoint -- so pages that need an account can gate on it but must send
@@ -2965,6 +2966,28 @@ export async function installPluginFromBranch(repo, branch = 'main') {
     const body = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(body.error || `Failed to install ${repo}: ${response.status} ${response.statusText}`);
     return body;
+}
+
+export async function getGitHubPluginManifest(repo, branch = 'main') {
+    const parts = String(repo || '').split('/');
+    if (parts.length !== 2 || parts.some(part => !/^[A-Za-z0-9_.-]+$/.test(part)) || !/^[A-Za-z0-9_.\/-]+$/.test(branch)) {
+        throw new Error('Invalid GitHub plugin source.');
+    }
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
+    const url = `https://raw.githubusercontent.com/${parts.map(encodeURIComponent).join('/')}/${branch.split('/').map(encodeURIComponent).join('/')}/manifest.json`;
+    try {
+        const response = await fetch(url, { cache: 'no-store', signal: controller.signal });
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(body.error || `GitHub returned ${response.status} ${response.statusText}`);
+        if (!body || typeof body !== 'object') throw new Error('GitHub returned an invalid plugin manifest.');
+        return body;
+    } catch (error) {
+        if (error?.name === 'AbortError') throw new Error('The update check timed out.');
+        throw error;
+    } finally {
+        clearTimeout(timeout);
+    }
 }
 
 // Checks every GitHub-backed plugin. Updates that need no new permission are
