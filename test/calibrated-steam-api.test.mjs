@@ -12,6 +12,18 @@ const build = update => new Function(
     `${match[0].replace('export ', '')}; return writeAutoSteamSettings;`,
 )(update, clampAutoSteamSettings);
 
+const errorMatch = source.match(/function pluginEndpointError\(pluginId, endpoint, status, errorBody\) \{[\s\S]*?\n\}/);
+assert.ok(errorMatch);
+const buildEndpointError = new Function(`${errorMatch[0]}; return pluginEndpointError;`)();
+
+test('plugin endpoint errors expose JSON messages and status metadata', () => {
+    const error = buildEndpointError('calibrated-steam.reaplugin', 'calculate', 422,
+        JSON.stringify({ code: 'invalid_milk_weight', message: 'Milk < 10 g · Medium pitcher' }));
+    assert.equal(error.message, 'Milk < 10 g · Medium pitcher');
+    assert.equal(error.status, 422);
+    assert.equal(error.code, 'invalid_milk_weight');
+});
+
 test('custom settings compatibility helpers stay on the shared plugin transport', () => {
     assert.match(source, /export function calibratedSteamRequest\(endpoint, body\) \{[\s\S]*?return callPluginEndpoint\(/);
     assert.match(source, /export async function getCalibrationHeaterTemperature\(\)/);

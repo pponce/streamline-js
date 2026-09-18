@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { autoSteamDurationLabel, autoSteamSelectionSettings, steamAdjustmentControls } from '../src/modules/auto-steam-flow.js';
+import { autoSteamDurationLabel, autoSteamPitcherLabel, autoSteamSelectionSettings, compactAutoSteamTargetLabel,
+    shouldKeepAutoSteamMode, steamAdjustmentControls } from '../src/modules/auto-steam-flow.js';
 
 const saved = () => ({
     mode: 'saved',
@@ -65,5 +66,18 @@ test('manual steam modes retain their normal controls', () => {
 test('Auto shows truthful timer state except during the brief target preview', () => {
     assert.equal(autoSteamDurationLabel(0), '0s');
     assert.equal(autoSteamDurationLabel(30), '30s');
-    assert.equal(autoSteamDurationLabel(0, '140.0 °F'), '140.0 °F');
+    assert.equal(autoSteamDurationLabel(0, '140.0 °F'), '140°F');
+    assert.equal(compactAutoSteamTargetLabel('140.5 °F'), '140.5°F');
+});
+
+test('only the selected pitcher carries the compact target label', () => {
+    assert.equal(autoSteamPitcherLabel('small', 'medium', '140.0 °F'), 'S');
+    assert.equal(autoSteamPitcherLabel('medium', 'medium', '140.0 °F'), 'M · 140°F');
+    assert.equal(autoSteamPitcherLabel('auto', 'auto', '60.0 °C'), 'Auto · 60°C');
+});
+
+test('expected calculation rejections stay in Auto while operational failures fall back', () => {
+    assert.equal(shouldKeepAutoSteamMode({ status: 422, code: 'invalid_milk_weight' }), true);
+    assert.equal(shouldKeepAutoSteamMode({ status: 500 }), false);
+    assert.equal(shouldKeepAutoSteamMode(new Error('timeout')), false);
 });

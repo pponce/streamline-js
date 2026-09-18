@@ -51,5 +51,20 @@ export function steamAdjustmentControls(mode, session = {}, machineState) {
 }
 
 export function autoSteamDurationLabel(duration, targetLabel = null) {
-    return typeof targetLabel === 'string' && targetLabel.length > 0 ? targetLabel : `${duration}s`;
+    return compactAutoSteamTargetLabel(targetLabel) || `${duration}s`;
+}
+
+export function compactAutoSteamTargetLabel(targetLabel) {
+    if (typeof targetLabel !== 'string' || !targetLabel.trim()) return '';
+    return targetLabel.trim().replace(/\.0(?=\s*°)/, '').replace(/\s+/g, '');
+}
+
+export function autoSteamPitcherLabel(pitcher, selectedPitcher, targetLabel) {
+    const base = { small: 'S', medium: 'M', large: 'L', auto: 'Auto' }[pitcher] ?? '';
+    const target = pitcher === selectedPitcher ? compactAutoSteamTargetLabel(targetLabel) : '';
+    return target ? `${base} · ${target}` : base;
+}
+
+export function shouldKeepAutoSteamMode(error) {
+    return error?.status === 422;
 }

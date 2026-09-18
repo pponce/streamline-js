@@ -380,10 +380,13 @@ blocked until one is connected — from the Coffee button and the keyboard short
 
 With the independently installed **Auto Steam Calculator** plugin enabled, the Steam mode control
 cycles **Auto | F | T**. Auto shows configured **S / M / L** pitcher presets, plus **Auto** when opted in and configured; tapping one
-calculates and applies time and calibration flow. Auto shows **0s** until calculated
+calculates and applies time and calibration flow. The selected preset also shows
+its compact milk target when an exact saved calibration is active. Auto shows **0s** until calculated
 and resets after steaming. While waiting, it keeps the normal steam-heater target
 but sets duration and milk-temperature stopping to Off, so the boiler remains ready
-between drinks. Physically starting steam while Auto is Off can still produce a
+between drinks. Expected calculation refusals, such as less than 10 g of milk,
+stay in Auto at 0s and show the calculator's short explanation; connection or
+plug-in failures fall back visibly to manual Time. Physically starting steam while Auto is Off can still produce a
 brief burst during the machine's state transition. Configure it at **Settings > Extensions > Auto Steam
 Calculator**. See the [setup and usage guide](docs/calibrated-steam.md).
 

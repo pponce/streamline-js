@@ -15,7 +15,7 @@ or start steam automatically. An unreachable Decaid is reported as an error,
 not mistaken for a missing installation. Choose **Open settings** to open its
 standalone calibration page. **Extensions > Plugins > Open** reaches the same form. Both entry points
 supply a return address: **Return to settings** exits without saving; a successful
-**Save calibration** returns to the calling settings category. Errors keep the
+**Save settings** returns to the calling settings category. Errors keep the
 form open. No iframe is used.
 
 The settings page has compact **General**, **Pitchers & Auto**, **Calibration**, **Instructions**, and **Glossary**
@@ -73,12 +73,15 @@ The choice remains highlighted and saved. Tap it again for the next pitcher: eve
 tap recalculates and applies, with a brief pitcher/milk/time confirmation. There is
 no calculator pop-up or Use time button. Starting steam is a separate action.
 Low milk errors use **Milk < 10 g · Medium pitcher**, including the inferred
-pitcher when Auto is selected.
+pitcher when Auto is selected. These expected calculation refusals remain in Auto
+at **0s**; only operational failures such as an unavailable or failing plugin
+fall back visibly to manual Time.
 
 With **Interpolate** off, the − / + controls cycle the filtered saved calibrations
 and wrap at either end. The selected calibration's flow remains in the existing
-flow position. Its saved milk target briefly replaces the timer value, then the
-timer returns to **0s**. When only one calibration is available, the gray button
+flow position. Its saved milk target briefly replaces the timer value in a compact,
+regular-weight form, then the timer returns to **0s**. The selected pitcher also
+shows that compact target while the exact calibration remains selected. When only one calibration is available, the gray button
 backgrounds remain but their − / + glyphs are hidden. The last calibration key is
 remembered on that device and falls back to the plugin's default when no longer
 available. With **Interpolate** on, − / + retain their existing 0.1 ml/s flow steps

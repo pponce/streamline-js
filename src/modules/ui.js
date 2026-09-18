@@ -1,4 +1,4 @@
-import { autoSteamDurationLabel, steamAdjustmentControls } from './auto-steam-flow.js';
+import { autoSteamDurationLabel, autoSteamPitcherLabel, shouldKeepAutoSteamMode, steamAdjustmentControls } from './auto-steam-flow.js';
 import { manualSteamMode, steamModeCycle } from './auto-steam-capability.js';
 import { getProfile, getWorkflow, updateWorkflow, setMachineState, setTargetHotWaterVolume, setTargetHotWaterTemp, setTargetHotWaterDuration, setDe1Settings, setTargetSteamFlow, setTargetSteamDuration, setStopAtTemperature, resyncSteamFromStore, MachineState, persistSharedValue, FLUSH_DURATION_LAST_VALUE_KEY, isBlackScreenSaver } from './api.js';
 import { openDB, getSetting, setSetting } from './idb.js';
@@ -131,6 +131,14 @@ async function fallbackToManual(error) {
     updateSteamDisplay({});
     updateSteamPresetDisplay();
     showToast(`${error.message} Using manual steam.`, 5000, 'error');
+}
+
+async function handleAutoSteamCalculationError(error) {
+    if (shouldKeepAutoSteamMode(error)) {
+        showToast(error.message, 5000, 'error');
+        return;
+    }
+    await fallbackToManual(error);
 }
 
 export function isAutoSteamMode() { return steamMode === 'auto' || calibratedSteamApplying; }
@@ -792,6 +800,9 @@ export function updateSteamDisplay(data) {
         }
     });
     flowEl.textContent = `${currentSteamFlow.toFixed(1)}`;
+    durationEl.style.fontSize = '';
+    durationEl.style.fontWeight = '';
+    durationEl.style.whiteSpace = '';
     const ACTIVE = 'text-[var(--mimoja-blue-v2)]';
     const INACTIVE = 'text-[var(--low-contrast-white)]';
     if (modeMilkEl) modeMilkEl.className = INACTIVE;
@@ -806,9 +817,13 @@ export function updateSteamDisplay(data) {
         modeTimeEl.className = INACTIVE;
         modeFlowEl.className = INACTIVE;
     } else if (steamMode === 'time' || steamMode === 'auto') {
+        const showingTarget = steamMode === 'auto' && autoSteamTargetLabel;
         durationEl.textContent = steamMode === 'auto'
             ? autoSteamDurationLabel(currentSteamDuration, autoSteamTargetLabel)
             : formatSteamDuration(currentSteamDuration);
+        durationEl.style.fontSize = showingTarget ? '20px' : '';
+        durationEl.style.fontWeight = showingTarget ? '400' : '';
+        durationEl.style.whiteSpace = showingTarget ? 'nowrap' : '';
         durationEl.classList.remove('text-[20px]');
         durationEl.classList.add('text-[26px]', 'font-bold', 'text-[var(--text-primary)]');
         flowEl.classList.remove('text-[26px]', 'font-bold');
@@ -990,9 +1005,15 @@ function updateSteamPresetDisplay() {
     autoPresetContainer?.classList.toggle('hidden', steamMode !== 'auto');
     document.querySelectorAll('[data-auto-pitcher]').forEach(button => {
         const selected = button.dataset.autoPitcher === calibratedSteamPitcher;
+        const selectedTarget = selected && calibratedSteamState.adjustmentKind === 'calibration'
+            ? calibratedSteamState.targetLabel : null;
         button.classList.toggle('preset-active', selected);
         button.setAttribute('aria-pressed', String(selected));
         button.style.display = calibratedSteamPitchers.includes(button.dataset.autoPitcher) ? '' : 'none';
+        button.textContent = autoSteamPitcherLabel(button.dataset.autoPitcher, calibratedSteamPitcher, selectedTarget);
+        button.style.fontSize = selectedTarget ? '17px' : '';
+        button.style.minWidth = selectedTarget ? '92px' : '72px';
+        button.style.whiteSpace = 'nowrap';
         button.disabled = calibratedSteamApplying || !calibratedSteamConfigured;
     });
     const setup = document.getElementById('steam-auto-setup');
@@ -2424,7 +2445,7 @@ export function initUI(callbacks) {
                 const pitcher = result.pitcherSource === 'tared' ? getTranslation('Milk only') : getTranslation(pitcherKey);
                 showToast(`${pitcher} · ${result.milkGrams} g · ${result.durationSeconds} s`, 4000);
             } catch (error) {
-                await fallbackToManual(error);
+                await handleAutoSteamCalculationError(error);
             }
         };
     }
