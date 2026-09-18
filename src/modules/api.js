@@ -1,7 +1,7 @@
 import * as ui from './ui.js';
 import { logger ,setDebug} from './logger.js';
 import { createSocketSlot } from './socket-slot.js';
-import { createScaleSampleBuffer } from './calibrated-steam.js';
+import { CALIBRATED_STEAM_PLUGIN, createScaleSampleBuffer } from './calibrated-steam.js';
 import { clampAutoSteamSettings } from './auto-steam-safety.js';
 import { AUTO_STEAM_SESSION_KEY, readAutoSteamSession } from './auto-steam-session.js';
 import { openDB, getSetting, setSetting } from './idb.js';
@@ -54,6 +54,17 @@ export function setCalibratedSteamSampling(enabled) {
 
 export function getCalibratedSteamSamples() {
     return calibratedSteamSamples.read();
+}
+
+// Compatibility entry point for this fork's dedicated Auto Steam settings
+// category. Keep all plugin HTTP traffic on the shared API transport.
+export function calibratedSteamRequest(endpoint, body) {
+    return callPluginEndpoint(
+        CALIBRATED_STEAM_PLUGIN,
+        endpoint,
+        body,
+        body === undefined ? 'GET' : 'POST',
+    );
 }
 
 let sensorSnapshotWebSocket = null;
@@ -1649,6 +1660,13 @@ export async function setTargetSteamDuration(duration) {
 
 export function isAutoSteamActive() {
     return readAutoSteamSession(localStorage.getItem(AUTO_STEAM_SESSION_KEY)).active === true;
+}
+
+export async function getCalibrationHeaterTemperature() {
+    const saved = readAutoSteamSession(localStorage.getItem(AUTO_STEAM_SESSION_KEY));
+    const value = saved.active && saved.manual?.targetTemperature > 0
+        ? saved.manual.targetTemperature : await readSharedValue(STEAM_TEMP_LAST_VALUE_KEY);
+    return Number.isInteger(value) && value >= 135 && value <= 165 ? value : null;
 }
 
 export async function writeAutoSteamSettings(steam) {

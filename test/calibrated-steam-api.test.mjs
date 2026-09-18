@@ -12,6 +12,11 @@ const build = update => new Function(
     `${match[0].replace('export ', '')}; return writeAutoSteamSettings;`,
 )(update, clampAutoSteamSettings);
 
+test('custom settings compatibility helpers stay on the shared plugin transport', () => {
+    assert.match(source, /export function calibratedSteamRequest\(endpoint, body\) \{[\s\S]*?return callPluginEndpoint\(/);
+    assert.match(source, /export async function getCalibrationHeaterTemperature\(\)/);
+});
+
 test('Auto writes flow, duration and heater together without changing manual persistence', async () => {
     const writes = [];
     const fn = build(async body => writes.push(body));
