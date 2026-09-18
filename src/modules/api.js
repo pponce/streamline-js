@@ -1,7 +1,8 @@
 import * as ui from './ui.js';
 import { logger ,setDebug} from './logger.js';
 import { createSocketSlot } from './socket-slot.js';
-import { CALIBRATED_STEAM_PLUGIN, createScaleSampleBuffer } from './calibrated-steam.js';
+import { createScaleSampleBuffer } from './calibrated-steam.js';
+import { clampAutoSteamSettings } from './auto-steam-safety.js';
 import { AUTO_STEAM_SESSION_KEY, readAutoSteamSession } from './auto-steam-session.js';
 import { openDB, getSetting, setSetting } from './idb.js';
 import { buildCalibrateBody, classifyCalState } from './loadcell-cal.js';
@@ -42,26 +43,19 @@ export let currentMachineState = null;
 let previousMachineState = null;
 let scaleWebSocket = null;
 const calibratedSteamSamples = createScaleSampleBuffer();
+let calibratedSteamSamplingEnabled = false;
+
+export function setCalibratedSteamSampling(enabled) {
+    const next = enabled === true;
+    if (calibratedSteamSamplingEnabled === next) return;
+    calibratedSteamSamplingEnabled = next;
+    calibratedSteamSamples.clear();
+}
 
 export function getCalibratedSteamSamples() {
     return calibratedSteamSamples.read();
 }
 
-export async function calibratedSteamRequest(endpoint, body) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 5000);
-    try {
-        const response = await fetch(`${API_BASE_URL}/plugins/${CALIBRATED_STEAM_PLUGIN}/${endpoint}`, {
-            method: body === undefined ? 'GET' : 'POST',
-            headers: { 'content-type': 'application/json' },
-            ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-            signal: controller.signal,
-        });
-        const data = await response.json();
-        if (!response.ok) throw Object.assign(new Error(data.message || data.error || 'Enable the calibrated steam extension in Plugins.'), { status: response.status });
-        return data;
-    } finally { clearTimeout(timeout); }
-}
 let sensorSnapshotWebSocket = null;
 let sensorSnapshotWebSocketId = null; // sensor `id` the open socket is bound to
 let displayWebSocket = null;
@@ -553,7 +547,7 @@ export function connectScaleWebSocket(onData, onReconnect, onDisconnect) {
                 logger.info('Scale connected (server status frame).');
                 if (onReconnect) onReconnect();
             } else {
-                calibratedSteamSamples.push(data);
+                if (calibratedSteamSamplingEnabled) calibratedSteamSamples.push(data);
                 onData(data);
             }
         } catch (error) {
@@ -1556,6 +1550,8 @@ export async function readSharedValue(key) {
 export async function resyncIfDrifted(key, fetchedValue, pushFn) {
     if (isAutoSteamActive() && [STEAM_DURATION_LAST_VALUE_KEY, STEAM_FLOW_LAST_VALUE_KEY, MILK_STOP_LAST_VALUE_KEY].includes(key)) return null;
     const remembered = await readSharedValue(key);
+    // Auto can become active while the shared value is being read. Re-check
+    // before an old manual target can be pushed over Auto's owned settings.
     if (isAutoSteamActive() && [STEAM_DURATION_LAST_VALUE_KEY, STEAM_FLOW_LAST_VALUE_KEY, MILK_STOP_LAST_VALUE_KEY].includes(key)) return null;
     // No record of the user ever setting this -> whatever the machine holds
     // stands. Otherwise the remembered value wins, INCLUDING when the workflow
@@ -1655,23 +1651,8 @@ export function isAutoSteamActive() {
     return readAutoSteamSession(localStorage.getItem(AUTO_STEAM_SESSION_KEY)).active === true;
 }
 
-export async function getCalibrationHeaterTemperature() {
-    const saved = readAutoSteamSession(localStorage.getItem(AUTO_STEAM_SESSION_KEY));
-    const value = saved.active && saved.manual?.targetTemperature > 0
-        ? saved.manual.targetTemperature : await readSharedValue(STEAM_TEMP_LAST_VALUE_KEY);
-    return Number.isInteger(value) && value >= 135 && value <= 165 ? value : null;
-}
-
 export async function writeAutoSteamSettings(steam) {
-    const { duration, flow, targetTemperature, stopAtTemperature } = steam;
-    if (!Number.isInteger(duration) || duration < 0 || duration > 255 ||
-        !Number.isFinite(flow) || flow < 0 || flow > 2.5 ||
-        !Number.isInteger(targetTemperature) || targetTemperature < 0 || targetTemperature > 165 ||
-        (stopAtTemperature !== undefined && (!Number.isFinite(stopAtTemperature) || stopAtTemperature < 0 || stopAtTemperature > 80))) {
-        throw new Error('Invalid Auto steam settings.');
-    }
-    return updateWorkflow({ steamSettings: { duration, flow, targetTemperature,
-        ...(stopAtTemperature === undefined ? {} : { stopAtTemperature }) } });
+    return updateWorkflow({ steamSettings: clampAutoSteamSettings(steam) });
 }
 
 // Steam-heater switch for procedures that must not run against a hot steam
@@ -2479,7 +2460,7 @@ export async function setPluginSettings(pluginId, settings) {
             throw new Error(`Failed to set plugin settings for ${pluginId}. Status: ${response.status}, Body: ${errorBody}`);
         }
         logger.info(`Plugin settings for ${pluginId} updated successfully:`, settings);
-        if (pluginId === CALIBRATED_STEAM_PLUGIN) document.dispatchEvent(new Event('streamline:auto-steam-settings'));
+        document.dispatchEvent(new CustomEvent('streamline:plugins-changed', { detail: { pluginId } }));
         return true;
     } catch (error) {
         throw error; // Re-throw to allow calling code to handle
@@ -2918,7 +2899,7 @@ export async function enablePlugin(pluginId) {
     const response = await fetch(`${API_BASE_URL}/plugins/${encodeURIComponent(pluginId)}/enable`, { method: 'POST' });
     if (!response.ok) throw new Error(`Failed to enable plugin ${pluginId}: ${response.status} ${response.statusText}`);
     const result = await response.json();
-    if (pluginId === CALIBRATED_STEAM_PLUGIN) document.dispatchEvent(new Event('streamline:auto-steam-settings'));
+    document.dispatchEvent(new CustomEvent('streamline:plugins-changed', { detail: { pluginId } }));
     return result;
 }
 
@@ -2926,7 +2907,7 @@ export async function disablePlugin(pluginId) {
     const response = await fetch(`${API_BASE_URL}/plugins/${encodeURIComponent(pluginId)}/disable`, { method: 'POST' });
     if (!response.ok) throw new Error(`Failed to disable plugin ${pluginId}: ${response.status} ${response.statusText}`);
     const result = await response.json();
-    if (pluginId === CALIBRATED_STEAM_PLUGIN) document.dispatchEvent(new Event('streamline:auto-steam-settings'));
+    document.dispatchEvent(new CustomEvent('streamline:plugins-changed', { detail: { pluginId } }));
     return result;
 }
 
@@ -2945,22 +2926,22 @@ export async function getDecentAccountStatus() {
     return { loggedIn: !!body?.loggedIn };
 }
 
-export async function installPluginFromRelease(repo, { assetName, includePrerelease } = {}) {
-    const response = await fetch(`${API_BASE_URL}/plugins/install/github-release`, {
+export async function installPluginFromBranch(repo, branch = 'main') {
+    const response = await fetch(`${API_BASE_URL}/plugins/install/github-branch`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ repo, ...(assetName ? { assetName } : {}), ...(includePrerelease ? { includePrerelease } : {}) })
+        body: JSON.stringify({ repo, branch })
     });
     const body = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(body.error || `Failed to install ${repo}: ${response.status} ${response.statusText}`);
     return body;
 }
 
-export async function installPluginFromBranch(repo, branch = 'main') {
-    const response = await fetch(`${API_BASE_URL}/plugins/install/github-branch`, {
+export async function installPluginFromRelease(repo, { assetName, includePrerelease } = {}) {
+    const response = await fetch(`${API_BASE_URL}/plugins/install/github-release`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ repo, branch })
+        body: JSON.stringify({ repo, ...(assetName ? { assetName } : {}), ...(includePrerelease ? { includePrerelease } : {}) })
     });
     const body = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(body.error || `Failed to install ${repo}: ${response.status} ${response.statusText}`);

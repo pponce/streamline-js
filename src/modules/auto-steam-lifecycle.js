@@ -6,6 +6,17 @@ export function createAutoSteamLifecycle({ session, getPlugins, getStatus, isAva
         if (visible) onError(error);
         else deferredError = error;
     }
+    async function failSafe(error) {
+        if (disposed) return;
+        onAvailability(false);
+        try {
+            await session.disable();
+        } catch (fallbackError) {
+            report(new AggregateError([error, fallbackError], 'Auto steam failed and manual settings could not be restored.'));
+            return;
+        }
+        report(error);
+    }
     function refresh() {
         if (disposed) return Promise.resolve();
         if (refreshing) return refreshing;
@@ -14,7 +25,8 @@ export function createAutoSteamLifecycle({ session, getPlugins, getStatus, isAva
             do {
                 observed = revision;
                 const plugins = await getPlugins();
-                if (disposed || plugins === null) return;
+                if (disposed) return;
+                if (plugins === null) throw new Error('Auto steam capability could not be checked. Using manual steam.');
                 const available = isAvailable(plugins);
                 onAvailability(available);
                 if (!available) await session.disable();
@@ -28,7 +40,7 @@ export function createAutoSteamLifecycle({ session, getPlugins, getStatus, isAva
                 }
                 initialized = true; reconnectPending = false;
             } while (!disposed && observed !== revision);
-        }).catch(report).finally(() => { refreshing = null; });
+        }).catch(failSafe).finally(() => { refreshing = null; });
         return refreshing;
     }
     return {
@@ -51,3 +63,4 @@ export function createAutoSteamLifecycle({ session, getPlugins, getStatus, isAva
         dispose() { disposed = true; deferredError = null; },
     };
 }
+

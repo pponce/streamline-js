@@ -13,10 +13,15 @@ function fixture() {
     return { lifecycle, resets, errors, reads: () => reads, changed: () => { changed = true; }, fail: () => { fail = true; } };
 }
 
-test('returning to the main page repaints cached state without refreshing settings', async () => {
+test('leaving the main page invalidates Auto and returning only repaints cached state', async () => {
     const f = fixture(); await f.lifecycle.initialize();
-    for (let i = 0; i < 10; i++) { await f.lifecycle.mainHidden(); f.lifecycle.mainShown(); }
-    assert.equal(f.reads(), 1); assert.deepEqual(f.resets[0], { verify: true });
+    assert.deepEqual(f.resets, [{ verify: true }]);
+    await f.lifecycle.mainHidden();
+    assert.deepEqual(f.resets, [{ verify: true }, undefined]);
+    for (let i = 0; i < 9; i++) { f.lifecycle.mainShown(); await f.lifecycle.mainHidden(); }
+    f.lifecycle.mainShown();
+    assert.equal(f.reads(), 1);
+    assert.equal(f.resets.length, 11);
     assert.equal(f.errors.length, 0);
 });
 
@@ -40,3 +45,56 @@ test('reconnect waits for telemetry then revalidates once', async () => {
     await f.lifecycle.observeMachine('idle'); await f.lifecycle.observeMachine('idle');
     assert.equal(f.reads(), 2); assert.equal(f.resets.length, 2);
 });
+
+test('missing capability disables Auto without reporting an error', async () => {
+    let disabled = 0;
+    const availability = [];
+    const session = {
+        snapshot: () => ({ active: true }),
+        updateStatus: () => false,
+        invalidate: async () => {},
+        disable: async () => { disabled++; },
+        connectionLost() {},
+        observeMachine: async () => {},
+    };
+    const lifecycle = createAutoSteamLifecycle({
+        session,
+        getPlugins: async () => [],
+        getStatus: async () => assert.fail('status is not queried without the capability'),
+        isAvailable: () => false,
+        onAvailability: value => availability.push(value),
+        onChange() {},
+        onError: error => assert.fail(error),
+    });
+    await lifecycle.initialize();
+    assert.deepEqual(availability, [false]);
+    assert.equal(disabled, 1);
+});
+
+test('a failed capability query visibly fails safe to manual', async () => {
+    let disabled = 0;
+    const availability = [];
+    const errors = [];
+    const session = {
+        snapshot: () => ({ active: true }),
+        updateStatus: () => false,
+        invalidate: async () => {},
+        disable: async () => { disabled++; },
+        connectionLost() {},
+        observeMachine: async () => {},
+    };
+    const lifecycle = createAutoSteamLifecycle({
+        session,
+        getPlugins: async () => null,
+        getStatus: async () => assert.fail('status is not queried after a failed capability query'),
+        isAvailable: () => true,
+        onAvailability: value => availability.push(value),
+        onChange() {},
+        onError: error => errors.push(error.message),
+    });
+    await lifecycle.initialize();
+    assert.deepEqual(availability, [false]);
+    assert.equal(disabled, 1);
+    assert.match(errors[0], /Using manual steam/);
+});
+

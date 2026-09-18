@@ -1,11 +1,16 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { clampAutoSteamSettings } from '../src/modules/auto-steam-safety.js';
 
 const source = readFileSync(new URL('../src/modules/api.js', import.meta.url), 'utf8');
 const match = source.match(/export async function writeAutoSteamSettings\(steam\) \{[\s\S]*?\n\}/);
 assert.ok(match);
-const build = update => new Function('updateWorkflow', `${match[0].replace('export ', '')}; return writeAutoSteamSettings;`)(update);
+const build = update => new Function(
+    'updateWorkflow',
+    'clampAutoSteamSettings',
+    `${match[0].replace('export ', '')}; return writeAutoSteamSettings;`,
+)(update, clampAutoSteamSettings);
 
 test('Auto writes flow, duration and heater together without changing manual persistence', async () => {
     const writes = [];
@@ -16,8 +21,16 @@ test('Auto writes flow, duration and heater together without changing manual per
         { steamSettings: { duration: 30, flow: 0.8, targetTemperature: 150 } },
         { steamSettings: { duration: 0, flow: 0.8, targetTemperature: 0, stopAtTemperature: 0 } },
     ]);
-    for (const duration of [-1, 256, 1.5, '30', null, NaN]) await assert.rejects(fn({ duration, flow: 0.8, targetTemperature: 150 }));
-    assert.equal(writes.length, 2);
+    await fn({ duration: -1, flow: 0.8, targetTemperature: 150 });
+    await fn({ duration: 256, flow: 0.8, targetTemperature: 150 });
+    await fn({ duration: 1.5, flow: 0.8, targetTemperature: 150 });
+    assert.deepEqual(writes.slice(-3), [
+        { steamSettings: { duration: 0, flow: 0.8, targetTemperature: 150 } },
+        { steamSettings: { duration: 255, flow: 0.8, targetTemperature: 150 } },
+        { steamSettings: { duration: 2, flow: 0.8, targetTemperature: 150 } },
+    ]);
+    for (const duration of ['30', null, NaN]) await assert.rejects(fn({ duration, flow: 0.8, targetTemperature: 150 }));
+    assert.equal(writes.length, 5);
 });
 
 test('Auto write failure propagates without a saved value for later replay', async () => {

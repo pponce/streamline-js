@@ -44,7 +44,6 @@ export const SYNCED_KEYS = [
     'waterTankUnit',
     'waterRefillLevel',
     'keyboardBindings',
-    'streamline.autoSteamSession',
     'streamline.steamStopMode',
     'streamline.steamStopModeFallback',
     'streamline.cupWarmerTarget',
@@ -234,3 +233,4 @@ async function boot() {
 export const settingsReady = typeof window === 'undefined'
     ? Promise.resolve()
     : boot().catch(e => { logger.warn('Settings hydrate failed', e); });
+

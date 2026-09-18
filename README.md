@@ -378,13 +378,16 @@ blocked until one is connected — from the Coffee button and the keyboard short
 
 ## 9. Steam, hot water, and flush
 
-With the independently installed **Auto Steam Calculator** plugin enabled, the Steam heading
+With the independently installed **Auto Steam Calculator** plugin enabled, the Steam mode control
 cycles **Auto | F | T**. Auto shows configured **S / M / L** pitcher presets, plus **Auto** when opted in and configured; tapping one
-calculates and applies time and calibration flow. Auto uses Off until calculated
-and resets after steaming. Configure it at **Settings > Extensions > Auto Steam
+calculates and applies time and calibration flow. Auto shows **0s** until calculated
+and resets after steaming. While waiting, it keeps the normal steam-heater target
+but sets duration and milk-temperature stopping to Off, so the boiler remains ready
+between drinks. Physically starting steam while Auto is Off can still produce a
+brief burst during the machine's state transition. Configure it at **Settings > Extensions > Auto Steam
 Calculator**. See the [setup and usage guide](docs/calibrated-steam.md).
 
-**Steam.** Set the value in the left column (tap the *Steam* label to switch between temperature,
+**Steam.** Set the value in the left column (tap the mode text below *Steam* to switch between temperature,
 duration and flow). Start from the GHC or the **Steam** button. Steam stops on its duration limit,
 or when you stop it.
 

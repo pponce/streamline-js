@@ -2,9 +2,8 @@
 
 The calculator is an independent [Decaid plugin](https://github.com/pponce/decentAutoSteamCalculator).
 It works with the official Android Decaid v0.8.6 release or newer; no custom APK
-is needed. Install this Streamline fork from `pponce/streamline-js`, branch
-`feature/calibrated-steam-timer`, using Decaid's skin selector → Install skin →
-GitHub Branch. Select **Streamline.js — Auto Steam**. Its test-only ID,
+is needed. Install this Streamline fork from `pponce/streamline-js` using
+Decaid's skin installer. Select **Streamline.js — Auto Steam**. Its test-only ID,
 `pponce.streamline-auto-steam`, keeps it separate from the official skin; restore
 the upstream skin identity before submitting that manifest change upstream.
 
@@ -20,16 +19,21 @@ supply a return address: **Return to settings** exits without saving; a successf
 form open. No iframe is used.
 
 The settings page has compact **General**, **Pitchers & Auto**, **Calibration**, **Instructions**, and **Glossary**
-tabs. Both Flow fields edit one saved plugin default; changing it clears the old
-calibration weight and time only in Single flow. Multiple flows preserves measurements when
-the default changes within the calibrated range. Tare stays beside the pitcher controls, capture buttons work
+tabs. Each saved calibration records flow, milk target, milk weight and time.
+With **Interpolate** off, **Milk target** filters the exact saved calibrations
+available on the shot page; **All targets** makes every saved calibration available.
+With **Interpolate** on, one milk target and at least three readings are required:
+the exact minimum, exact maximum and at least one interior flow. Tare stays beside
+the pitcher controls, capture buttons work
 without field focus, and errors appear beside the action. The summary shows which
 choices are configured using green S, M, L and Auto badges, with calibration
 readiness and flow displayed separately. Invalid saves open the
 relevant tab and field.
 
-Enter at least one Small, Medium or Large empty-pitcher weight, calibration
-milk-only weight, seconds to your desired temperature, and the flow used. Leave unused sizes blank or 0.
+Enter at least one Small, Medium or Large empty-pitcher weight and create one
+calibration with its milk-only weight, seconds, desired milk target and flow.
+Leave unused sizes blank or 0. This one-reading setup is enough when
+**Interpolate** is off.
 
 The shared Decaid page now has **Tare empty scale** and **Set from scale** controls
 for pitcher weights. Tare with nothing on the scale and wait for confirmed zero
@@ -55,7 +59,7 @@ subsequent preset taps and falls back to the configured starting choice if a
 previously selected pitcher is removed.
 
 With the plugin enabled, the steam mode label is **Auto | F | T**; blue indicates
-the active mode. Tap that label or the Steam heading to cycle modes. In Auto, the
+the active mode. Tap that label to cycle modes; the Steam heading remains inert. In Auto, the
 existing preset row offers only configured **S / M / L** choices, plus **Auto** when detection is enabled and configured. These have the same row height
 as the normal presets and a minimum design width of 72 px each. The compact mode
 label uses the existing 114 px area and 20 px font, with the existing text-fit
@@ -71,26 +75,33 @@ no calculator pop-up or Use time button. Starting steam is a separate action.
 Low milk errors use **Milk < 10 g · Medium pitcher**, including the inferred
 pitcher when Auto is selected.
 
-Auto starts at **Off** and returns to Off after steaming, when resuming after a
+With **Interpolate** off, the − / + controls cycle the filtered saved calibrations
+and wrap at either end. The selected calibration's flow remains in the existing
+flow position. Its saved milk target briefly replaces the timer value, then the
+timer returns to **0s**. When only one calibration is available, the gray button
+backgrounds remain but their − / + glyphs are hidden. The last calibration key is
+remembered on that device and falls back to the plugin's default when no longer
+available. With **Interpolate** on, − / + retain their existing 0.1 ml/s flow steps
+within the measured range.
+
+Auto starts at **0s** and returns to 0s after steaming, when resuming after a
 reload, and when leaving an armed calculation on the main page. Navigation does
 not wait for resets. Once Off is confirmed, repeated navigation performs no reset
 reads or writes. Focus and settings-category mount/unmount do not trigger refresh.
 Actual plugin changes and reconnection revalidate state; duplicate reset requests
 share one operation. Genuine background failures are shown once on the main page,
-with no contention popup for routine navigation. Off writes duration 0
-and heater target 0, matching Streamline's existing Off behavior. It is a reminder,
-not a hardware start lock; a physical start can still produce a short burst.
+with no contention popup for routine navigation. Off writes duration 0 and disables
+milk-temperature stopping while leaving the normal heater target unchanged, so
+the boiler stays ready between drinks. It is a reminder, not a hardware start
+lock; a physical start can still produce a short burst.
 A successful calculation applies the configured flow and calculated duration,
 and restores the normal heater setting saved before Auto entry. If manual steam
 was already Off, it uses Streamline’s existing remembered heater setting. No heater
 calibration field or temperature compensation is used; keep the same normal heater
-setting as the calibration run. There is no configurable maximum duration. Auto flow is configured in the extension settings: **0.4–2.5 ml/s**,
-default **0.4 ml/s**. Measure calibration time at that flow; recalibrate after
-changing it in Single flow. Direct number editors are inactive in Auto. Single-flow
-Auto hides only the − / + icons, keeping their gray button backgrounds visible and
-disabled. Multiple-flow Auto shows − / + to adjust flow in 0.1 ml/s steps
-within measured bounds while idle; changing flow resets time to Off and requires
-a fresh pitcher tap. Manual Flow and Time keep their normal − / + controls.
+setting as the calibration run. There is no configurable maximum duration.
+Direct number editors are inactive in Auto. Changing calibration or interpolated
+flow resets time to 0s and requires a fresh pitcher tap. Manual Flow and Time keep
+their normal − / + controls.
 
 Switching to Flow or Time restores the previous manual steam settings, including
 flow. Auto's values never overwrite manual preferences or profile values. Plugin
@@ -103,30 +114,32 @@ only when the scale reports milk alone; pitcher inference is then unavailable. U
 similar milk, starting temperature and technique to the calibration run. This is
 a temperature estimate through time, not a temperature measurement.
 
-## Multiple-flow calibration
+## Calibration selection and interpolation
 
-Calibration offers **Single flow** (one fixed measured flow) and **Multiple
-flows** (2–4 measurements, with 3 recommended). Select minimum/maximum flow,
-reading count and default Auto flow. Record the actual milk-only weight for each reading;
-new manual readings start blank. An optional target milk temperature note is
-shown in summaries and does not control steaming. The page suggests evenly
-spaced points including both endpoints. Each point supports manual time entry or
-a guided run, using fresh milk at the same starting temperature each time.
-Guided Prepare applies that reading's flow before enabling Start. Start checks
-that the calibration settings remain applied. Use each reading, review the set,
-then Save. The old saved calibration remains active until the full draft saves.
+With **Interpolate** off, every active saved calibration is an exact selectable
+choice. **Milk target** may filter the list to one temperature or use **All
+targets**. Each exact choice uses its own measured seconds-per-gram ratio and
+flow; there is no default checkbox.
 
+With **Interpolate** on, select one milk target, minimum flow and maximum flow.
+The group needs at least three saved readings: the exact minimum, exact maximum
+and one interior flow. An individual reading can be saved while the set is still
+incomplete, but the extension cannot be activated with that incomplete set.
 At intermediate flows the plugin interpolates seconds per gram between adjacent
-readings; it does not extrapolate beyond the measured range. Auto's selected flow
-is stored separately from manual preferences and survives ordinary navigation
-and reload. A changed calibration adopts its new default. Existing installations
-remain Single flow after upgrading.
+readings and never extrapolates beyond the measured range.
+
+Each reading supports manual time entry or a guided run using fresh milk at
+similar starting conditions. Guided Prepare applies that reading's flow before
+enabling Start. Auto's selected calibration key or interpolated flow is stored
+separately from manual steam preferences and survives navigation and reload on
+that device.
 
 ## Developer notes
 
-`auto-steam-flow.js` validates the optional status flow capability and owns
-adjustment-control visibility/bounds. `auto-steam-session.js` owns Auto entry, preset actions, reset and restore, with a
-persisted manual backup and pitcher choice. One session is retained for the app
+`auto-steam-flow.js` validates the status selection capability and owns
+adjustment-control visibility and bounds. `auto-steam-session.js` owns Auto entry,
+preset actions, exact-calibration cycling, interpolation changes, reset and
+restore, with a persisted manual backup, pitcher choice and selection. One session is retained for the app
 lifetime. `auto-steam-lifecycle.js` coordinates page visibility, actual settings
 changes and connection changes; background errors are deferred while off-page.
 `subscribeMachineConnectionChanges` uses existing device-stream subscriptions and
@@ -136,10 +149,12 @@ existing API/scale socket and UI. `api.js` suppresses manual steam reconciliatio
 while the persisted Auto session owns the settings. `settings/categories/auto-steam.js`
 is shared by the shell and legacy settings navigation paths.
 
-Requires calculator API version 4. Requests include the selected `pitcher` and
-`flow` on both calculation passes, verify the returned pitcher and flow, and apply
-the duration/flow pair. `status.flowCalibration` determines whether flow is
-adjustable; `status.availablePitchers` determines the configured presets. Empty
+Requires calculator API version 5. Exact-calibration requests include the opaque
+`calibrationKey`; interpolation requests include `flow`. Both calculation passes
+verify the returned key, target, pitcher and flow before applying the duration/flow
+pair. `status.flowCalibration` determines whether the − / + controls cycle saved
+calibrations or 0.1 ml/s interpolation steps; `status.availablePitchers` determines
+the configured presets. Empty
 setup keeps top-level Auto available and Off, with a setup reminder instead of
 pitcher buttons. Incomplete calibration disables calculation; manual Flow and Time
 continue to work. Settings, API fields and UI labels use pitcher terminology.

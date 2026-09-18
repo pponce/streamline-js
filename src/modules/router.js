@@ -173,8 +173,9 @@ export async function loadPage(pageUrl, { history = 'push' } = {}) {
             cleanupCurrentPage = cleanupSettingsShell;
         }
 
-        if (mainPage?.style.display !== 'none') document.dispatchEvent(new Event('streamline:mainpagehidden'));
+        const mainPageWasVisible = mainPage && mainPage.style.display !== 'none';
         if (mainPage) mainPage.style.display = 'none';
+        if (mainPageWasVisible) document.dispatchEvent(new Event('streamline:mainpagehidden'));
         subpageHost.style.display = '';
 
         // Apply current language to freshly injected HTML before page init runs
@@ -211,3 +212,4 @@ export async function loadPage(pageUrl, { history = 'push' } = {}) {
         if (subpageHost) subpageHost.style.display = 'none';
     }
 }
+
