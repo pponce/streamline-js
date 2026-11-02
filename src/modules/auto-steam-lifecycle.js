@@ -63,4 +63,3 @@ export function createAutoSteamLifecycle({ session, getPlugins, getStatus, isAva
         dispose() { disposed = true; deferredError = null; },
     };
 }
-

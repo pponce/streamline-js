@@ -142,24 +142,24 @@ test('a real exit still survives the same round trip', () => {
 // instead of a hardcoded 0.6.
 // DEFAULT_LIMITER_RANGE moved into profile-field-limits.js (imported above) so
 // the legacy-TCL importer can share it; it's injected below the same way the
-// other stubbed dependencies (addFieldTo, createSpinner, ...) are.
+// other stubbed dependencies (createSpinner, ...) are.
 const limiterMatch = source.match(/function limitedSteps\(pump\) \{[\s\S]*?\nfunction newLimiterRange\(pump\) \{[\s\S]*?\r?\n\}/);
-const toleranceMatch = source.match(/const toleranceField = \(pump, label, unit\) => \{[\s\S]*?\r?\n        \};/);
+const toleranceMatch = source.match(/const rangeControl = \(pump, unit\) => \{[\s\S]*?\r?\n        \};/);
 assert.ok(limiterMatch && toleranceMatch, 'limiter tolerance source not found in profile_editor.js');
 
-// The tab builds the field through addFieldTo/createSpinner; stub both to
-// capture what a real render would have shown.
+// SETTINGS builds each spinner through rangeControl(pump, unit); stub
+// createSpinner to capture what a real render would have shown.
 function limiterEditor(steps) {
     const editorState = { profile: { steps } };
-    const fields = {};
     const createSpinner = (value, _step, unit, onChange, opts) => ({ value, unit, onChange, ...opts });
-    const addFieldTo = (_col, label, spinner) => { fields[label] = spinner; };
     const api = new Function(
-        'editorState', 'addFieldTo', 'createSpinner', 'getTranslation', 'leftCol', 'DEFAULT_LIMITER_RANGE',
-        `${limiterMatch[0]}\n${toleranceMatch[0]}\nreturn { toleranceField, newLimiterRange, limiterRangeOf };`
-    )(editorState, addFieldTo, createSpinner, (x) => x, null, DEFAULT_LIMITER_RANGE);
-    api.toleranceField('flow', 'bar-field', 'bar');
-    api.toleranceField('pressure', 'mls-field', 'mL/s');
+        'editorState', 'createSpinner', 'getTranslation', 'DEFAULT_LIMITER_RANGE',
+        `${limiterMatch[0]}\n${toleranceMatch[0]}\nreturn { rangeControl, newLimiterRange, limiterRangeOf };`
+    )(editorState, createSpinner, (x) => x, DEFAULT_LIMITER_RANGE);
+    const fields = {
+        'bar-field': api.rangeControl('flow', 'bar'),
+        'mls-field': api.rangeControl('pressure', 'mL/s'),
+    };
     return { steps, fields, newLimiterRange: api.newLimiterRange };
 }
 
@@ -241,4 +241,234 @@ test('with nothing to inherit a new limiter takes the DE1 band, not the 0 on scr
     const { fields, newLimiterRange } = limiterEditor([{ pump: 'flow' }, { pump: 'pressure' }]);
     assert.equal(fields['bar-field'].value, 0);
     assert.equal(newLimiterRange('flow'), 0.6);
+});
+
+// ── New-step insertion seeds from the neighbor it's inserted next to ────────
+{
+    const defaultStepMatch = source.match(/const DEFAULT_STEP = \{[\s\S]*?\r?\n\};/);
+    const makeNewStepMatch = source.match(/function makeNewStep\(neighbor\) \{[\s\S]*?\r?\n\}/);
+    const insertStepAfterMatch = source.match(/function insertStepAfter\(index\) \{[\s\S]*?\r?\n\}/);
+    assert.ok(defaultStepMatch, 'DEFAULT_STEP not found in profile_editor.js');
+    assert.ok(makeNewStepMatch, 'makeNewStep not found in profile_editor.js');
+    assert.ok(insertStepAfterMatch, 'insertStepAfter not found in profile_editor.js');
+
+    const build = (steps, target_volume_count_start = 0) => {
+        const editorState = { profile: { steps, target_volume_count_start } };
+        const insertStepAfter = new Function(
+            'editorState',
+            `const PUMP_SEED_FLOW = 6.0;\n${defaultStepMatch[0]}\n${makeNewStepMatch[0]}\n${insertStepAfterMatch[0]}\nreturn insertStepAfter;`
+        )(editorState);
+        return { insertStepAfter, editorState };
+    };
+
+    test("inserting after a step seeds the new one from that step's values, not the generic default", () => {
+        const { insertStepAfter, editorState } = build([
+            { name: 'Preinfusion', pump: 'pressure', transition: 'smooth', pressure: 3, temperature: 88, sensor: 'water', seconds: 10, weight: 0, volume: 0, exit: null, limiter: { value: 2, range: 1 } },
+        ]);
+        insertStepAfter(0);
+        const inserted = editorState.profile.steps[1];
+        assert.equal(inserted.pump, 'pressure');
+        assert.equal(inserted.pressure, 3);
+        assert.equal(inserted.temperature, 88);
+        assert.equal(inserted.sensor, 'water');
+        assert.deepEqual(inserted.limiter, { value: 2, range: 1 });
+    });
+
+    test("the inserted step's own name resets, so two steps don't share a label", () => {
+        const { insertStepAfter, editorState } = build([{ name: 'Preinfusion' }]);
+        insertStepAfter(0);
+        assert.equal(editorState.profile.steps[1].name, 'New Step');
+    });
+
+    test('inserting a first step into an empty profile falls back to the generic default', () => {
+        const { insertStepAfter, editorState } = build([]);
+        insertStepAfter(-1); // the "Insert a step" button passes numSteps - 1, which is -1 when empty
+        assert.equal(editorState.profile.steps.length, 1);
+        assert.equal(editorState.profile.steps[0].pump, 'flow');
+        assert.equal(editorState.profile.steps[0].temperature, 93);
+    });
+
+    test('mutating the inserted step does not mutate the step it was copied from', () => {
+        const { insertStepAfter, editorState } = build([
+            { name: 'Preinfusion', pump: 'flow', flow: 2 },
+        ]);
+        insertStepAfter(0);
+        editorState.profile.steps[1].flow = 99;
+        assert.equal(editorState.profile.steps[0].flow, 2);
+    });
+}
+// ── SCRIPT tab: which sentences a step produces (buildStepScript) ────────────
+// The prose half of the redesigned SCRIPT tab (Figma node 2662-803) decides
+// which lines a step gets, in what order, and with which temperature verb.
+// Extracted the same way as everything above, so it can't drift from what the
+// tab actually renders. readExitDef is passed in rather than duplicated — the
+// exit line's presence is exactly its "is this really off?" answer.
+const scriptStart = source.indexOf('// ─── Pure script-line composition');
+const scriptEnd = source.indexOf('// ─── End pure script-line composition');
+assert.ok(scriptStart !== -1 && scriptEnd !== -1 && scriptEnd > scriptStart, 'pure script-line block not found in profile_editor.js');
+const S = new Function('readExitDef', `${source.slice(scriptStart, scriptEnd)}
+    return { SCRIPT_MAX_FIELDS, temperatureVerb, buildStepScript, scriptValueFormat };`)(readExitDef);
+
+const kinds = (lines) => lines.map((l) => l.kind);
+// A step with nothing optional set: no volume marker, no limiter, no ceilings
+// and no exit — so only the two lines every step always has.
+const bareStep = (over = {}) => ({ pump: 'flow', flow: 6, temperature: 93, ...over });
+
+test('every step opens with its temperature then its pump line', () => {
+    assert.deepEqual(kinds(S.buildStepScript(bareStep(), 0, {}, null)), ['temperature', 'pump']);
+});
+
+test('the opening step Sets its temperature; there is nothing to compare it to', () => {
+    const [temp] = S.buildStepScript(bareStep({ temperature: 93 }), 0, {}, null);
+    assert.equal(temp.verb, 'Set');
+});
+
+test('the verb tracks the previous step: Maintain, Increase, Decrease', () => {
+    const verbFor = (prev, now) => S.buildStepScript(
+        bareStep({ temperature: now }), 1, {}, bareStep({ temperature: prev }),
+    )[0].verb;
+    assert.equal(verbFor(93, 93), 'Maintain');
+    assert.equal(verbFor(88, 93), 'Increase');
+    assert.equal(verbFor(93, 88), 'Decrease');
+});
+
+test('a previous step with no temperature of its own reads as Set, not Maintain', () => {
+    // temperatureVerb takes only a real number as a comparison point —
+    // undefined must not compare equal and claim the target is unchanged.
+    assert.equal(S.temperatureVerb(undefined, 93), 'Set');
+    assert.equal(S.temperatureVerb(null, 93), 'Set');
+    assert.equal(S.temperatureVerb(93, 93), 'Maintain');
+});
+
+test('an unset limiter, ceiling or exit states nothing — the line is left out', () => {
+    const lines = kinds(S.buildStepScript(
+        bareStep({ limiter: { value: 0 }, seconds: 0, volume: 0, weight: 0, exit: null }), 0, {}, null,
+    ));
+    assert.deepEqual(lines, ['temperature', 'pump']);
+});
+
+test('a set limiter and a real exit each add their own line', () => {
+    const lines = kinds(S.buildStepScript(
+        bareStep({ limiter: { value: 3, range: 0.6 }, exit: { type: 'pressure', condition: 'over', value: 4 } }),
+        0, {}, null,
+    ));
+    assert.deepEqual(lines, ['temperature', 'pump', 'limit', 'exit']);
+});
+
+test('an exit that readExitDef calls off adds no line', () => {
+    // The exit line is the only place a step says "move on if", so it has to
+    // agree with readExitDef rather than testing step.exit for truthiness — a
+    // legacy { type: 'weight' } exit is off, but it is not falsy.
+    const lines = kinds(S.buildStepScript(bareStep({ exit: { type: 'weight', value: 30 } }), 0, {}, null));
+    assert.equal(lines.includes('exit'), false);
+});
+
+test('the ceilings collapse into one line, in the CARDS row order, skipping unset ones', () => {
+    assert.deepEqual(S.SCRIPT_MAX_FIELDS.map((f) => f.key), ['weight', 'seconds', 'volume']);
+    const [max] = S.buildStepScript(bareStep({ seconds: 12, volume: 100 }), 0, {}, null)
+        .filter((l) => l.kind === 'maximum');
+    assert.deepEqual(max.keys, ['seconds', 'volume']);
+    const [all] = S.buildStepScript(bareStep({ weight: 36, seconds: 12, volume: 100 }), 0, {}, null)
+        .filter((l) => l.kind === 'maximum');
+    assert.deepEqual(all.keys, ['weight', 'seconds', 'volume']);
+});
+
+// ── Volume-tracking marker placement ────────────────────────────────────────
+// target_volume_count_start is "preinfusion ends after step N", 1-based with
+// 0 meaning none — so the marker belongs on the step AFTER it.
+
+test('the marker lands on the step after the one preinfusion ends on', () => {
+    const profile = { target_volume_count_start: 3 };
+    const at = (i) => kinds(S.buildStepScript(bareStep(), i, profile, bareStep()));
+    assert.equal(at(2).includes('volumeStart'), false); // step 3 itself — still preinfusion
+    assert.equal(at(3)[0], 'volumeStart');              // step 4 — tracking starts here
+    assert.equal(at(4).includes('volumeStart'), false);
+});
+
+test('"none" puts no marker on step 1, which shares its index-0 falsy value', () => {
+    for (const profile of [{}, { target_volume_count_start: 0 }, { target_volume_count_start: null }]) {
+        assert.equal(kinds(S.buildStepScript(bareStep(), 0, profile, null)).includes('volumeStart'), false);
+    }
+});
+
+// ── Value formatting ────────────────────────────────────────────────────────
+
+test('every value keeps one decimal, so a whole number reads 93.0 and not 93', () => {
+    assert.equal(S.scriptValueFormat('°C')(93), '93.0 °C');
+    assert.equal(S.scriptValueFormat('sec')(2), '2.0 sec');
+    assert.equal(S.scriptValueFormat('mL/s')(8.25), '8.3 mL/s');
+    assert.equal(S.scriptValueFormat('')(5), '5.0');
+});
+
+// ── CARDS row trailing track ────────────────────────────────────────────────
+// The row snaps each card flush against the sticky label gutter. Without a
+// trailing dead track the row ends flush right, so the far-right scroll clamp
+// lands off-snap and slices whichever card is leftmost. The tail exists only
+// when the row actually overflows — adding it to a row that already fits would
+// invent a scrollbar for nothing.
+const tailMatch = source.match(/const LABEL_GUTTER[\s\S]*?\nfunction cardRowTailTrack\(numSteps\) \{[\s\S]*?\r?\n\}/);
+assert.ok(tailMatch, 'cardRowTailTrack not found in profile_editor.js');
+const cardRowTailTrack = new Function(
+    `const CARD_WIDTH = 450, CARD_GAP = 15;\n${tailMatch[0]}\nreturn cardRowTailTrack;`
+)();
+
+test('a row that already fits gets no tail, so it never becomes scrollable', () => {
+    for (const n of [0, 1, 2, 3]) {
+        assert.equal(cardRowTailTrack(n), '', `${n} steps should need no tail`);
+    }
+});
+
+test('the row grows a tail as soon as it overflows the canvas', () => {
+    // 192.75 gutter + 4*450 + 3*15 = 2037.75, past the 1920 canvas; 3 steps is 1572.75.
+    for (const n of [4, 5, 8, 20]) {
+        assert.equal(cardRowTailTrack(n), ' calc(100% - 450px)', `${n} steps should carry a tail`);
+    }
+});
+
+test('the tail is a percentage, so it tracks the scrollbar gutter rather than assuming 1920', () => {
+    // A fixed px tail computed from the 1920 canvas would be 45px too wide:
+    // scrollbar-gutter reserves the vertical bar, leaving a 1875 content box.
+    assert.match(cardRowTailTrack(6), /^ calc\(100% - \d+px\)$/);
+});
+
+// --- sending a saved profile to the machine -------------------------------
+// The send itself lives in profileManager (sendProfileRecordToMachine, covered
+// in profile-send-gate.test.mjs). What belongs to the editor is only that SAVE
+// goes through it at all, and that a held switch is reported to the user --
+// "Saved profile" alone would read as "the machine has it".
+const pushMatch = source.match(/async function pushSavedProfileToMachine\([\s\S]*?\n\}/);
+assert.ok(pushMatch, 'pushSavedProfileToMachine not found in profile_editor.js');
+const pushSource = pushMatch[0].replace("await import('./profileManager.js')", 'deps');
+
+function editorPush(result) {
+    const seen = [], toasts = [];
+    const deps = { sendProfileRecordToMachine: async r => { seen.push(r); return result; } };
+    const fn = new Function('deps', 'showToast', 'getTranslation',
+        `${pushSource}\nreturn pushSavedProfileToMachine;`)(
+        deps, m => toasts.push(m), k => k);
+    return { fn, seen, toasts };
+}
+
+const saved = { id: 'A', profile: { title: 'Londinium', target_weight: '36' }, metadata: {} };
+
+test('saving sends the profile to the machine and reports a held switch', async () => {
+    const sent = editorPush('sent');
+    await sent.fn(saved);
+    assert.deepEqual(sent.seen, [saved]);
+    assert.deepEqual(sent.toasts, [], 'the ordinary save toast already covers this');
+
+    const deferred = editorPush('deferred');
+    await deferred.fn(saved);
+    assert.equal(deferred.toasts.length, 1, 'the user must learn the machine kept the old profile');
+
+    // A failed send is logged by the send itself; the save still succeeded, so
+    // it must not be dressed up as a failure here.
+    const failed = editorPush('failed');
+    await failed.fn(saved);
+    assert.deepEqual(failed.toasts, []);
+
+    const empty = editorPush('sent');
+    await empty.fn(null);
+    await empty.fn({ id: 'A' });
+    assert.deepEqual(empty.seen, [], 'nothing to send without a profile');
 });

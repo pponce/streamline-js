@@ -10,6 +10,7 @@ import {
     selectMilkProbeSensorId,
     applyMilkProbeGate,
     resolveSteamTileMode,
+    steamSlotField,
     milkTelemetryText,
     milkTelemetryValue,
     steamFlowHighlightIndex,
@@ -18,6 +19,8 @@ import {
     steamSyncField,
     foldSteamSyncState,
     shouldRetrySteamSync,
+    STEAM_SYNC_RETRY_DELAYS_MS,
+    steamSyncRetryDelay,
     ECO_STEAM_TEMP,
     ECO_STEAM_DELAY_MS,
     shouldEnterEcoSteam,
@@ -212,11 +215,13 @@ test('gate: non-temperature modes are untouched regardless of the probe', () => 
 // usable (Bengle + probe); a probe loss lands the tile on the recorded
 // Time/Off fallback, and probe return does not jump back to Milk on its own.
 
-test('tile: an armed milk stop with milk available pins Milk mode', () => {
+test('tile: an armed milk stop with milk available pins Milk mode, but leaves Flow alone', () => {
     // Boot restore: the workflow kept an armed stop and the probe reports in.
-    assert.equal(resolveSteamTileMode('flow', true, true, 'time'), 'temperature');
     assert.equal(resolveSteamTileMode('time', true, true, null), 'temperature');
     assert.equal(resolveSteamTileMode('temperature', true, true, 'off'), 'temperature');
+    // The stop stays armed while the tile sits on Flow (the Milk|Flow toggle
+    // no longer disarms it), so armed must NOT yank the tile back to Milk.
+    assert.equal(resolveSteamTileMode('flow', true, true, 'time'), 'flow');
 });
 
 test('tile: with milk available but un-armed, the pair is Milk|Flow and nothing auto-arms', () => {
@@ -237,6 +242,16 @@ test('tile: probe loss in Milk mode falls back to the recorded Time/Off mode', (
     assert.equal(resolveSteamTileMode('temperature', false, false, null), 'time');
     // An armed value arriving with no probe stays gated off the display too.
     assert.equal(resolveSteamTileMode('temperature', false, true, 'time'), 'time');
+});
+
+test('tile: the duration slot is a milk-stop editor whenever the stop is armed', () => {
+    // Milk|Flow shows the milk target in both halves, so a tap on that slot has
+    // to open the MILK STOP pad, not STEAM DURATION -- in Flow mode too.
+    assert.equal(steamSlotField(true, true), 'milk-stop');
+    // No probe, or a stop turned off in Settings: the slot really is seconds.
+    assert.equal(steamSlotField(true, false), 'steam-duration');
+    assert.equal(steamSlotField(false, true), 'steam-duration');
+    assert.equal(steamSlotField(false, false), 'steam-duration');
 });
 
 test('tile: without milk, non-Milk modes pass through untouched', () => {
@@ -350,6 +365,18 @@ test('foldSteamSyncState: a failed push marks the field and arms the retries', (
     assert.equal(s.field, 'duration');
     assert.equal(s.retriesLeft, STEAM_SYNC_RETRY_LIMIT);
     assert.equal(shouldRetrySteamSync(s), true);
+});
+
+test('steamSyncRetryDelay: one backoff rung per retry, ladder matches the limit', () => {
+    assert.equal(STEAM_SYNC_RETRY_DELAYS_MS.length, STEAM_SYNC_RETRY_LIMIT);
+    let s = foldSteamSyncState(STEAM_SYNC_SYNCED, { type: 'push-failed', field: 'duration' });
+    const delays = [];
+    while (shouldRetrySteamSync(s)) {
+        delays.push(steamSyncRetryDelay(s));
+        s = foldSteamSyncState(s, { type: 'retry-failed' });
+    }
+    assert.deepEqual(delays, [2000, 4000, 8000]);
+    assert.equal(steamSyncRetryDelay(s), 8000); // clamps once exhausted
 });
 
 test('foldSteamSyncState: a successful push of the same field clears the mark', () => {

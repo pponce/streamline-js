@@ -20,4 +20,3 @@ test('non-finite values and unsafe temperatures are rejected', () => {
         { duration: 30, flow: 1, targetTemperature: 150, stopAtTemperature: 81 },
     ]) assert.throws(() => clampAutoSteamSettings(value), /Invalid Auto steam/);
 });
-

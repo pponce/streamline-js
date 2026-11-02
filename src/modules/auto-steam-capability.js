@@ -22,4 +22,3 @@ export function steamModeCycle({ autoAvailable = false, milkAvailable = false } 
     const manual = manualSteamMode({ milkAvailable });
     return autoAvailable ? [manual, 'auto', 'flow'] : [manual, 'flow'];
 }
-

@@ -1,6 +1,6 @@
 # Decaid and Streamline.js — User Manual
 
-**Applies to:** Decaid (the app formerly called decent.app) and the Streamline.js skin, v0.1.112
+**Applies to:** Decaid (the app formerly called decent.app) and the Streamline.js skin, v0.2.21
 
 ---
 
@@ -26,7 +26,9 @@
 15. [Appendix](#15-appendix)
 
 **Building a skin or a plugin?** The REST and WebSocket API reference lives in
-[docs/API.md](docs/API.md). Contributing to this skin? See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
+[docs/API.md](docs/API.md). Want a plugin to add a button, a hint, a tile mode or a numpad prompt to the main screen? See
+[docs/plugin-surfaces.md](docs/plugin-surfaces.md). Contributing to this skin? See
+[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
 ---
 
@@ -310,6 +312,26 @@ Streamline.js only *reads* DYE2's data. A recipe hidden in DYE2 will not appear 
 In the in-app web view there is also a floating **Exit to Decent dashboard** button. Drag it to
 move it; long-press to hide it.
 
+### Plugin additions
+
+A Decaid plugin can add a few small things to this screen: a button in the top bar, a short hint or
+line on a tile, and an extra **mode** for a tile. A button opens the plugin's own page, and a hint can
+set that tile's value when you tap it.
+
+A mode appears as a small toggle under the tile's name, like `°C | %` under **Brew**. Select the plugin's
+option and the tile shows the plugin's value. `-` / `+` step it, and tapping the value lets you type
+a number; the number pad offers a `±` key for negative numbers when the mode works in whole numbers.
+Brew, Drink, Flush and Steam also show the plugin's own presets (up to four); Grind and Dose have no
+preset row. Select the first option to get the normal tile back. Modes can go on Grind, Dose, Drink,
+Brew, Steam and Flush, and the Steam one is hidden while steam is in Auto.
+
+All of these look like the built-in controls, and disappear when the plugin is switched off or does not
+answer. Plugin authors: see [docs/plugin-surfaces.md](docs/plugin-surfaces.md).
+
+This repository ships one such plugin, [Shot companion](plugins/shot-companion.reaplugin): the current bean in
+the top bar, a live shot strip in the info row during an espresso, and last-shot pills under Grind, Dose and
+Drink. Install it on Decaid as its README describes.
+
 ### Left column — shot settings
 
 | Row | What it sets |
@@ -378,21 +400,19 @@ blocked until one is connected — from the Coffee button and the keyboard short
 
 ## 9. Steam, hot water, and flush
 
-With the independently installed **Auto Steam Calculator** plugin enabled, the Steam mode control
-cycles **Auto | F | T**. Auto shows configured **S / M / L** pitcher presets, plus **Auto** when opted in and configured; tapping one
-calculates and applies time and calibration flow. The selected preset also shows
-its compact milk target when an exact saved calibration is active. Auto shows **0s** until calculated
-and resets after steaming. While waiting, it keeps the normal steam-heater target
-but sets duration and milk-temperature stopping to Off, so the boiler remains ready
-between drinks. Expected calculation refusals, such as less than 10 g of milk,
-stay in Auto at 0s and show the calculator's short explanation; connection or
-plug-in failures fall back visibly to manual Time. Physically starting steam while Auto is Off can still produce a
-brief burst during the machine's state transition. Configure it at **Settings > Extensions > Auto Steam
-Calculator**. See the [setup and usage guide](docs/calibrated-steam.md).
+**Steam.** Set the value in the left column (tap the mode text below *Steam* to switch between
+temperature, duration and flow). Start from the GHC or the **Steam** button. Steam stops on its
+duration limit, or when you stop it — with the duration at 0 (shown as ∞) there is no timer and steam
+runs until you stop it. Tap the *Steam* label to open Settings → Calibration → Steam.
 
-**Steam.** Set the value in the left column (tap the mode text below *Steam* to switch between temperature,
-duration and flow). Start from the GHC or the **Steam** button. Steam stops on its duration limit,
-or when you stop it.
+When the Auto Steam Calculator plugin is available, the same mode control also offers **Auto**.
+In saved-calibration mode, use **−** / **+** to cycle the available calibrations; the selected milk
+target appears beside the active pitcher and briefly replaces the duration display after each change. In
+interpolation mode, the same buttons adjust flow in 0.1 ml/s steps within the calibrated range. Tap a
+configured pitcher to calculate and arm the steam time. While Auto waits for a calculation or the next
+pitcher, it keeps the normal steam-heater target but sets the duration and milk-temperature stop to Off.
+The boiler therefore stays ready between drinks. Physically starting steam while Auto is Off can still
+produce a brief burst during the machine's state transition.
 
 **Hot water.** Tap the *Hot Water* label to choose volume, temperature, duration or flow, then set
 the value. Start with the GHC or the **Water** button.
@@ -447,7 +467,7 @@ editor's **SETTINGS** tab:
   editor to review; nothing reaches your library until you tap **SAVE**.
 - **Import from Share Code** — enter the 4-character code from a profile shared on visualizer.coffee
   and tap **Import**. This needs a Decent Visualizer account already configured — if you haven't
-  added one, a message tells you to set it up in Settings → **Extensions** → **Visualizer** (§13)
+  added one, a message tells you to log in from the Visualizer card in Settings → **Extensions** (§8)
   first. A working code saves the profile straight to your library and opens it here so you can keep
   tweaking it.
 
@@ -590,7 +610,7 @@ Each known device shows its ID, a **Preferred** toggle, its availability, and **
 behind the blocked-start behaviour described in §8.
 
 ### 3. Calibration
-Sub-pages for **Default load settings**, **Refill Kit**, **Voltage**, **Fan**, **Steam** and — on
+Sub-pages for **Default load settings**, **Refill Kit**, **Voltage**, **Fan**, **Steam** (steam-heater on/off toggle and temperature) and — on
 Bengle machines only — **Load Cells**, which walks through a load-cell calibration with a reference
 weight. Some values here are read from the machine but not saveable, depending on what the firmware
 API supports.
@@ -613,16 +633,18 @@ effect immediately — no reload needed.
 ![Language settings](docs/media/language.jpg)
 
 ### 8. Extensions
-Three sub-pages:
+**Shot Uploader** — its own page, for linking a Decent account.
 
-**Visualizer** — toggle on and enter your Decent Visualizer credentials to upload shots
-automatically.
+Below it, one row per plugin Decaid has installed, each with a card built from the plugin's own
+manifest: what it is, an **Open** link when it has a web UI, an enable switch, version and update
+state, and its settings. A plugin needs no support in the skin to appear here — installing it is
+enough. **Visualizer** shows up this way; turn it on and enter your visualizer.coffee login there to
+upload shots. When Decaid reports no plugins (or cannot be reached), a single **Plugins** row stands
+in instead.
 
-**Plugins** — the plugins Decaid has installed.
-
-**DYE2** — the *Describe Your Espresso* master switch, **default off**. Turning it on adds the P/F/R
-toggle, the auto-favourite/recipe strip and the DYE button to the header (§7). Requires
-`dye2.reaplugin` installed in Decaid.
+**DYE2** — the *Describe Your Espresso* card carries one extra control, a master switch that is
+**default off**. Turning it on adds the P/F/R toggle, the auto-favourite/recipe strip and the DYE
+button to the header (§7). Requires `dye2.reaplugin` installed in Decaid.
 
 ### 9. Miscellaneous
 A group of sub-pages: **Decaid Settings**, **Brightness**, **Wake Lock**, **Presence
@@ -641,9 +663,15 @@ machine is **confirmed asleep**, and tapping it wakes the machine.
 | Control | Notes |
 |---|---|
 | On / off | Enabled by default |
+| Show date and time | Enabled by default, on both image and black screen savers |
+| Clock format | Device default (unchanged locale behavior), 12-hour, or 24-hour |
+| Clock position | Top left/center/right or bottom left/center/right; bottom center by default |
 | Your own images | Upload one or more; thumbnails are shown, and you can clear them again |
 | Image cycle | How long each image stays up, 2–600 seconds, default 10. Only meaningful with more than one image |
 | Black screen | A plain black screen saver instead of images |
+
+Clock preferences are saved locally and mirrored to Decaid with the other UI preferences.
+They do not change sleep timing or the image cycle.
 
 > The skin never raises the screen saver optimistically, and hiding it never wakes the machine —
 > only your tap does. This is deliberate: an earlier version put the machine to sleep and woke it

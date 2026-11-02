@@ -1,3 +1,5 @@
+import { SHRINK_ADOPT_MS, trackBaseline, keyboardLift } from './keyboard-fit.js';
+
 let isInitialScaleDone = false; // module-level: only first initScaling call adds .scaled
 
 export function initScaling() {
@@ -5,8 +7,26 @@ export function initScaling() {
     const content = document.getElementById('scaled-content');
     const designWidth = 1920;
     const designHeight = 1200;
-    let baselineHeight = window.innerHeight;
-    let keyboardWasShrunk = false;
+    // The window as it is with no keyboard. The canvas is always laid out for
+    // this height, never for the height a keyboard leaves: see trackBaseline.
+    let baseline = {
+        baselineHeight: window.innerHeight, baselineWidth: window.innerWidth,
+        shrunkSince: 0, keyboardLike: false, shrunk: false,
+    };
+    let adoptTimer = 0;
+    // Set by an orientation change: the window really did change shape, so the
+    // baseline follows it down without waiting.
+    let forceBaseline = false;
+    // How far the canvas is currently lifted to clear the soft keyboard; the
+    // breathing room it leaves is KEYBOARD_GAP in keyboard-fit.js.
+    let keyboardShift = 0;
+    // Signature of the last geometry actually written to the DOM. A soft keyboard
+    // fires visualViewport resize every frame of its slide-in animation, and each
+    // pass used to rewrite the transform and dispatch streamline:scaleupdate --
+    // which re-runs EasyMDE's codemirror.refresh() in the notes modal, the one
+    // place a keyboard is most likely to be open. The geometry is identical on
+    // nearly all of those passes, so skip the writes when nothing moved.
+    let lastGeometry = '';
 
     // Detect if device is mobile
     function isMobileDevice() {
@@ -94,60 +114,80 @@ export function initScaling() {
     function updateScale() {
         if (!viewport || !content) return;
 
-        // Get actual viewport dimensions — guard against keyboard shrinking innerHeight
         const screenWidth = window.innerWidth;
         const rawHeight = window.innerHeight;
+        // Some WebViews resize the window for the keyboard, others only shrink
+        // visualViewport and leave innerHeight alone. Take whichever is smaller
+        // so both report the same "the screen got shorter".
+        const visibleHeight = window.visualViewport ? window.visualViewport.height : rawHeight;
         const activeEl = document.activeElement;
-        const inputFocused = activeEl &&
+        const editing = !!activeEl &&
             (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA' || activeEl.isContentEditable);
-        const keyboardShrunk = inputFocused && rawHeight < baselineHeight * 0.85;
-        const screenHeight = keyboardShrunk ? baselineHeight : rawHeight;
-        if (!keyboardShrunk) baselineHeight = rawHeight;
+        // A full-screen overlay says so with data-keyboard-fit and fits itself to
+        // what is left of the screen: lifting one only pushes its header off the
+        // top while its lower half stays under the keyboard.
+        const fitsItself = !!activeEl?.closest?.('[data-keyboard-fit]');
 
-        // The canvas is deliberately kept at its pre-keyboard size above (so
-        // the main chart/controls don't jump), but that means the real
-        // on-screen keyboard can cover the focused field with nothing to
-        // trigger the browser's normal "scroll input into view" behavior.
-        // Do it ourselves, once, on the rising edge.
-        if (keyboardShrunk && !keyboardWasShrunk) {
-            requestAnimationFrame(() => activeEl.scrollIntoView({ block: 'center', behavior: 'smooth' }));
-        }
-        keyboardWasShrunk = keyboardShrunk;
+        baseline = trackBaseline(baseline, {
+            rawHeight, rawWidth: screenWidth, visibleHeight, editing,
+            now: Date.now(), force: forceBaseline,
+        });
+        forceBaseline = false;
+        // A shrink that was never typed into becomes the new window size once it
+        // has held; nothing else would re-run this to notice.
+        clearTimeout(adoptTimer);
+        if (baseline.shrunk && !baseline.keyboardLike) adoptTimer = setTimeout(updateScale, SHRINK_ADOPT_MS + 50);
+        // Always the full window, never what a keyboard left: the canvas does not
+        // re-scale for a keyboard, it moves (keyboardShift below).
+        const screenHeight = baseline.baselineHeight;
+        const keyboardShrunk = baseline.shrunk;
 
-        // Width always fills. What happens vertically depends on the screen's aspect
-        // relative to the 16:10 design canvas:
+        // The canvas is deliberately kept at its pre-keyboard size above so the
+        // chart and controls don't jump, which also means the keyboard can cover
+        // the focused field. scrollIntoView cannot fix that here: #scaling-container
+        // is overflow:hidden and the non-zoomed branch below resets its scrollTop to
+        // 0 on every pass, so any scroll it managed was undone a frame later. Lift
+        // the whole canvas in the transform instead, by exactly the overlap.
+        keyboardShift = keyboardShrunk && !fitsItself
+            ? keyboardLift(activeEl.getBoundingClientRect(), visibleHeight, keyboardShift)
+            : 0;
+
+        // Width always fills. Vertically the canvas is elastic: the scale stays
+        // uniform (no text stretch) and the canvas takes however many design rows
+        // the screen leaves at that scale. #main-page is a flex column whose <main>
+        // absorbs the difference, so taller-than-16:10 screens (4:3 iPads) GROW past
+        // 1200 rows and shorter ones (Teclast 1340x800, 16:9 panels) SHRINK below it,
+        // with the change landing in the chart instead of in letterbox bars.
         //
-        //   taller than 16:10 (4:3 iPads)  -> keep the scale uniform and GROW the
-        //     canvas past 1200 design rows. #main-page is a flex column whose <main>
-        //     grows, so the extra rows land in the chart instead of in black bars.
-        //     No stretch, no letterbox.
-        //   shorter than 16:10 (A7 1340x800, 16:9 panels) -> can't grow into rows that
-        //     aren't there, so fall back to the TCL-style independent x/y squash
-        //     (dui.tcl uses separate xscale_factor/yscale_factor for the same reason),
-        //     clamped so round controls don't visibly turn into ellipses.
+        // The shrink stops at the rigid part of the main page -- 168px header +
+        // 150px profile/telemetry band + #chart-wrap's 450px min-height + the 242px
+        // footer band reserved by <main>'s padding-bottom. Below that the layout
+        // would clip, so screens flatter than 1920:1010 fall back to the TCL-style
+        // independent x/y squash
+        // (dui.tcl uses separate xscale_factor/yscale_factor for the same reason),
+        // clamped so round controls don't visibly turn into ellipses.
+        const MIN_CANVAS_HEIGHT = 1010;
         let sx = screenWidth / designWidth;
         let sy = screenHeight / designHeight;
         let canvasHeight = designHeight;
 
-        if (screenHeight / sx >= designHeight) {
+        if (screenHeight / sx >= MIN_CANVAS_HEIGHT) {
             sy = sx;
             canvasHeight = screenHeight / sx;
         } else {
-            // Only screens shorter than 16:10 land here, so this clamp no longer has
-            // to protect the 4:3 iPads (they take the grow branch above) -- it can
-            // stay loose enough to cover an A7 Lite whose height is eaten by browser
-            // chrome (1340x736 needs 1.138). localStorage 'maxStretch': 1.0 = never
-            // squash (letterbox instead), higher = fill more aggressively.
-            const MAX_STRETCH = parseFloat(localStorage.getItem('maxStretch') || '1.15');
+            // Only screens flatter than 1920:1010 land here, so this clamp no longer
+            // has to protect the 4:3 iPads or the common 16:9/16:10-ish tablets (they
+            // take the uniform branch above) -- it can stay loose enough to cover an
+            // A7 Lite whose height is eaten by browser chrome. localStorage
+            // 'maxStretch': 1.0 = never squash (letterbox instead), higher = fill
+            // more aggressively.
+            const MAX_STRETCH = parseFloat(localStorage.getItem('maxStretch') || '1.0');
             const stretch = Math.max(sx, sy) / Math.min(sx, sy);
             if (stretch > MAX_STRETCH) {
                 const k = MAX_STRETCH / stretch;
                 if (sx > sy) sx *= k; else sy *= k;
             }
         }
-
-        content.style.width = `${designWidth}px`;
-        content.style.height = `${canvasHeight}px`;
 
         // Option A: only apply user zoom when the base scale < 1.0
         // (i.e. UI is already smaller than designed — small/tablet screens).
@@ -182,8 +222,27 @@ export function initScaling() {
             offsetX = (screenWidth - designWidth * sx) / 2;
             offsetY = (screenHeight - canvasHeight * sy) / 2;
             viewport.style.overflow = 'hidden';
+            // Not meant to be scrollable here -- positioning is done entirely via the
+            // transform above. A stray scrollTop (left over from the zoomed/pannable
+            // branch, or from a focused element's scrollIntoView) shifts the whole
+            // scaled page and clips fixed-height headers off-screen.
+            viewport.scrollTop = 0;
+            viewport.scrollLeft = 0;
         }
 
+        // Lift the canvas clear of the keyboard (0 whenever it is down).
+        offsetY -= keyboardShift;
+
+        // Everything above is arithmetic; this is where it reaches the DOM. Bail
+        // out when the result is identical to the last pass so a keyboard's
+        // per-frame resize storm doesn't re-write the transform or re-fire
+        // streamline:scaleupdate, whose listeners do real layout work.
+        const geometry = `${screenWidth}|${screenHeight}|${canvasHeight}|${sx}|${sy}|${offsetX}|${offsetY}|${keyboardShrunk ? visibleHeight : 0}`;
+        if (geometry === lastGeometry) return;
+        lastGeometry = geometry;
+
+        content.style.width = `${designWidth}px`;
+        content.style.height = `${canvasHeight}px`;
         content.style.transformOrigin = 'top left';
         content.style.transform = `translate(${offsetX}px, ${offsetY}px) scale(${sx}, ${sy})`;
 
@@ -193,27 +252,57 @@ export function initScaling() {
 
         // `scale` kept for existing listeners; it is the horizontal factor, which is
         // what pointer-coordinate math against offsetWidth needs.
+        // visibleHeight and offsetY are what a `position: fixed` child of
+        // #scaled-content needs to cover the screen rather than the canvas: see
+        // visibleBand() in keyboard-fit.js.
         document.dispatchEvent(new CustomEvent('streamline:scaleupdate', {
-            detail: { scale: sx, scaleX: sx, scaleY: sy }
+            detail: {
+                scale: sx, scaleX: sx, scaleY: sy,
+                offsetX, offsetY, canvasHeight,
+                keyboardUp: keyboardShrunk,
+                visibleHeight: keyboardShrunk ? visibleHeight : canvasHeight * sy,
+            }
         }));
     }
 
     updateScale();
     if (content && !isInitialScaleDone) {
         isInitialScaleDone = true;
-        requestAnimationFrame(() => content.classList.add('scaled'));
+        // Native WebViews can report a stale innerWidth/innerHeight at boot and
+        // correct it a few frames later. Reveal only once the size holds still
+        // for 3 frames, or after 600ms regardless so the UI always appears.
+        const start = performance.now();
+        let last = '', stable = 0;
+        const reveal = () => {
+            updateScale();
+            const now = `${window.innerWidth}x${window.innerHeight}`;
+            stable = now === last ? stable + 1 : 0;
+            last = now;
+            if (stable >= 3 || performance.now() - start > 600) content.classList.add('scaled');
+            else requestAnimationFrame(reveal);
+        };
+        requestAnimationFrame(reveal);
     }
     setTimeout(updateScale, 250);
     
-    // Add resize listener with debounce to prevent excessive recalculations
-    let resizeTimer;
+    // A soft keyboard slides in over several hundred milliseconds and fires
+    // visualViewport resize on every frame of it. One pass per frame, coalesced,
+    // so the canvas follows the keyboard instead of jumping 150 ms late, plus one
+    // pass once it has settled because a WebView reports its final height a beat
+    // after the animation ends. updateScale returns early when the geometry has
+    // not moved, so the storm costs a string compare per frame.
+    let resizeFrame = 0;
+    let settleTimer = 0;
     const onResize = () => {
-        clearTimeout(resizeTimer);
-        resizeTimer = setTimeout(() => {
-            updateScale();
-            updateRotationPrompt();
-            setTimeout(updateScale, 200);
-        }, 150);
+        if (!resizeFrame) {
+            resizeFrame = requestAnimationFrame(() => {
+                resizeFrame = 0;
+                updateScale();
+                updateRotationPrompt();
+            });
+        }
+        clearTimeout(settleTimer);
+        settleTimer = setTimeout(() => { settleTimer = 0; updateScale(); }, 250);
     };
     window.addEventListener('resize', onResize);
 
@@ -222,10 +311,19 @@ export function initScaling() {
     if (window.visualViewport) {
         window.visualViewport.addEventListener('resize', onResize);
     }
+
+    // Which field needs clearing changes on focus, not on resize: tabbing from
+    // one input to the next with the keyboard already up fires no viewport event
+    // at all. Unthrottled on purpose -- updateScale returns early when the
+    // geometry is unchanged, so the common case costs one string compare.
+    document.addEventListener('focusin', updateScale);
+    // On blur activeElement is still the old field for the rest of the tick.
+    document.addEventListener('focusout', () => requestAnimationFrame(updateScale));
     
     // Also listen for orientation changes which can affect viewport dimensions
     window.addEventListener('orientationchange', () => {
         console.log('Orientation change event detected');
+        forceBaseline = true;
         // Multiple updates with increasing delays to handle Firefox and other browsers
         // that may take time to report correct viewport dimensions
         setTimeout(() => {

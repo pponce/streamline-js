@@ -1,10 +1,14 @@
-import { loadPage } from './router.js';
-import { showToast, flashPlusMinusButton } from './ui.js';
-import { openModal, shouldUseNumpad, resetNumpadModal } from './numpad-modal.js';
+import { loadPage, getPreviousPageUrl } from './router.js';
+import { showToast, flashPlusMinusButton, flashIconButton } from './ui.js';
+import { openModal, resetNumpadModal } from './numpad-modal.js';
 import { openNotesModal } from './notes-modal.js';
-import { getTranslation } from './i18n.js';
+import { getTranslation, fitTextToWidth } from './i18n.js';
 import { callPluginEndpoint, getPluginSettings } from './api.js';
-import { validateProfileStructure } from './profileManager.js';
+import { validateProfileStructure, isActiveProfile } from './profileManager.js';
+import { getProfileOverride, saveProfileOverride, removeProfileOverrideKeys,
+    clearProfileOverride, ensureProfileOverridesLoaded } from './profile-overrides.js';
+import { applyFlowCalibrationForProfile, getFlowCalibrationBaseline, pickFlowCalibration,
+    FLOW_CAL_KEYS, FLOW_CAL_DEFAULTS } from './flow-calibration.js';
 import { loadECharts } from './echarts-loader.js';
 import { renderChart } from './echarts-renderer.js';
 import { parseTclProfile, isLikelyTclProfile } from './tcl-profile.js';
@@ -17,6 +21,9 @@ let editorState = {
     sourceProfileRecord: null,
     profile: null,
     activeTab: 0,
+    // Index of the one step card allowed to be expanded/editable at a time in
+    // the CARDS tab; every other card renders read-only. null = all collapsed.
+    editingStep: null,
 };
 
 // IDs of profiles persisted to the server via share-code import during a
@@ -51,13 +58,19 @@ function openNumpadForField(currentVal, numpadConfig, onCommit) {
     });
 }
 
-// ─── Review Settings Editable Pill ─────────────────────────────────────────
-// Reusable inline editable value span — dotted blue underline; click opens
-// numpad on tablet or inline edit on desktop. Used in the review tab's
-// settings list under the graph preview.
+// ─── Inline Editable Value Pill ────────────────────────────────────────────
+// Reusable inline editable value span — dashed blue underline; a tap opens the
+// full-screen numpad. This is the editor's one mid-sentence value control; the
+// SCRIPT tab's Steps Overview builds every number in its prose from it.
+// `fieldType` is the numpad's recent-values key, so passing the same one the
+// CARDS tab uses (pe-temp, pe-pump, pe-lim, pe-exit, MAX_NUMPAD's) shares that
+// history between the two tabs rather than splitting it per view.
 
 function createSettingPill({ value, step, unit, min, max, fieldType, title, format, onCommit }) {
-    const PILL_CLASS = 'text-[var(--button-primary-bg)] font-semibold cursor-pointer select-none inline-flex underline decoration-dashed underline-offset-[3px] px-[4px] rounded-[4px]';
+    // py + matching -my expands the tap/hover box for tablet fingers without
+    // pushing wrapped script lines further apart (negative margin cancels the
+    // padding's contribution to layout, only the hit area grows).
+    const PILL_CLASS = 'text-[var(--action-label)] font-semibold cursor-pointer select-none inline-flex px-[4px] py-[10px] -my-[10px] rounded-[4px]';
     const fmt = format || ((v) => unit ? `${roundTo(v, step || 1)} ${unit}` : `${roundTo(v, step || 1)}`);
 
     const pill = document.createElement('span');
@@ -67,101 +80,47 @@ function createSettingPill({ value, step, unit, min, max, fieldType, title, form
     pill.addEventListener('mouseleave', () => { pill.style.backgroundColor = ''; });
 
     pill.addEventListener('click', () => {
-        if (shouldUseNumpad()) {
-            openNumpadForField(value, {
-                fieldType: fieldType || 'pe-review-setting',
-                title: title || (unit ? unit.toUpperCase() : 'VALUE'),
-                unit: unit || '',
-                min: min ?? 0,
-                max: max ?? 9999,
-                label: `${min ?? 0}–${max ?? 9999}`
-            }, (val) => {
-                value = val;
-                pill.textContent = fmt(value);
-                onCommit(value);
-            });
-            return;
-        }
-        inlineEditValue(pill, value, {
-            min, max, step: step || 1, unit,
-            onCommit(val) {
-                value = val;
-                pill.textContent = fmt(value);
-                onCommit(value);
-            }
+        openNumpadForField(value, {
+            fieldType: fieldType || 'pe-script-value',
+            title: title || (unit ? unit.toUpperCase() : 'VALUE'),
+            unit: unit || '',
+            min: min ?? 0,
+            max: max ?? 9999,
+            label: `${min ?? 0}–${max ?? 9999}`
+        }, (val) => {
+            value = val;
+            pill.textContent = fmt(value);
+            onCommit(value);
+            // Every caller of createSettingPill edits an execution field —
+            // keep SAVE AS NEW's enabled state current.
+            updateSaveAsNewButtonState();
         });
     });
 
     return pill;
 }
 
-// ─── Desktop Inline Edit Helper ────────────────────────────────────────────
-// On desktop (non-numpad), clicking a numeric display opens a small input field
-// so the user can type a value directly instead of using +/- buttons.
+// ─── Icon Mask Helper ──────────────────────────────────────────────────────
+// Renders an SVG as a CSS mask (see .pe-icon-mask in main.css) so the glyph
+// follows a theme token/currentColor instead of the fixed stroke baked into
+// the source file. `size` is a single px number (icons here are square).
 
-function inlineEditValue(displayEl, currentValue, { min, max, step, unit, onCommit }) {
-    if (shouldUseNumpad()) return false; // tablet — let numpad handle it
-    if (!displayEl || !displayEl.querySelector) return false; // not a valid element
-    if (displayEl.querySelector('input')) return false; // already editing
+const ICON_MINUS         = 'src/ui/Minus.svg';
+const ICON_PLUS          = 'src/ui/Plus.svg';
+const ICON_ARROW         = 'src/ui/Arrow.svg';
+const ICON_TRASH         = 'src/ui/lucide_trash-2.svg';
+const ICON_CHEVRON_LEFT  = 'src/ui/icons/chevron-left.svg';
+const ICON_CHEVRON_RIGHT = 'src/ui/icons/chevron-right.svg';
 
-    // Find the first text node to replace (preserve child elements like ± buttons)
-    let textNode = null;
-    for (const child of displayEl.childNodes) {
-        if (child.nodeType === Node.TEXT_NODE) { textNode = child; break; }
-    }
-    const savedText = textNode ? textNode.textContent : displayEl.textContent;
-
-    const input = document.createElement('input');
-    input.type = 'number';
-    input.value = currentValue;
-    input.step = step || 'any';
-    if (min !== undefined) input.min = min;
-    if (max !== undefined) input.max = max;
-    input.className = 'bg-transparent border-b-2 border-[var(--text-primary)] outline-none text-center font-bold text-[var(--text-primary)]';
-    input.style.cssText = `width:${Math.max(displayEl.offsetWidth, 60)}px;font-size:inherit;line-height:inherit;`;
-
-    if (textNode) {
-        displayEl.replaceChild(input, textNode);
-    } else {
-        displayEl.textContent = '';
-        displayEl.appendChild(input);
-    }
-    input.focus();
-    input.select();
-
-    function commit() {
-        const num = parseFloat(input.value);
-        restore(); // always put text node back before calling onCommit
-        if (!isNaN(num)) {
-            const clamped = clamp(roundTo(num, step || 0.1), min ?? 0, max ?? 9999);
-            onCommit(clamped);
-        }
-        cleanup();
-    }
-
-    function restore() {
-        const newText = document.createTextNode(savedText);
-        if (input.parentNode === displayEl) displayEl.replaceChild(newText, input);
-    }
-
-    function cancel() {
-        restore();
-        cleanup();
-    }
-
-    function cleanup() {
-        input.removeEventListener('blur', commit);
-        input.removeEventListener('keydown', onKey);
-    }
-
-    function onKey(e) {
-        if (e.key === 'Enter') { e.preventDefault(); input.blur(); }
-        if (e.key === 'Escape') { e.preventDefault(); input.removeEventListener('blur', commit); cancel(); }
-    }
-
-    input.addEventListener('blur', commit);
-    input.addEventListener('keydown', onKey);
-    return true; // handled
+function maskIcon(svgPath, size, color) {
+    const el = document.createElement('span');
+    el.className = 'pe-icon-mask';
+    el.style.width = `${size}px`;
+    el.style.height = `${size}px`;
+    el.style.maskImage = `url('${svgPath}')`;
+    el.style.webkitMaskImage = `url('${svgPath}')`;
+    el.style.backgroundColor = color;
+    return el;
 }
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -216,11 +175,18 @@ const DEFAULT_STEP = {
     limiter: null,
 };
 
-// Factory for new steps inserted from the "+" button. Returns a deep copy of
-// DEFAULT_STEP. Kept as a function so future variants (e.g. seeded from the
-// previous step) can branch here.
-function makeNewStep() {
-    return JSON.parse(JSON.stringify(DEFAULT_STEP));
+// Factory for new steps inserted from the "+" button. Seeds from `neighbor`
+// (the step it's being inserted next to) when given, so continuing a profile
+// -- e.g. a "hold" step right after "preinfusion" -- starts from those same
+// pump/temperature/exit settings instead of the generic default; falls back
+// to DEFAULT_STEP when there is no neighbor (first step in an empty
+// profile). The name always resets to DEFAULT_STEP's: two steps sharing a
+// label in the list is more confusing than starting blank on just that one
+// field.
+function makeNewStep(neighbor) {
+    const seed = JSON.parse(JSON.stringify(neighbor || DEFAULT_STEP));
+    seed.name = DEFAULT_STEP.name;
+    return seed;
 }
 
 // profile.target_volume_count_start is a 1-based step index (0 = None), so it
@@ -251,39 +217,9 @@ function confirmDeleteStep(index) {
 
 function insertStepAfter(index) {
     const p = editorState.profile;
-    p.steps.splice(index + 1, 0, makeNewStep());
+    p.steps.splice(index + 1, 0, makeNewStep(p.steps[index]));
     const start = p.target_volume_count_start || 0;
     if (start > index + 1) p.target_volume_count_start = start + 1;
-}
-
-// Reorder button for a step. `dir` is -1 (earlier) or +1 (later). At the ends
-// of the run the button stays in place but goes inert, so the footer's button
-// row keeps the same width on every step — a disappearing control would shift
-// delete and insert sideways under the finger.
-function makeMoveBtn(index, dir, total, rerender, big) {
-    // Class strings are literals, not interpolated: Tailwind builds app.css by
-    // scanning source text, so a `w-[${size}px]` would compile to nothing and
-    // silently lose its width.
-    const BOX = big
-        ? 'pe-step-action-btn w-[60px] h-[60px] flex items-center justify-center rounded-[10px]'
-        : 'pe-step-action-btn w-[36px] h-[36px] flex items-center justify-center rounded-[10px]';
-
-    const target = index + dir;
-    const disabled = target < 0 || target >= total;
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = `${BOX} ${disabled ? 'cursor-default' : 'text-[var(--mimoja-blue)] hover:bg-[var(--button-grey)] cursor-pointer'}`;
-    if (disabled) {
-        btn.style.color = 'var(--low-contrast-white)';
-        btn.style.opacity = '0.35';
-        btn.disabled = true;
-    }
-    const d = dir < 0 ? 'M15 19l-7-7 7-7' : 'M9 5l7 7-7 7';
-    const px = big ? 'h-8 w-8' : 'h-5 w-5';
-    btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" class="${px}" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="${d}" /></svg>`;
-    btn.setAttribute('aria-label', dir < 0 ? 'Move step earlier' : 'Move step later');
-    if (!disabled) btn.addEventListener('click', () => { if (moveStep(index, target)) rerender(); });
-    return btn;
 }
 
 // Move a step to a new position. Like removeStepAt/insertStepAfter this has to
@@ -313,13 +249,24 @@ function moveStep(from, to) {
 
 const TAB_COUNT = 3;
 
-// Stepper ± button. 44px is the WCAG 2.5.5 / iOS HIG touch-target floor; the old
-// expand-on-tap buttons were 60px, which only fitted because they were hidden at
-// rest and drawn outside the cell. Always-visible buttons have to live in the
-// cell's width budget, and 44 is what pays for that.
-const STEPPER_BTN_CLASS = 'bg-[var(--button-grey)] rounded-[14px] w-[44px] h-[44px] flex items-center justify-center shrink-0 cursor-pointer select-none text-xl font-bold text-[var(--text-primary)]';
+// Stepper ± button — shared by every ± control in the editor (the grid's
+// createGridStepper and the settings tab's createSpinner), so there is
+// exactly one ± button style in the file.
+// Icon colour is --stepper-icon, dimmed to --stepper-icon-disabled when the value
+// sits at its min/max (setStepperLimit) — the button stays tappable, it just
+// reads as spent.
+const STEPPER_BTN_CLASS = 'bg-[var(--stepper-btn-bg)] rounded-[15px] w-[72px] h-[72px] flex items-center justify-center shrink-0 cursor-pointer select-none';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
+
+// Figma 4351-1658/1659 give the adjust button a disabled state per END, not
+// per button: MINUS DISABLED and PLUS DISABLED are the same treatment, applied
+// to whichever one is sitting on its limit. The glyph mutes in both themes;
+// light also drops the fill to Adjust.Inactive, dark keeps its own.
+function setStepperLimit(btn, atLimit) {
+    btn.firstChild.style.backgroundColor = atLimit ? 'var(--stepper-icon-disabled)' : 'var(--stepper-icon)';
+    btn.style.backgroundColor = atLimit ? 'var(--stepper-btn-bg-disabled)' : '';
+}
 
 function deepCopy(obj) {
     return JSON.parse(JSON.stringify(obj));
@@ -340,37 +287,56 @@ function roundTo(value, step) {
 // ─── Spinner Factory ────────────────────────────────────────────────────────
 
 function createSpinner(initialValue, step, unit, onChange, opts = {}) {
-    const { min, max, disabled } = opts;
+    // displaySize: Figma's settings-row values aren't all the same size --
+    // Preheat Water Tank is 32px (scaled 24px, the default) but Flow Range,
+    // Pressure Range, Weight and Volume are 34px (scaled 25.5px) -- so callers
+    // matching the latter pass displaySize: 25.5 explicitly.
+    const { min, max, disabled, displaySize = 24 } = opts;
     let value = typeof initialValue === 'number' ? initialValue : parseFloat(initialValue) || 0;
     let debounceTimer = null;
 
     const wrapper = document.createElement('div');
-    wrapper.className = 'flex items-center gap-[10px]';
+    wrapper.className = 'flex items-center gap-[15px]';
 
     const minusBtn = document.createElement('button');
     minusBtn.type = 'button';
-    minusBtn.className = 'bg-[var(--button-grey)] rounded-[18px] w-[60px] h-[60px] flex items-center justify-center cursor-pointer select-none text-xl font-bold text-[var(--text-primary)] z-[10]';
-    minusBtn.textContent = '\u2212';
+    minusBtn.className = STEPPER_BTN_CLASS;
+    minusBtn.appendChild(maskIcon(ICON_MINUS, 37.5, 'var(--stepper-icon)'));
     minusBtn.setAttribute('aria-label', 'Decrease');
 
     const display = document.createElement('span');
-    display.className = 'font-bold text-[20px] text-center w-[90px] text-[var(--text-primary)]';
+    // Tailwind's scanner needs literal class strings (a template-interpolated
+    // arbitrary value like text-[${displaySize}px] won't be picked up), so the
+    // two sizes this editor actually uses are spelled out and selected here.
+    display.className = `font-bold ${displaySize === 25.5 ? 'text-[25.5px]' : 'text-[24px]'} text-center w-[150px] text-[var(--text-primary)]`;
 
     const plusBtn = document.createElement('button');
     plusBtn.type = 'button';
-    plusBtn.className = 'bg-[var(--button-grey)] rounded-[18px] w-[60px] h-[60px] flex items-center justify-center cursor-pointer select-none text-xl font-bold text-[var(--text-primary)] z-[10]';
-    plusBtn.textContent = '+';
+    plusBtn.className = STEPPER_BTN_CLASS;
+    plusBtn.appendChild(maskIcon(ICON_PLUS, 37.5, 'var(--stepper-icon)'));
     plusBtn.setAttribute('aria-label', 'Increase');
 
     function updateDisplay() {
         const formatted = roundTo(value, step);
         display.textContent = unit ? `${formatted} ${unit}` : `${formatted}`;
+        setStepperLimit(minusBtn, min != null && value <= min);
+        setStepperLimit(plusBtn, max != null && value >= max);
+    }
+
+    // Every createSpinner field in this editor (target weight/volume, tank
+    // temperature, limiter tolerance) is a profile-wide execution field, so
+    // every path that commits a value also has to keep SAVE AS NEW's enabled
+    // state current — wrapped once here rather than at each of the two call
+    // sites below (± via the debounce, tap-to-type via the numpad).
+    function notifyChange(val) {
+        onChange(val);
+        updateSaveAsNewButtonState();
     }
 
     function debouncedOnChange() {
         clearTimeout(debounceTimer);
         debounceTimer = setTimeout(() => {
-            onChange(value);
+            notifyChange(value);
         }, 300);
     }
 
@@ -388,25 +354,21 @@ function createSpinner(initialValue, step, unit, onChange, opts = {}) {
         debouncedOnChange();
     });
 
-    // Click the value to type one: numpad on tablet, inline input on desktop.
-    // This used to need two taps (first selected, second opened) with a 2s
-    // window in between — the ± are always visible here, so there was never
-    // anything for the first tap to disambiguate.
+    // Click the value to type one on the full-screen numpad. This used to need
+    // two taps (first selected, second opened) with a 2s window in between —
+    // the ± are always visible here, so there was never anything for the first
+    // tap to disambiguate.
     display.style.cursor = 'pointer';
     display.addEventListener('click', () => {
-        const commit = (val) => { value = roundTo(val, step); updateDisplay(); onChange(value); };
-        if (shouldUseNumpad()) {
-            openNumpadForField(value, {
-                fieldType: 'pe-settings',
-                title: (unit || 'VALUE').toUpperCase(),
-                unit: unit || '',
-                min: min ?? 0,
-                max: max ?? 9999,
-                label: `${min ?? 0}–${max ?? 9999}`
-            }, commit);
-            return;
-        }
-        inlineEditValue(display, value, { min, max, step, unit, onCommit: commit });
+        const commit = (val) => { value = roundTo(val, step); updateDisplay(); notifyChange(value); };
+        openNumpadForField(value, {
+            fieldType: 'pe-settings',
+            title: (unit || 'VALUE').toUpperCase(),
+            unit: unit || '',
+            min: min ?? 0,
+            max: max ?? 9999,
+            label: `${min ?? 0}–${max ?? 9999}`
+        }, commit);
     });
 
     updateDisplay();
@@ -459,83 +421,68 @@ function newLimiterRange(pump) {
 }
 
 // ─── Grid Stepper ───────────────────────────────────────────────────────────
-// One control for every numeric field in the step grid: [−] [value] [+].
+// One control for every numeric field in an expanded step card: [−] [value] [+].
+// The ± are always visible (no reveal-on-tap — cards themselves are the
+// collapse/expand unit now, see editorState.editingStep). Tapping the value
+// opens the full-screen numpad.
 //
-// `revealOnTap` hides the ± until the value is tapped, so a cell at rest shows
-// only its numbers. Two rules keep that from repeating the old tap-to-expand
-// model's mistakes:
-//
-//  1. Hidden means `visibility:hidden`, not `display:none`. The ± keep their
-//     space, so revealing them cannot reflow the row out from under a finger —
-//     which is the reason the old code positioned them `absolute` outside the
-//     pill, where they overlapped the sticky label column and the next step.
-//  2. Nothing auto-collapses. The old 2s timer expired mid-edit and was a
-//     WCAG 2.2.1 failure. A revealed stepper closes only when another one
-//     opens, tracked by the single `_activeStepper` below (the previous code
-//     spread this across five Sets and a Map that could disagree).
-//
-// Tapping the value opens the numpad on tablet or an inline input on desktop —
-// once revealed, or immediately when `revealOnTap` is false.
-let _activeStepper = null; // { hide: fn } | null
-
-// `startRevealed` steppers are the grid's affordance hint: the Temp row draws
-// its ± on first paint so the control demonstrates itself, and the first tap on
-// any pill anywhere retires them — by then the user has seen what a pill does.
-// Dismissal is sticky for the editing session, otherwise every renderStepCards()
-// (tab switch, insert, delete) would re-arm the hint and it would read as a
-// flicker rather than a one-time lesson. Reset in initializeProfileEditor.
-let _hintSteppers = [];      // hide fns still acting as hints
-let _hintsDismissed = false;
-
-function _dismissHints(exceptHide) {
-    if (!_hintSteppers.length) return;
-    for (const hideFn of _hintSteppers) if (hideFn !== exceptHide) hideFn();
-    _hintSteppers = [];
-    _hintsDismissed = true;
-}
-
-function createGridStepper({ value, lim, numpad, revealOnTap = false, startRevealed = false, offWhenZero = false, format, onChange }) {
+// `unit`, when given, renders as a second line stacked under the value (e.g.
+// "7.5" over "mL/s"). Omit it and fold the unit into `format` instead for a
+// field the design keeps on one line (e.g. "92°C", "15g").
+function createGridStepper({ value, lim, numpad, unit = null, offWhenZero = false, format, onChange }) {
     let current = value;
     const fmt = format || ((v) => `${roundTo(v, lim.step)}`);
 
     const wrapper = document.createElement('div');
-    wrapper.className = 'flex items-center gap-[8px]';
+    wrapper.className = 'flex items-center gap-[15px]';
 
-    const display = document.createElement('span');
-    display.style.minWidth = '140px';
+    const valueCol = document.createElement('div');
+    valueCol.className = 'flex flex-col items-center justify-center w-[72px] cursor-pointer select-none';
+
+    const valueLine = document.createElement('span');
+    valueLine.className = 'font-bold text-[25.5px] text-center leading-[30.75px]';
+    valueCol.appendChild(valueLine);
+
+    let unitLine = null;
+    if (unit) {
+        unitLine = document.createElement('span');
+        unitLine.className = 'font-semibold text-[19.5px] text-center leading-[23.25px]';
+        unitLine.textContent = unit;
+        valueCol.appendChild(unitLine);
+    }
 
     function restyle() {
-        // offWhenZero fields (the limiter, the three Max limits) read as an
-        // outline pill at 0 — white on --secondary-button-bg was 1.75:1 in the
-        // light theme. Off is greyed, not just unfilled: --secondary-button-outline
-        // is the blue the live Flow/Quickly toggles wear, so a 0 g pill used to
-        // look exactly as enabled as they are.
+        // offWhenZero fields (the limiter, the three Max limits) read as
+        // "off" via muted text rather than an outline pill — 0 is a real,
+        // reachable state (a limiter/limit that isn't set), not a disabled one.
         const on = !offWhenZero || current > 0;
-        const textCls = on ? 'text-white' : 'text-[var(--low-contrast-white)]';
-        const bg = on ? 'bg-[var(--button-primary-bg)]' : '';
-        display.className = `${bg} rounded-[8px] px-[10px] py-[4px] text-[24px] font-semibold cursor-pointer select-none text-center ${textCls}`;
-        display.style.border = on ? '1px solid transparent' : '1px solid var(--border-color)';
-        // The ± dim with their pill, so a revealed-but-off field still reads off.
-        minusBtn.style.opacity = on ? '' : '0.45';
-        plusBtn.style.opacity  = on ? '' : '0.45';
+        const color = on ? 'var(--text-primary)' : 'var(--low-contrast-white)';
+        valueLine.style.color = color;
+        if (unitLine) unitLine.style.color = color;
     }
 
     function render() {
-        display.textContent = fmt(current);
+        valueLine.textContent = fmt(current);
         restyle();
+        setStepperLimit(minusBtn, current <= lim.min);
+        setStepperLimit(plusBtn, current >= lim.max);
     }
 
     function commit(val) {
         current = val;
         render();
         onChange(current);
+        // Every createGridStepper field is an execution field (temp, pump
+        // target, limiter, max, exit value) — SAVE AS NEW's enabled state has
+        // to track every one of them, not just full-tab re-renders.
+        updateSaveAsNewButtonState();
     }
 
-    function mkBtn(label, delta, ariaLabel) {
+    function mkBtn(svgPath, delta, ariaLabel) {
         const btn = document.createElement('button');
         btn.type = 'button';
         btn.className = STEPPER_BTN_CLASS;
-        btn.textContent = label;
+        btn.appendChild(maskIcon(svgPath, 37.5, 'var(--stepper-icon)'));
         btn.setAttribute('aria-label', ariaLabel);
         btn.addEventListener('click', (e) => {
             e.stopPropagation();
@@ -545,60 +492,377 @@ function createGridStepper({ value, lim, numpad, revealOnTap = false, startRevea
         return btn;
     }
 
-    const minusBtn = mkBtn('−', -lim.step, numpad.title + ' decrease');
-    const plusBtn  = mkBtn('+',       lim.step, numpad.title + ' increase');
+    const minusBtn = mkBtn(ICON_MINUS, -lim.step, numpad.title + ' decrease');
+    const plusBtn  = mkBtn(ICON_PLUS,   lim.step, numpad.title + ' increase');
 
-    const isHint = revealOnTap && startRevealed && !_hintsDismissed;
-    let revealed = !revealOnTap || isHint;
-    function setRevealed(on) {
-        revealed = on;
-        const v = on ? 'visible' : 'hidden';
-        minusBtn.style.visibility = v;
-        plusBtn.style.visibility = v;
-    }
-    setRevealed(revealed);
-
-    function hide() {
-        if (!revealOnTap) return;
-        setRevealed(false);
-        if (_activeStepper && _activeStepper.hide === hide) _activeStepper = null;
-    }
-
-    if (isHint) _hintSteppers.push(hide);
-
-    display.addEventListener('click', () => {
-        // Any pill tap ends the hint — including a tap on a hinting pill itself,
-        // which keeps its own ± (it is the field being edited) while its peers
-        // drop theirs.
-        _dismissHints(hide);
-        if (revealOnTap && !revealed) {
-            if (_activeStepper) _activeStepper.hide();
-            setRevealed(true);
-            _activeStepper = { hide };
-            return;
-        }
-        // A hinting pill was already revealed, so this tap is the edit itself —
-        // register it as active so the next tap elsewhere collapses it.
-        if (revealOnTap && revealed && !_activeStepper) _activeStepper = { hide };
-        if (shouldUseNumpad()) {
-            openNumpadForField(current, numpad, commit);
-            return;
-        }
-        inlineEditValue(display, current, {
-            min: lim.min, max: lim.max, step: lim.step,
-            onCommit: commit,
-        });
+    valueCol.addEventListener('click', (e) => {
+        e.stopPropagation();
+        openNumpadForField(current, numpad, commit);
     });
 
     render();
     wrapper.appendChild(minusBtn);
-    wrapper.appendChild(display);
+    wrapper.appendChild(valueCol);
     wrapper.appendChild(plusBtn);
-    wrapper._setWidth = (px) => { display.style.minWidth = px; };
     return wrapper;
 }
 
 // ─── Render Functions ───────────────────────────────────────────────────────
+
+// ─── Cycle Chip Factory ─────────────────────────────────────────────────────
+// One control for every "cycle through N states on tap" chip in an expanded
+// card (temp sensor, pump mode, exit condition). `states` is an array of
+// opaque backing values; `labelFor` renders the chip text for a given state.
+function createCycleChip({ states, index, labelFor, onChange }) {
+    let i = index;
+    const chip = document.createElement('button');
+    chip.type = 'button';
+    // Line box and inset are the design's, not Tailwind's defaults: Figma's
+    // chip text is 26/31 (19.5/23.25 here, so leading-tight's 1.25 ran two
+    // lines 2.25 too tall) in a box inset 3 (2.25) from the 152-wide frame,
+    // which is also the width a two-word label wraps against.
+    // Outline, not filled, in BOTH themes (Figma 2662-936): the chips bind
+    // Buttons/Primary.Background.Inactive as fill, Border/Primary as stroke and
+    // --action-label as label. Only those tokens' values differ between light
+    // and dark; the shape never does. The fill matches the card behind it in
+    // both themes -- the stroke is what draws the box, as designed.
+    chip.className = 'w-[114px] h-[72px] rounded-[15px] bg-[var(--card-bg)] border-[1.5px] border-[var(--border-primary)] text-[var(--action-label)] font-bold text-[19.5px] leading-[23.25px] px-[2.25px] flex items-center justify-center text-center shrink-0 cursor-pointer select-none';
+    // pre-line, not normal: honour the explicit breaks labelFor hands back,
+    // and still wrap a line too long for the box on its own.
+    chip.style.whiteSpace = 'pre-line';
+
+    // labelFor may return a string, or one string per line for the chips the
+    // design breaks itself; pre-line above is what honours the join.
+    function render() {
+        const label = labelFor(states[i], i);
+        chip.textContent = Array.isArray(label) ? label.join('\n') : label;
+    }
+    render();
+
+    chip.addEventListener('click', (e) => {
+        e.stopPropagation();
+        i = (i + 1) % states.length;
+        render();
+        onChange(states[i], i);
+        // Every chip in this editor (sensor, pump mode, exit condition) cycles
+        // an execution field — keep SAVE AS NEW's enabled state current.
+        updateSaveAsNewButtonState();
+    });
+
+    return chip;
+}
+
+// ─── Pure state-cycle + paging math ────────────────────────────────────────
+// Kept as small standalone functions (not closures) so they can be extracted
+// and unit-tested the same way readExitDef/pushChannel are above.
+
+// Pump-mode chip: Flow Quickly → Flow Slowly → Pressure Quickly → Pressure
+// Slowly → (wrap). Composed from existing translation keys, not a new CSV row.
+const PUMP_CYCLE_STATES = [
+    { pump: 'flow',     transition: 'fast'   },
+    { pump: 'flow',     transition: 'smooth' },
+    { pump: 'pressure', transition: 'fast'   },
+    { pump: 'pressure', transition: 'smooth' },
+];
+function pumpCycleIndex(pump, transition) {
+    return (pump === 'pressure' ? 2 : 0) + (transition === 'smooth' ? 1 : 0);
+}
+// Figma (2662-989, 2662-1037) breaks these chips between the noun and its
+// qualifier -- "Flow / Quickly", "Pressure / is over" -- rather than wherever
+// the 114px box runs out. Hence parts: createCycleChip renders one per line,
+// while the collapsed rows and the SCRIPT tab join them back into a sentence.
+function pumpChipParts(state) {
+    return [
+        getTranslation(state.pump === 'pressure' ? 'Pressure' : 'Flow'),
+        getTranslation(state.transition === 'smooth' ? 'Slowly' : 'Quickly'),
+    ];
+}
+function pumpChipLabel(state) {
+    return pumpChipParts(state).join(' ');
+}
+
+// "Move on if" chip: Pressure is over → Pressure is under → Flow is over →
+// Flow is under → Off → (wrap). `type: null` marks the Off state, matching
+// readExitDef's { type: 'off', condition: 'over', value: 0 } shape's 'off'.
+const EXIT_CYCLE_STATES = [
+    { type: 'pressure', condition: 'over'  },
+    { type: 'pressure', condition: 'under' },
+    { type: 'flow',      condition: 'over'  },
+    { type: 'flow',      condition: 'under' },
+    { type: 'off',       condition: null    },
+];
+function exitCycleIndex(type, condition) {
+    if (type !== 'pressure' && type !== 'flow') return 4; // off
+    return (type === 'flow' ? 2 : 0) + (condition === 'under' ? 1 : 0);
+}
+function exitChipParts(state) {
+    if (state.type === 'off') return [getTranslation('Off')];
+    return [
+        getTranslation(state.type === 'flow' ? 'Flow' : 'Pressure'),
+        getTranslation(state.condition === 'under' ? 'is under' : 'is over'),
+    ];
+}
+function exitChipLabel(state) {
+    return exitChipParts(state).join(' ');
+}
+
+// Card paging: the row scrolls by one card "pitch" (450 card + 15 gap) per tap.
+const CARD_WIDTH = 450;
+const CARD_GAP = 15;
+const CARD_PITCH = CARD_WIDTH + CARD_GAP;
+// Skirt of page ground left visible below the card row (Figma 42 at 0.75).
+const CARD_BOTTOM_GAP = 31.5;
+// Width of the sticky label rail pinned over the row's left edge.
+const LABEL_GUTTER = 192.75;
+// The shell is a fixed-width design canvas (scaling.js scales the whole thing
+// to the real viewport), so the row's own widths can be reasoned about against
+// this rather than measured — which also means the tail below is decided
+// correctly even when CARDS is re-rendered while hidden and clientWidth is 0.
+const CANVAS_WIDTH = 1920;
+
+// Trailing dead grid track for the card row, so the LAST card can still reach
+// the "flush against the sticky gutter" snap position. Without it the row ends
+// flush right: scrolling clamps at scrollWidth - clientWidth, which is not a
+// snap position, so whichever card is leftmost there gets sliced by the gutter.
+// The tail buys back exactly the slack that clamp was eating, and the row now
+// ends in empty page ground rather than a cut card.
+//
+// Sized as a percentage rather than off CANVAS_WIDTH because a grid track's %
+// resolves against the container's content box — the canvas less whatever
+// scrollbar-gutter reserves for the vertical bar (1875, not 1920) — which is
+// the same box the scroll clamp is computed from.
+//
+// The strict minimum is 100% - (gutter + card). It is overshot by the gutter's
+// own width on purpose: at the exact minimum Chromium still stopped ~30px short
+// of the last card's snap position, resting off-snap with a 15px sliver of the
+// previous card showing past the gutter. The surplus is unreachable — mandatory
+// snap pulls back to the last real snap position — so it costs nothing.
+//
+// Returns '' unless the row actually overflows (4+ cards at this canvas width):
+// adding a tail to a row that already fits would invent a scrollbar, and with
+// nothing to scroll past, the leftmost card was never at risk to begin with.
+function cardRowTailTrack(numSteps) {
+    const naturalRowWidth = LABEL_GUTTER + numSteps * CARD_WIDTH + Math.max(0, numSteps - 1) * CARD_GAP;
+    return naturalRowWidth > CANVAS_WIDTH ? ` calc(100% - ${CARD_WIDTH}px)` : '';
+}
+
+// Which end-chevron is disabled for a header at `index` of `total` cards —
+// shared by the header's own reorder chevrons.
+function isChevronDisabled(index, dir, total) {
+    const target = index + dir;
+    return target < 0 || target >= total;
+}
+
+// ─── Card collapse/expand state ────────────────────────────────────────────
+// Only one card is expanded at a time; collapsed cards render read-only.
+// Outside-click collapses the open card — see installOutsideClickHandler.
+function expandCard(index) {
+    if (editorState.editingStep === index) return;
+    editorState.editingStep = index;
+    renderStepCards();
+}
+
+function collapseCard() {
+    if (editorState.editingStep === null) return;
+    editorState.editingStep = null;
+    renderStepCards();
+}
+
+let _outsideClickHandler = null;
+function installOutsideClickHandler() {
+    removeOutsideClickHandler();
+    _outsideClickHandler = (e) => {
+        if (editorState.editingStep === null) return;
+        const stepsContainer = document.getElementById('editor-steps-container');
+        // Modals (numpad, notes, confirm dialogs) mount outside this container,
+        // so a click landing there is never "outside the card" in the sense
+        // that should collapse it.
+        if (!stepsContainer || !stepsContainer.contains(e.target)) return;
+        if (e.target.closest(`[data-card-index="${editorState.editingStep}"]`)) return;
+        collapseCard();
+    };
+    document.addEventListener('click', _outsideClickHandler);
+}
+
+function removeOutsideClickHandler() {
+    if (_outsideClickHandler) {
+        document.removeEventListener('click', _outsideClickHandler);
+        _outsideClickHandler = null;
+    }
+}
+
+// ─── Card paging controls ───────────────────────────────────────────────────
+let _pagingScrollHandler = null;
+
+function updatePagingButtons() {
+    const container = document.getElementById('editor-steps-container');
+    const prevBtn = document.getElementById('editor-page-prev-btn');
+    const nextBtn = document.getElementById('editor-page-next-btn');
+    if (!container || !prevBtn || !nextBtn) return;
+    // The last card has no scroll-snap-align (see renderStepCards), so with
+    // mandatory snap the container can never actually come to rest at
+    // scrollWidth - clientWidth — it snaps back to the second-to-last
+    // card's start instead. That resting position is (numSteps - 2) card
+    // pitches from scroll-padding-left 0, independent of LABEL_GUTTER since
+    // scroll-padding-left shifts the snap target by the same amount.
+    const numSteps = parseInt(container.dataset.numSteps, 10) || 0;
+    const maxScrollLeft = numSteps >= 2 ? (numSteps - 2) * CARD_PITCH : 0;
+    const atStart = container.scrollLeft <= 1;
+    const atEnd = container.scrollLeft >= maxScrollLeft - 1;
+    const prevIcon = prevBtn.querySelector('.pe-icon-mask');
+    const nextIcon = nextBtn.querySelector('.pe-icon-mask');
+    prevBtn.classList.toggle('pointer-events-none', atStart);
+    prevBtn.setAttribute('aria-disabled', String(atStart));
+    if (prevIcon) prevIcon.style.backgroundColor = atStart ? 'var(--profile-button-outline-color)' : 'var(--text-primary)';
+    nextBtn.classList.toggle('pointer-events-none', atEnd);
+    nextBtn.setAttribute('aria-disabled', String(atEnd));
+    if (nextIcon) nextIcon.style.backgroundColor = atEnd ? 'var(--profile-button-outline-color)' : 'var(--text-primary)';
+}
+
+function removeCardPagingScrollHandler() {
+    if (!_pagingScrollHandler) return;
+    const container = document.getElementById('editor-steps-container');
+    if (container) container.removeEventListener('scroll', _pagingScrollHandler);
+    _pagingScrollHandler = null;
+}
+
+// Run `fn` at most once per animation frame. A touch scroll fires its event far
+// more often than the screen repaints, and both scroll handlers in this file
+// read layout (scrollLeft, scrollHeight/clientHeight) and then write styles —
+// unthrottled that is a forced synchronous reflow per event, for a result the
+// user can only see once a frame. Same shape as the soft-keyboard storm in
+// scaling.js: coalesce, don't recompute.
+function perFrame(fn) {
+    let queued = false;
+    return () => {
+        if (queued) return;
+        queued = true;
+        requestAnimationFrame(() => { queued = false; fn(); });
+    };
+}
+
+// Binds the paging buttons and the scroll listener exactly once per page
+// mount. Called from initializeProfileEditor, NOT from renderStepCards: the
+// prev/next buttons and the scroll container are static markup in
+// profile_editor.html, so renderStepCards (which runs on every expand,
+// collapse, reorder, chip cycle, insert and delete) only ever clears the
+// container's *children* — calling this from there stacked a fresh click/
+// scroll listener on the same three elements every single re-render.
+// Idempotent: the router replaces the whole subpage HTML on every real
+// navigation (fresh elements, nothing to double-bind), but this still has to
+// survive being invoked twice against the same elements without stacking.
+function initCardPaging() {
+    const container = document.getElementById('editor-steps-container');
+    const prevBtn = document.getElementById('editor-page-prev-btn');
+    const nextBtn = document.getElementById('editor-page-next-btn');
+    if (!container || !prevBtn || !nextBtn) return;
+
+    if (prevBtn.dataset.pagingBound === 'true') {
+        updatePagingButtons();
+        return;
+    }
+    prevBtn.dataset.pagingBound = 'true';
+    nextBtn.dataset.pagingBound = 'true';
+
+    prevBtn.innerHTML = '';
+    const prevIcon = maskIcon(ICON_ARROW, 37.5, 'var(--text-primary)');
+    prevIcon.style.transform = 'rotate(180deg)';
+    prevBtn.appendChild(prevIcon);
+
+    nextBtn.innerHTML = '';
+    nextBtn.appendChild(maskIcon(ICON_ARROW, 37.5, 'var(--text-primary)'));
+
+    prevBtn.addEventListener('click', () => container.scrollBy({ left: -CARD_PITCH, behavior: 'smooth' }));
+    nextBtn.addEventListener('click', () => container.scrollBy({ left: CARD_PITCH, behavior: 'smooth' }));
+
+    removeCardPagingScrollHandler();
+    _pagingScrollHandler = perFrame(updatePagingButtons);
+    container.addEventListener('scroll', _pagingScrollHandler);
+    updatePagingButtons();
+}
+
+// ─── Exit-value memory ──────────────────────────────────────────────────────
+// readExitDef reports a step with no exit as { type: 'off', value: 0 } — that
+// 0 is a display fallback, not a real value (see the comment on readExitDef).
+// Cycling the exit chip away from Off must not write it as one: a live
+// { type: 'pressure', condition: 'over', value: 0 } exit fires on essentially
+// any pressure at all, silently changing how the step runs. This remembers
+// the last real value per pump type per step (keyed by the step object, so it
+// survives a reorder — splice moves references, it never clones them — but
+// naturally drops off if the step itself is deleted) so cycling Off and back
+// through the same type restores what was there, and falls back to a sane
+// default otherwise.
+const _lastExitValue = new WeakMap(); // step -> { pressure?: number, flow?: number }
+
+// DEFAULT_STEP.exit.value (9.0 bar) is the single source of truth for a fresh
+// step's pressure exit; flow has no such default elsewhere, so 6.0 mL/s is
+// chosen to match PUMP_SEED_FLOW's already-established "reasonable default
+// flow" figure.
+const EXIT_FALLBACK_VALUE = { pressure: DEFAULT_STEP.exit.value, flow: 6.0 };
+
+function rememberExitValue(step, type, value) {
+    if ((type !== 'pressure' && type !== 'flow') || !(value > 0)) return;
+    const rec = _lastExitValue.get(step) || {};
+    rec[type] = value;
+    _lastExitValue.set(step, rec);
+}
+
+function recallExitValue(step, type) {
+    const remembered = _lastExitValue.get(step)?.[type];
+    const value = remembered > 0 ? remembered : EXIT_FALLBACK_VALUE[type];
+    return clamp(value, 0, EXIT_MAX_MAP[type]);
+}
+
+// ─── Render Functions ───────────────────────────────────────────────────────
+
+// Collapsed-card row: centered "Label  Value", read-only.
+// A collapsed card mirrors the expanded one line for line — same labels, same
+// order — so expanding a card changes only how a value is edited, never what
+// the card says. `accent` follows the expanded row's own left slot: a label
+// backed by a cycling chip reads bold (Group, Flow Quickly, Pressure is over),
+// a plain caption reads regular (Limit to, Weight, Time, Volume). Both use
+// --text-primary: the action blue is ~2.6:1 on the dark card, and the style
+// guide has no blue text token. The gutter already names the row, so a line
+// never repeats it. min-h matches the expanded control line (72px) so both
+// states put each line at the same height — the Pump gutter label relies on it.
+function collapsedRow(labelText, valueText, { accent = true } = {}) {
+    const row = document.createElement('div');
+    row.className = 'flex items-center justify-center gap-[7.5px] flex-wrap px-[16px] min-h-[72px]';
+    const label = document.createElement('span');
+    label.className = `text-[24px] ${accent ? 'font-bold text-[var(--action-label)]' : 'text-[var(--text-primary)]'}`;
+    label.textContent = labelText;
+    const value = document.createElement('span');
+    value.className = 'font-bold text-[25.5px] text-[var(--text-primary)]';
+    value.textContent = valueText;
+    row.appendChild(label);
+    row.appendChild(value);
+    return row;
+}
+
+// Expanded-card control line's fixed-width left slot when it has no cycling
+// chip (a plain caption — "Limit to", "Weight", "Time" — rather than a
+// tappable state). Same 114px width and centering as the chip so every
+// stepper in the card lines up on the same column regardless of which kind
+// of left slot its row uses.
+function labelSlot(text) {
+    const span = document.createElement('span');
+    span.className = 'w-[114px] shrink-0 text-[24px] font-normal text-[var(--text-primary)] text-center leading-[28.5px]';
+    span.textContent = text;
+    return span;
+}
+
+// One horizontal control line: a 114px left slot (chip or label) + 30px gap
+// + the stepper group. This is the one repeating structure every expanded
+// row (Temp, each Pump/Maximum sub-line, Move on if) is built from — rows
+// with two sub-fields (Pump, Maximum) stack two of these with a 15px gap
+// between them; single-field rows (Temp, Move on if) use exactly one.
+function controlLine(leftSlot, stepper) {
+    const line = document.createElement('div');
+    line.className = 'flex items-center justify-center gap-[30px]';
+    line.appendChild(leftSlot);
+    if (stepper) line.appendChild(stepper);
+    return line;
+}
 
 function renderStepCards() {
     const container = document.getElementById('editor-steps-container');
@@ -607,223 +871,407 @@ function renderStepCards() {
 
     const steps = editorState.profile.steps || [];
     const numSteps = steps.length;
+    if (editorState.editingStep !== null && editorState.editingStep >= numSteps) {
+        editorState.editingStep = numSteps > 0 ? numSteps - 1 : null;
+    }
 
-    // CSS grid: label col + step cols (4 visible at once, extras scroll) + add-step col
-    // 380px per step = (1920 - 220 label - 180 add) / 4; minmax keeps 4 visible, min enforces scroll beyond 4
-    const R = { HEADER: 1, TEMP: 2, PUMP: 3, MAX: 4, EXIT: 5, FOOTER: 6 };
-    const TOTAL_ROWS = 6;
+    // Maximum, Move on if and the footer share one TAIL track rather than a
+    // track each: Maximum shows one line per limit that is actually set, and a
+    // shared grid row is sized by the tallest card, so a single step with all
+    // three limits used to stretch every other card's Maximum cell to three
+    // lines. Inside TAIL each card stacks its own blocks and hugs its content
+    // (align-self: start), so a one-line Maximum card is one line tall. The
+    // trade-off the design accepts: cards no longer end at the same height,
+    // and the gutter's Move on if label lines up with the tallest card only.
+    const R = { HEADER: 1, TEMP: 2, PUMP: 3, TAIL: 4 };
+
+    // Maximum block geometry, duplicated here as arithmetic rather than
+    // measured: controlLine/collapsedRow are both min-h-[72px] and mCell adds
+    // a gap plus top+bottom padding. The gutter needs the tallest card's
+    // Maximum height before anything is laid out, and counting lines is
+    // cheaper (and steadier) than a forced reflow mid-render.
+    //
+    // Figma only ever draws two Maximum lines. A card showing all three -- any
+    // open card, or a closed one with all three limits set -- totals 939 at
+    // the design's spacing against the 853.5 the content area has. Rather than
+    // taking all 85.5 out of the two rows that happen to be adjacent to it,
+    // the whole row drops to a tighter ROW_PAD: every row keeps its content at
+    // full size (72 lines, 72 +/- targets, a 67.5 footer button) and only the
+    // breathing room around it gives, uniformly, so no row reads as squeezed
+    // next to its neighbours. The step-name header keeps its Figma 97.5.
+    //
+    // Figma only ever draws two Maximum lines. A card showing all three -- any
+    // open card, or a closed one with all three limits set -- needs 87 more
+    // than a two-line one, which the content area does not have.
+    //
+    // Only the last three rows can give it. The step-name, Temp and Pump rows
+    // are shared GRID TRACKS: every card's Temp cell is the same track, which
+    // is what lines the gutter's labels up across the row, and a track is
+    // sized by its tallest cell -- so one card cannot shrink them without
+    // shrinking all of them. Maximum, Move on if and the footer are stacked
+    // inside each card's own TAIL cell, so they are the card's to spend.
+    //
+    // Spread evenly over those three, 87 is 29 off each, and the arithmetic
+    // lands on a three-line tail exactly as tall as a two-line one -- so
+    // nothing moves at all when a card opens:
+    //
+    //   2 lines, 45 pad:  205.5 + 118.5 + 114 = 438
+    //   3 lines, 16 pad:  263.5 +  89.5 +  85 = 438
+    //
+    // Each figure includes the row's own 1.5px top border, which border-box
+    // folds into its height -- easy to forget, and the reason an earlier pass
+    // at this came out 2px over on a CLOSED row.
+    const MAX_LINE_H = 72, MAX_LINE_GAP = 15, HAIRLINE_H = 1.5;
+    const TAIL_PAD = 45, TAIL_PAD_TIGHT = 16;
+    const maxLinesFor = (step, isExpanded) => (isExpanded
+        ? 3
+        : Math.max(1, ['weight', 'seconds', 'volume'].filter((k) => (step[k] || 0) > 0).length));
+    // Per CARD, not per row: a three-line card tightens, its neighbours do not.
+    const isTight = (lines) => lines >= 3;
+    const tailPad = (lines) => (isTight(lines) ? TAIL_PAD_TIGHT : TAIL_PAD);
+    // Tailwind needs whole class names, so both halves are spelled out.
+    const padY = (tight) => (tight ? 'py-[8px]' : 'py-[22.5px]');
+    const rowMinH = (tight) => (tight ? 'min-h-[88px]' : 'min-h-[117px]');
+    const maxBlockHeight = (lines) => lines * MAX_LINE_H + (lines - 1) * MAX_LINE_GAP
+        + tailPad(lines) + HAIRLINE_H;
+
+    // Attach once: the container is never recreated, only its contents are.
+    initScrollThumb('editor-steps-container', 'editor-steps-container-thumb');
 
     container.style.display = 'grid';
-    // Label column grows to fit the longest (translated) row label — min 110px so
-    // English stays compact, max-content so longer languages don't clip/overflow.
     // repeat() rejects a count of 0 and CSS drops the whole declaration, so a
-    // zero-step profile has to omit the step track entirely.
-    const stepCols = numSteps > 0 ? ` repeat(${numSteps}, minmax(380px, 1fr))` : '';
-    container.style.gridTemplateColumns = `minmax(110px, max-content)${stepCols} 180px`;
-    container.style.gridTemplateRows = `60px 1fr 1fr 1fr 1fr 60px`;
+    // zero-step profile reserves one bare track instead, for the empty-state
+    // "insert a step" button below.
+    const stepCols = numSteps > 0 ? ` repeat(${numSteps}, ${CARD_WIDTH}px)` : ` ${CARD_WIDTH}px`;
+    const tailCol = cardRowTailTrack(numSteps);
+    // Fixed 450px tracks, not 1fr: cards must not stretch to fill the row —
+    // with few steps the row leaves empty space on the right ("cards snap to
+    // the left"), which is the point of the horizontal scroll-snap below.
+    container.style.gridTemplateColumns = `${LABEL_GUTTER}px${stepCols}${tailCol}`;
+    // Header/footer stay content-sized; the four data rows are proportional
+    // so they absorb the rest of the container's height — `auto` rows
+    // stopped short of the bottom, leaving a bg-tertiary gap under the cards
+    // instead of running the cards full height.
+    // Figma's own label-gutter row heights (Temp 157, Pump 289) set the
+    // proportions between the two rows that are uniform across every card.
+    // TAIL is content-sized (auto) and each card hugs its own content inside
+    // it, so the track only ever grows to the tallest card and the slack goes
+    // to the proportional rows.
+    // Figma 2662-936's own card rows (97.5 / 117 / 204 / 433.5 here) as
+    // proportions rather than fixed px: on the design's 1200-high canvas each
+    // track lands on its exact value, and on a viewport whose aspect differs
+    // the three top rows give up a few px each instead of the row overflowing
+    // into a vertical scrollbar. The floors are each row's own content height,
+    // so they stop shrinking before anything clips; an expanded card whose
+    // Maximum block runs to three lines genuinely does not fit and scrolls.
+    // The three shared tracks keep the design's values whatever any card is
+    // doing: 97.5 for the step name, then Figma's 117:204 for Temp and Pump,
+    // with floors loose enough to absorb the hairlines and sub-pixel rounding.
+    container.style.gridTemplateRows = `97.5px minmax(99px, 117fr) minmax(186px, 204fr) auto`;
+    container.style.columnGap = `${CARD_GAP}px`;
+    // Cards stop short of the content area's bottom edge: the design's card row
+    // is 1138 tall in a 1600 frame starting at y=420, leaving a 42px skirt
+    // (31.5 here) of --bg-tertiary below them. That skirt is padding, not a
+    // shorter box: the element still runs to the bottom of the screen so its
+    // horizontal scrollbar — which renders at the border box's bottom edge —
+    // sits flush against it rather than floating 31.5px up.
     container.style.height = '100%';
+    container.style.paddingBottom = `${CARD_BOTTOM_GAP}px`;
+    // Width stays at the viewport (not max-content): the fixed-px column
+    // tracks are what overflow it, and that overflow is exactly what makes
+    // this scrollable — a content-sized container has scrollWidth ===
+    // clientWidth, so scrollBy() and the paging buttons become no-ops.
     container.style.width = '100%';
-    // Match the data rows to the header/label background (transparent cells pick this up).
-    container.style.backgroundColor = 'var(--box-color)';
+    container.style.backgroundColor = 'var(--bg-tertiary)';
+    container.style.scrollSnapType = 'x mandatory';
+    // The label gutter is `position: sticky; left: 0` over the first
+    // 192.75px of this container, but scroll-snap-align:start on the cards
+    // snaps them to the container's own (unadjusted) left edge — landing a
+    // snapped card underneath the gutter instead of flush against it.
+    // scroll-padding insets the snapport by exactly the gutter's width so
+    // snap positions account for the pinned overlay.
+    container.style.scrollPaddingLeft = `${LABEL_GUTTER}px`;
+    // Read back by updatePagingButtons to compute the true end-of-scroll
+    // position — mandatory snap (below) means scrollWidth - clientWidth
+    // overstates how far the container can actually rest.
+    container.dataset.numSteps = String(numSteps);
 
-    // Helper: create a grid cell, append to container
-    function mkCell(row, col, className) {
+    // A grid cell when it goes straight into the container, a plain stacked
+    // block when `parent` is a card's TAIL cell — those are flex children, so
+    // a gridRow/gridColumn on them would mean nothing.
+    function mkCell(row, col, className, parent = container) {
         const el = document.createElement('div');
-        el.style.gridRow = row;
-        el.style.gridColumn = col;
+        if (parent === container) {
+            el.style.gridRow = row;
+            el.style.gridColumn = col;
+        }
         el.className = className;
-        container.appendChild(el);
+        parent.appendChild(el);
         return el;
     }
 
-    // ── Label column (sticky left) ────────────────────────────────────────────
-    const labelBase = 'flex items-center px-[20px] py-[8px] border-r-2 border-b border-[var(--border-color)] bg-[var(--box-color)]';
+    // ── Label gutter ────────────────────────────────────────────────────────
+    const labelBase = 'flex items-center justify-end bg-[var(--bg-tertiary)] px-[22.5px]';
 
-    function mkLabel(row, text, tip = '') {
+    function mkLabel(row, text) {
         const el = mkCell(row, 1, labelBase);
+        // Fixed rail at x0 that the cards scroll underneath, per Figma — the
+        // gutter's own bg-tertiary is a solid color (no alpha), so it stays
+        // opaque and cards pass cleanly behind it rather than showing through.
         el.style.position = 'sticky';
         el.style.left = '0';
         el.style.zIndex = '2';
         if (text) {
             const span = document.createElement('span');
-            span.className = 'text-[17px] font-semibold text-[var(--low-contrast-white)] leading-tight break-words';
+            span.className = 'w-[123px] text-right text-[24px] font-bold text-[var(--text-primary)] leading-tight';
             span.textContent = text;
             el.appendChild(span);
-        }
-        if (tip) {
-            const tipWrapper = document.createElement('div');
-            tipWrapper.className = 'tooltip tooltip-right ml-[6px] before:text-[18px]';
-            tipWrapper.setAttribute('data-tip', tip);
-            tipWrapper.innerHTML = `<button type="button" class="w-[18px] h-[18px] rounded-full bg-[var(--button-grey)] text-[var(--low-contrast-white)] text-[12px] font-bold flex items-center justify-center shrink-0 focus:outline-none" tabindex="-1" aria-label="Help">i</button>`;
-            el.appendChild(tipWrapper);
         }
         return el;
     }
 
-    mkLabel(R.HEADER,  '');
-    mkLabel(R.TEMP,    getTranslation('Temp')).id = 'editor-row-temp';
-    mkLabel(R.PUMP,    getTranslation('Pump')).id = 'editor-row-pump';
-    mkLabel(R.MAX,     getTranslation('Max')).id = 'editor-row-max';
-    mkLabel(R.EXIT,    getTranslation('Exit if')).id = 'editor-row-exit';
-    mkLabel(R.FOOTER,  '');
+    mkLabel(R.HEADER, '');
+    mkLabel(R.TEMP,   getTranslation('Temp')).id = 'editor-row-temp';
+    const pumpLabel = mkLabel(R.PUMP, getTranslation('Pump'));
+    pumpLabel.id = 'editor-row-pump';
+    // The card cell centers two 72px lines + a 15px gap, so its first line (the
+    // chip row) sits 43.5px above centre. 87px of bottom padding lifts the
+    // label's centre by the same amount, putting it level with that chip.
+    pumpLabel.style.paddingBottom = '87px';
+    // The gutter mirrors the cards' TAIL stack: a Maximum slot as tall as the
+    // tallest card's Maximum block, then Move on if. Cards shorter than that
+    // sit higher than their label — unavoidable once each card hugs its own
+    // content, and the reason the label tracks the tallest card rather than
+    // the first one.
+    let tallestMax = maxBlockHeight(1);
+    let tallestMaxPad = TAIL_PAD / 2;
+    steps.forEach((s, i) => {
+        const lines = maxLinesFor(s, editorState.editingStep === i);
+        const h = maxBlockHeight(lines);
+        if (h > tallestMax) { tallestMax = h; tallestMaxPad = tailPad(lines) / 2; }
+    });
+    const tailLabel = mkLabel(R.TAIL, '');
+    tailLabel.className = 'flex flex-col items-end bg-[var(--bg-tertiary)] px-[22.5px]';
 
-    // ── Step columns ──────────────────────────────────────────────────────────
-    const stepCell = 'flex items-center justify-start px-[16px] py-[8px] border-r border-b border-[var(--border-color)]';
+    function mkTailLabel(text, height, topPad) {
+        const slot = document.createElement('div');
+        slot.className = 'flex items-start justify-end w-full shrink-0';
+        slot.style.height = `${height}px`;
+        slot.style.paddingTop = `${topPad}px`;
+        const span = document.createElement('span');
+        span.className = 'w-[123px] text-right text-[24px] font-bold text-[var(--text-primary)] leading-tight';
+        span.textContent = text;
+        slot.appendChild(span);
+        tailLabel.appendChild(slot);
+        return slot;
+    }
+
+    // Maximum's block is top-aligned, so its first 72px line is centred
+    // 1.5 (hairline) + padding + 36 from the block top; a 30px label starts
+    // half its own height above that. The padding is the tallest card's, which
+    // is the compact one whenever that card is the open one.
+    mkTailLabel(getTranslation('Maximum'), tallestMax, tallestMaxPad + 22.5).id = 'editor-row-max';
+    // Move on if is a single centred 72px line, so its 30px label sits half
+    // the difference down whatever the row's padding makes that block.
+    mkTailLabel(getTranslation('Move on if'), 72 + TAIL_PAD, (72 + TAIL_PAD - 30) / 2).id = 'editor-row-exit';
+
+    // ── Card columns ────────────────────────────────────────────────────────
+    // Each column is one white "card": rounded-[15px], 1.5px border, drawn as
+    // per-row grid cells that share a background/side-border so the row reads
+    // as one continuous card. The row's own border-top is the hairline between
+    // fields — it bleeds the full 450px card width, past the 390px content col.
+    const CARD_BG = 'bg-[var(--card-bg)]';
+    // No side strokes: Figma 2662-936 separates cards by their fill against the
+    // page ground, and draws rules only BETWEEN a card's own rows.
+    const SIDE = '';
+    const HAIRLINE = 'border-t-[1.5px] border-[var(--border-graph-grid)]';
+
+    // Figma 2662-1053/1057 draw the footer trash and plus as bare glyphs: the
+    // 90 (67.5 here) frame is a tap target whose Rectangle 305 paints nothing,
+    // so there is no fill and no stroke -- only --action-label, which is
+    // already the Action blue in light and Text/Primary.Active in dark (the
+    // style guide ships no dark blue text; #415996 on #292C38 is ~2:1).
+    const FOOTER_BTN_CLASS = 'w-[67.5px] h-[67.5px] rounded-[15px] flex items-center justify-center cursor-pointer';
+
 
     steps.forEach((step, index) => {
         const col = index + 2;
+        const expanded = editorState.editingStep === index;
         const isFlow = step.pump !== 'pressure';
+        // The last card has no snap target of its own: with mandatory
+        // snap, a card here would rest flush against the gutter with
+        // nothing after it but blank tail track — showing only that one
+        // card at the end of the row. Leaving it un-snapped means the
+        // furthest resting position is the second-to-last card instead,
+        // which brings the last two cards into view together.
+        const isLastCard = index === numSteps - 1;
+        const cardAttr = (el) => { el.dataset.cardIndex = String(index); if (!isLastCard) el.style.scrollSnapAlign = 'start'; return el; };
+        const onExpandClick = (el) => {
+            if (!expanded) el.addEventListener('click', () => expandCard(index));
+            return el;
+        };
 
-        // Header: step number + name input
-        // overflow-hidden + the min-w-0/max-w-full pair below keep a long step name
-        // inside its column: the track is minmax(380px, 1fr), so it does not grow to
-        // fit content — without the cap the name input spilled over the next step.
-        const hCell = mkCell(R.HEADER, col, 'flex items-center justify-center px-[16px] py-[10px] border-r border-b-2 border-[var(--border-color)] bg-[var(--box-color)] overflow-hidden');
-        const nameWrapper = document.createElement('div');
-        nameWrapper.className = 'flex items-center gap-[6px] min-w-0 max-w-full';
-        const numSpan = document.createElement('span');
-        numSpan.className = 'text-[24px] font-bold text-[var(--low-contrast-white)] shrink-0 select-none';
-        numSpan.textContent = `${index + 1}.`;
-        const nameInput = document.createElement('input');
-        nameInput.type = 'text';
-        nameInput.value = step.name || '';
-        // Dashed underline, the same affordance the Text tab's editable values
-        // use. Without it a transparent borderless input reads as static text.
-        // It also restores a focus indicator: `outline-none` left this field with
-        // no visible focus state at all.
-        // min-w-0 lets the input shrink below its `size` width (a form control's
-        // default min-width is auto, which is what let it push past the column);
-        // max-w-full stops at the cell edge. Short names still size to their text.
-        nameInput.className = 'text-[24px] font-bold text-[var(--text-primary)] bg-transparent outline-none underline decoration-dashed min-w-0 max-w-full';
-        nameInput.style.textDecorationColor = 'var(--low-contrast-white)';
-        nameInput.style.textUnderlineOffset = '4px';
-        nameInput.addEventListener('focus', () => { nameInput.style.textDecorationColor = 'var(--mimoja-blue)'; });
-        nameInput.addEventListener('blur',  () => { nameInput.style.textDecorationColor = 'var(--low-contrast-white)'; });
-        const syncSize = () => { nameInput.size = Math.max(4, nameInput.value.length + 1); };
-        syncSize();
-        nameInput.addEventListener('input', syncSize);
-        nameInput.addEventListener('change', () => { editorState.profile.steps[index].name = nameInput.value; });
-        nameWrapper.appendChild(numSpan);
-        nameWrapper.appendChild(nameInput);
-        hCell.appendChild(nameWrapper);
+        // ── Header row ──────────────────────────────────────────────────────
+        // Expanded: chevrons pinned to the card's content edges (Figma's 520px
+        // justify-between row, 390 here) with the number + name between them;
+        // collapsed has no chevrons, so the label just centres.
+        const hCell = cardAttr(mkCell(R.HEADER, col,
+            `flex items-center ${expanded ? 'justify-between' : 'justify-center gap-[8px]'} ${CARD_BG} border-t-[1.5px] border-[var(--border-graph-grid)] ${SIDE} rounded-t-[15px] px-[30px] pt-[30px] pb-[22.5px] overflow-hidden ${expanded ? '' : 'cursor-pointer'}`));
+        onExpandClick(hCell);
 
-        // Temp + Sensor.
-        //   [−]  93 °C  [+]
-        //   Group
-        // Temp starts with its ± shown as the grid's affordance hint; the first tap
-        // on any pill retires it and Temp behaves like every other row.
-        {
-            const tCell = mkCell(R.TEMP, col, 'flex flex-col justify-center items-center px-[16px] py-[8px] border-r border-b border-[var(--border-color)] gap-[10px]');
+        if (expanded) {
+            const chevLeftDisabled = isChevronDisabled(index, -1, numSteps);
+            const chevLeft = document.createElement('button');
+            chevLeft.type = 'button';
+            chevLeft.className = `w-[45px] h-[45px] flex items-center justify-center shrink-0 ${chevLeftDisabled ? 'pointer-events-none' : 'cursor-pointer'}`;
+            chevLeft.setAttribute('aria-label', 'Move step earlier');
+            chevLeft.setAttribute('aria-disabled', String(chevLeftDisabled));
+            chevLeft.appendChild(maskIcon(ICON_CHEVRON_LEFT, 45, chevLeftDisabled ? 'var(--profile-button-outline-color)' : 'var(--action-label)'));
+            chevLeft.addEventListener('click', (e) => {
+                e.stopPropagation();
+                if (moveStep(index, index - 1)) { editorState.editingStep = index - 1; renderStepCards(); }
+            });
+
+            const nameWrapper = document.createElement('div');
+            nameWrapper.className = 'flex flex-1 justify-center items-center gap-[6px] min-w-0';
+            const numSpan = document.createElement('span');
+            numSpan.className = 'text-[24px] font-semibold text-[var(--text-primary)] shrink-0 select-none';
+            numSpan.textContent = `${index + 1}.`;
+            const nameInput = document.createElement('input');
+            nameInput.type = 'text';
+            nameInput.value = step.name || '';
+            nameInput.className = 'text-[24px] font-bold text-[var(--action-label)] bg-transparent outline-none min-w-0 max-w-full';
+            // field-sizing hugs the real text width, so the centred "N. Name"
+            // group lands on the card's midline (Figma 2662-936 centres it).
+            // `size` below stays as the fallback for engines without it, where
+            // the box rounds up to whole characters and leans the text left.
+            nameInput.style.fieldSizing = 'content';
+            nameInput.addEventListener('click', (e) => e.stopPropagation());
+            const syncSize = () => { nameInput.size = Math.max(4, nameInput.value.length + 1); };
+            syncSize();
+            nameInput.addEventListener('input', syncSize);
+            nameInput.addEventListener('change', () => {
+                editorState.profile.steps[index].name = nameInput.value;
+                // A step name lives inside `steps`, which is hashed as
+                // execution content (unlike the profile's own title) — no
+                // other render path runs after this raw listener.
+                updateSaveAsNewButtonState();
+            });
+            nameWrapper.appendChild(numSpan);
+            nameWrapper.appendChild(nameInput);
+
+            const chevRightDisabled = isChevronDisabled(index, 1, numSteps);
+            const chevRight = document.createElement('button');
+            chevRight.type = 'button';
+            chevRight.className = `w-[45px] h-[45px] flex items-center justify-center shrink-0 ${chevRightDisabled ? 'pointer-events-none' : 'cursor-pointer'}`;
+            chevRight.setAttribute('aria-label', 'Move step later');
+            chevRight.setAttribute('aria-disabled', String(chevRightDisabled));
+            chevRight.appendChild(maskIcon(ICON_CHEVRON_RIGHT, 45, chevRightDisabled ? 'var(--profile-button-outline-color)' : 'var(--action-label)'));
+            chevRight.addEventListener('click', (e) => {
+                e.stopPropagation();
+                if (moveStep(index, index + 1)) { editorState.editingStep = index + 1; renderStepCards(); }
+            });
+
+            hCell.appendChild(chevLeft);
+            hCell.appendChild(nameWrapper);
+            hCell.appendChild(chevRight);
+        } else {
+            const label = document.createElement('span');
+            label.className = 'text-[24px] text-center leading-tight';
+            const numSpan = document.createElement('span');
+            numSpan.className = 'font-semibold text-[var(--text-primary)]';
+            numSpan.textContent = `${index + 1}. `;
+            const nameSpan = document.createElement('span');
+            nameSpan.className = 'font-bold text-[var(--action-label)]';
+            nameSpan.textContent = step.name || '';
+            label.appendChild(numSpan);
+            label.appendChild(nameSpan);
+            hCell.appendChild(label);
+        }
+
+        // ── Temp row ────────────────────────────────────────────────────────
+        // One horizontal line: the sensor chip on the left, then the ± target.
+        const tCell = cardAttr(mkCell(R.TEMP, col,
+            `flex items-center justify-center ${CARD_BG} ${SIDE} ${HAIRLINE} px-[30px] py-[22.5px] ${expanded ? '' : 'cursor-pointer'}`));
+        onExpandClick(tCell);
+
+        if (expanded) {
             const TEMP_LIM = FIELD_LIMITS.temperature;
-
             const tempStepper = createGridStepper({
                 value: step.temperature || 93,
                 lim: TEMP_LIM,
-                revealOnTap: true,
-                startRevealed: true,
                 numpad: numpadConfig('pe-temp', 'TEMPERATURE', '°C', TEMP_LIM),
                 format: (v) => `${v}°C`,
                 onChange: (val) => {
                     editorState.profile.steps[index].temperature = val;
-                    renderReviewGraph();
+                    renderScriptGraph();
                 },
             });
-            tempStepper._setWidth('110px');
 
-            let sensorValue = step.sensor || 'coffee';
-            const sensorBtn = document.createElement('button');
-            sensorBtn.type = 'button';
-            sensorBtn.className = 'text-[var(--text-primary)] border border-[var(--secondary-button-outline)] rounded-[8px] px-[8px] py-[2px] text-[24px] font-semibold cursor-pointer select-none';
-            sensorBtn.textContent = sensorValue === 'coffee' ? getTranslation('Group') : getTranslation('Mix');
-            sensorBtn.addEventListener('click', () => {
-                sensorValue = sensorValue === 'coffee' ? 'water' : 'coffee';
-                sensorBtn.textContent = sensorValue === 'coffee' ? getTranslation('Group') : getTranslation('Mix');
-                editorState.profile.steps[index].sensor = sensorValue;
+            const sensorStates = ['coffee', 'water'];
+            const sensorChip = createCycleChip({
+                states: sensorStates,
+                index: (step.sensor || 'coffee') === 'water' ? 1 : 0,
+                labelFor: (s) => getTranslation(s === 'water' ? 'Water' : 'Coffee'),
+                onChange: (s) => { editorState.profile.steps[index].sensor = s; },
             });
 
-            tCell.appendChild(tempStepper);
-            tCell.appendChild(sensorBtn);
+            tCell.appendChild(controlLine(sensorChip, tempStepper));
+        } else {
+            tCell.appendChild(collapsedRow(
+                getTranslation((step.sensor || 'coffee') === 'water' ? 'Water' : 'Coffee'),
+                `${step.temperature ?? 93}°C`,
+            ));
         }
 
-        // Pump + Limit — three lines:
-        //   [−]  6.0 mL/s  [+]      (± revealed on tap)
-        //   [Flow]  [Quickly]
-        //   + Limit   /   Limit to [−] 4.0 bar [+]
-        // The pump cell carries the most controls, so its steppers stay quiet
-        // until tapped — the ± keep their space (visibility, not display), so
-        // revealing them never shifts the row.
-        {
-            const pCell = mkCell(R.PUMP, col, 'flex flex-col justify-center items-center px-[16px] py-[4px] gap-[10px] border-r border-b border-[var(--border-color)]');
+        // ── Pump row ────────────────────────────────────────────────────────
+        const pCell = cardAttr(mkCell(R.PUMP, col,
+            `flex flex-col items-center justify-center ${CARD_BG} ${SIDE} ${HAIRLINE} px-[30px] py-[22.5px] gap-[15px] ${expanded ? '' : 'cursor-pointer'}`));
+        onExpandClick(pCell);
 
+        if (expanded) {
             const targetUnit = isFlow ? 'mL/s' : 'bar';
-            const PUMP_LIM   = isFlow ? FIELD_LIMITS.flow : FIELD_LIMITS.pressure;
-            let transValue   = step.transition || 'fast';
+            const PUMP_LIM = isFlow ? FIELD_LIMITS.flow : FIELD_LIMITS.pressure;
 
-            // ── Line 1: pump target ──────────────────────────────────────────
             const targetStepper = createGridStepper({
                 value: isFlow ? (step.flow || 0) : (step.pressure || 0),
                 lim: PUMP_LIM,
-                revealOnTap: true,
+                unit: targetUnit,
                 numpad: isFlow
                     ? numpadConfig('pe-pump', 'FLOW', 'mL/s', PUMP_LIM)
                     : numpadConfig('pe-pump', 'PRESSURE', 'bar', PUMP_LIM),
-                format: (v) => `${roundTo(v, PUMP_LIM.step)} ${targetUnit}`,
                 onChange: (val) => {
                     if (isFlow) editorState.profile.steps[index].flow = val;
                     else editorState.profile.steps[index].pressure = val;
-                    renderReviewGraph();
+                    renderScriptGraph();
                 },
             });
 
-            // ── Line 2: pump mode + ramp ─────────────────────────────────────
-            // The 'Ramp' label is gone: it was the widest element in the cell,
-            // and its German (row 1721, 'Sanfter Ubergang' = smooth transition)
-            // hardcodes 'smooth', so beside the toggle it read 'Sanfter
-            // Ubergang Schnell' — smooth transition, fast. The toggle says the
-            // whole thing on its own.
-            // Single cycling button, not a segmented pair: every other toggle in
-            // this editor shows the current value and cycles on tap, and the
-            // unit in the value above already says which mode is active.
-            const modeLine = document.createElement('div');
-            modeLine.className = 'flex items-center gap-[8px] flex-wrap justify-center';
-
-            const modeBtn = document.createElement('button');
-            modeBtn.type = 'button';
-            modeBtn.className = 'border border-[var(--secondary-button-outline)] text-[var(--text-primary)] rounded-[8px] px-[8px] py-[2px] text-[24px] font-semibold cursor-pointer select-none';
-            modeBtn.textContent = isFlow ? getTranslation('Flow') : getTranslation('Pressure');
-            modeBtn.addEventListener('click', () => {
-                const s = editorState.profile.steps[index];
-                if (isFlow) {
-                    s.pump = 'pressure';
-                    if (!s.pressure) s.pressure = PUMP_SEED_PRESSURE;
-                    delete s.flow;
-                } else {
-                    s.pump = 'flow';
-                    if (!s.flow) s.flow = PUMP_SEED_FLOW;
-                    delete s.pressure;
-                }
-                renderStepCards(); // units, limits and the limiter axis all change with the mode
+            // Single cycling chip replaces the old mode + transition button
+            // pair: Flow Quickly → Flow Slowly → Pressure Quickly → Pressure
+            // Slowly. Crossing the flow/pressure boundary keeps the existing
+            // seed/delete behavior and re-renders the whole tab, because units,
+            // FIELD_LIMITS bounds and the limiter axis all change with the mode.
+            const modeChip = createCycleChip({
+                states: PUMP_CYCLE_STATES,
+                index: pumpCycleIndex(step.pump === 'pressure' ? 'pressure' : 'flow', step.transition || 'fast'),
+                labelFor: pumpChipParts,
+                onChange: (state) => {
+                    const s = editorState.profile.steps[index];
+                    if (state.pump === 'pressure' && s.pump !== 'pressure') {
+                        s.pump = 'pressure';
+                        if (!s.pressure) s.pressure = PUMP_SEED_PRESSURE;
+                        delete s.flow;
+                    } else if (state.pump === 'flow' && s.pump === 'pressure') {
+                        s.pump = 'flow';
+                        if (!s.flow) s.flow = PUMP_SEED_FLOW;
+                        delete s.pressure;
+                    }
+                    s.transition = state.transition;
+                    renderStepCards(); // units, limits and the limiter axis all change with the mode
+                },
             });
 
-            const transBtn = document.createElement('button');
-            transBtn.type = 'button';
-            transBtn.className = 'border border-[var(--secondary-button-outline)] text-[var(--text-primary)] rounded-[8px] px-[8px] py-[2px] text-[24px] font-semibold cursor-pointer select-none';
-            transBtn.textContent = transValue === 'fast' ? getTranslation('Quickly') : getTranslation('Slowly');
-            transBtn.addEventListener('click', () => {
-                transValue = transValue === 'fast' ? 'smooth' : 'fast';
-                transBtn.textContent = transValue === 'fast' ? getTranslation('Quickly') : getTranslation('Slowly');
-                editorState.profile.steps[index].transition = transValue;
-                renderReviewGraph();
-            });
-
-            modeLine.appendChild(modeBtn);
-            modeLine.appendChild(transBtn);
-
-            // ── Line 3: limiter ──────────────────────────────────────────────
-            // Off collapses to a single '+ Limit' chip: 'Limit to [−] 0 bar [+]'
-            // spent four elements saying nothing is limited, on the majority of
-            // steps. The chip opens the numpad directly, so there is no
-            // revealed-but-still-zero state and no silently seeded value.
             const limUnit = isFlow ? 'bar' : 'mL/s';
             const LIM_LIM = isFlow ? FIELD_LIMITS.pressureLimit : FIELD_LIMITS.flowLimit;
             const limValue = step.limiter?.value ?? 0;
@@ -831,351 +1279,768 @@ function renderStepCards() {
                 ? numpadConfig('pe-lim', 'PRESSURE LIMIT', 'bar', LIM_LIM)
                 : numpadConfig('pe-lim', 'FLOW LIMIT', 'mL/s', LIM_LIM);
 
-            function writeLim(val) {
-                const s = editorState.profile.steps[index];
-                if (!s.limiter) s.limiter = { value: val, range: newLimiterRange(s.pump) };
-                else s.limiter.value = val;
-                renderReviewGraph();
-            }
-
-            const limLine = document.createElement('div');
-            // Column, not a row: "Limit to" sits above its stepper as a caption.
-            // Inline it competed with the value for the cell's width and forced
-            // German ("Begrenzen auf") to wrap mid-phrase.
-            limLine.className = 'flex flex-col items-center gap-[4px]';
-
-            if (limValue > 0) {
-                const withText = document.createElement('span');
-                // Caption weight, not body weight — at 24px it read as a peer of
-                // the value it labels.
-                withText.className = 'text-[20px] text-[var(--low-contrast-white)] select-none';
-                withText.textContent = getTranslation('Limit to');
-
-                const limStepper = createGridStepper({
-                    value: limValue,
-                    lim: LIM_LIM,
-                    revealOnTap: true,
-                    offWhenZero: true,
-                    numpad: limNumpad,
-                    format: (v) => `${roundTo(v, LIM_LIM.step)} ${limUnit}`,
-                    onChange: writeLim,
-                });
-                limStepper._setWidth('130px');
-
-                limLine.appendChild(withText);
-                limLine.appendChild(limStepper);
-            } else {
-                const addLimit = document.createElement('button');
-                addLimit.type = 'button';
-                addLimit.className = 'border border-[var(--secondary-button-outline)] text-[var(--text-primary)] rounded-[8px] px-[10px] py-[2px] text-[24px] font-semibold cursor-pointer select-none';
-                addLimit.textContent = `+ ${getTranslation('Limit')}`;
-                addLimit.addEventListener('click', () => {
-                    const apply = (val) => { writeLim(val); if (val > 0) renderStepCards(); };
-                    if (shouldUseNumpad()) openNumpadForField(0, limNumpad, apply);
-                    else inlineEditValue(addLimit, 0, { min: LIM_LIM.min, max: LIM_LIM.max, step: LIM_LIM.step, onCommit: apply });
-                });
-                limLine.appendChild(addLimit);
-            }
-
-            pCell.appendChild(targetStepper);
-            pCell.appendChild(modeLine);
-            pCell.appendChild(limLine);
-        }
-
-        // Exit — two lines:
-        //   [Pressure] [is over]
-        //   [−]  9.0 bar  [+]
-        // Type 'off' is a UI-only state (step.exit = null on save); it hides the
-        // condition and value rather than showing a disabled control.
-        {
-            const exitCell = mkCell(R.EXIT, col, 'flex flex-col justify-center items-center px-[16px] py-[4px] gap-[8px] border-r border-b border-[var(--border-color)]');
-
-            const exitDef = readExitDef(step);
-            let exitType  = exitDef.type;
-            let exitCond  = exitDef.condition;
-            const exitValue = exitDef.value;
-
-            const TOGGLE_CLASS = 'border border-[var(--secondary-button-outline)] text-[var(--text-primary)] rounded-[8px] px-[8px] py-[2px] text-[24px] font-semibold cursor-pointer select-none';
-
-            function writeExit(patch) {
-                const s = editorState.profile.steps[index];
-                if (!s.exit) s.exit = { type: exitType, condition: exitCond, value: exitValue };
-                Object.assign(s.exit, patch);
-                renderReviewGraph();
-            }
-
-            const typeBtn = document.createElement('button');
-            typeBtn.type = 'button';
-            typeBtn.className = TOGGLE_CLASS;
-            typeBtn.textContent = getTranslation(exitType.charAt(0).toUpperCase() + exitType.slice(1));
-            typeBtn.addEventListener('click', () => {
-                exitType = EXIT_TYPES[(EXIT_TYPES.indexOf(exitType) + 1) % EXIT_TYPES.length];
-                // Bounds are per-type — pressure tops out at 12 bar, flow at
-                // 8 mL/s — so the value has to come along into the new range.
-                // Switching 11 bar to flow used to leave an 11 mL/s exit, well
-                // over the ceiling the numpad and ± both enforce.
-                const patch = { type: exitType };
-                if (exitType !== 'off') patch.value = clamp(exitValue, 0, EXIT_MAX_MAP[exitType]);
-                writeExit(patch);
-                renderStepCards(); // unit, bounds and the whole line's visibility change with the type
+            const limStepper = createGridStepper({
+                value: limValue,
+                lim: LIM_LIM,
+                unit: limUnit,
+                offWhenZero: true,
+                numpad: limNumpad,
+                onChange: (val) => {
+                    const s = editorState.profile.steps[index];
+                    if (!s.limiter) s.limiter = { value: val, range: newLimiterRange(s.pump) };
+                    else s.limiter.value = val;
+                    renderScriptGraph();
+                },
             });
 
-            const condBtn = document.createElement('button');
-            condBtn.type = 'button';
-            condBtn.className = TOGGLE_CLASS;
-            condBtn.textContent = getTranslation(exitCond === 'over' ? 'is over' : 'is under');
-            condBtn.addEventListener('click', () => {
-                exitCond = exitCond === 'over' ? 'under' : 'over';
-                condBtn.textContent = getTranslation(exitCond === 'over' ? 'is over' : 'is under');
-                writeExit({ condition: exitCond });
-            });
+            // Two horizontal lines, stacked: mode chip + target on top,
+            // "Limit to" + limiter stepper below — never the other way
+            // around (stacking the chip above the stepper) as before.
+            pCell.appendChild(controlLine(modeChip, targetStepper));
+            pCell.appendChild(controlLine(labelSlot(getTranslation('Limit to')), limStepper));
+        } else {
+            // Two lines, matching the expanded row: the pump mode (chip-backed,
+            // so accented) with its target, then the limiter caption with its
+            // value — "Off" rather than "0 bar" when nothing is limited, which
+            // is what the zero actually means.
+            const targetUnit = isFlow ? 'mL/s' : 'bar';
+            const targetLim  = isFlow ? FIELD_LIMITS.flow : FIELD_LIMITS.pressure;
+            const targetVal  = isFlow ? (step.flow || 0) : (step.pressure || 0);
+            const limUnitC   = isFlow ? 'bar' : 'mL/s';
+            const limLimC    = isFlow ? FIELD_LIMITS.pressureLimit : FIELD_LIMITS.flowLimit;
+            const limValC    = step.limiter?.value ?? 0;
 
-            const exitTopLine = document.createElement('div');
-            exitTopLine.className = 'flex items-center gap-[8px] flex-wrap justify-center';
-            exitTopLine.appendChild(typeBtn);
-            exitCell.appendChild(exitTopLine);
-
-            if (exitType !== 'off') {
-                condBtn.style.display = '';
-                exitTopLine.appendChild(condBtn);
-
-                const EXIT_LIM = { min: 0, max: EXIT_MAX_MAP[exitType], step: EXIT_STEP_MAP[exitType] };
-                const exitStepper = createGridStepper({
-                    value: exitValue,
-                    lim: EXIT_LIM,
-                    revealOnTap: true,
-                    numpad: {
-                        fieldType: 'pe-exit',
-                        title: 'EXIT ' + exitType.toUpperCase(),
-                        unit: EXIT_UNIT_MAP[exitType] || '',
-                        min: EXIT_LIM.min, max: EXIT_LIM.max,
-                        label: `${EXIT_LIM.min}–${EXIT_LIM.max}`,
-                    },
-                    format: (v) => `${roundTo(v, EXIT_LIM.step)} ${EXIT_UNIT_MAP[exitType]}`,
-                    onChange: (val) => writeExit({ value: val }),
-                });
-                exitStepper._setWidth('130px');
-                exitCell.appendChild(exitStepper);
-            }
+            pCell.appendChild(collapsedRow(
+                pumpChipLabel({ pump: isFlow ? 'flow' : 'pressure', transition: step.transition || 'fast' }),
+                `${roundTo(targetVal, targetLim.step)} ${targetUnit}`,
+            ));
+            pCell.appendChild(collapsedRow(
+                getTranslation('Limit to'),
+                limValC > 0 ? `${roundTo(limValC, limLimC.step)} ${limUnitC}` : getTranslation('Off'),
+                { accent: false },
+            ));
         }
 
-        // Max — one stepper per limit, stacked.
-        //   [−]  0 g    [+]      outline = this limit is off
-        //   [−]  30 sec [+]      filled  = active
-        //   [−]  0 ml   [+]
-        // All three are shown because all three are live on the machine: whichever
-        // trips first ends the step. The old row colored exactly one of them blue
-        // by a weight > seconds > volume priority, which described nothing the
-        // machine does, and it floated the inactive pills absolutely above and
-        // below the active one — over the Pump and Exit rows either side of it.
-        {
-            const maxCell = mkCell(R.MAX, col, 'flex flex-col justify-center items-center px-[16px] py-[4px] border-r border-b border-[var(--border-color)] gap-[4px]');
+        // ── Maximum row ─────────────────────────────────────────────────────
+        // Three horizontal lines, stacked: Weight, Time (seconds), Volume.
+        // All three are live on the machine — whichever trips first ends the
+        // step — so all three stay editable from here, not just weight/time.
+        // One cell for the rest of the card, stacked internally and hugging its
+        // own content: a card with fewer Maximum lines ends higher than its
+        // neighbours rather than being padded out to match them. Stretching it
+        // to the track instead would line every card's footer up, but it also
+        // grows every CLOSED card the moment one is opened, which reads as all
+        // of them expanding at once.
+        const tailCell = cardAttr(mkCell(R.TAIL, col, 'flex flex-col min-w-0'));
+        tailCell.style.alignSelf = 'start';
 
-            const MAX_FIELDS = [
-                { key: 'weight',  unit: 'g',   lim: FIELD_LIMITS.weight },
-                { key: 'seconds', unit: 'sec', lim: FIELD_LIMITS.seconds },
-                { key: 'volume',  unit: 'ml',  lim: FIELD_LIMITS.volume },
-            ];
+        // Three Maximum lines need 87 more than two; this card spends it out
+        // of its own three tail rows, evenly, so its neighbours never move.
+        const tight = isTight(maxLinesFor(step, expanded));
 
-            MAX_FIELDS.forEach(({ key, unit, lim }) => {
+
+        const mCell = cardAttr(mkCell(R.TAIL, col,
+            `flex flex-col items-center justify-start ${CARD_BG} ${SIDE} ${HAIRLINE} px-[30px] ${padY(tight)} gap-[15px] ${expanded ? '' : 'cursor-pointer'}`, tailCell));
+        onExpandClick(mCell);
+
+        const MAX_FIELDS = [
+            { key: 'weight',  unit: 'g',   lim: FIELD_LIMITS.weight,  label: 'Weight' },
+            { key: 'seconds', unit: 'sec', lim: FIELD_LIMITS.seconds, label: 'Time' },
+            { key: 'volume',  unit: 'ml',  lim: FIELD_LIMITS.volume,  label: 'Volume' },
+        ];
+
+        if (expanded) {
+            MAX_FIELDS.forEach(({ key, unit, lim, label }) => {
                 const stepper = createGridStepper({
                     value: step[key] || 0,
                     lim,
-                    revealOnTap: true,
                     offWhenZero: true,
                     numpad: numpadConfig(MAX_NUMPAD[key].fieldType, MAX_NUMPAD[key].title, unit, lim),
                     format: (v) => `${roundTo(v, lim.step)} ${unit}`,
                     onChange: (val) => {
                         editorState.profile.steps[index][key] = val;
-                        renderReviewGraph();
+                        renderScriptGraph();
                     },
                 });
-                stepper._setWidth('120px');
-                maxCell.appendChild(stepper);
+                mCell.appendChild(controlLine(labelSlot(getTranslation(label)), stepper));
             });
+        } else {
+            // One labelled line per limit that is set, same order as expanded.
+            // Zero (Off) limits are hidden until the card is tapped open; if
+            // none are set, a single "Maximum Off" line keeps the row from
+            // collapsing to nothing.
+            const active = MAX_FIELDS.filter(({ key }) => (step[key] || 0) > 0);
+            active.forEach(({ key, unit, lim, label }) => {
+                mCell.appendChild(collapsedRow(
+                    getTranslation(label),
+                    `${roundTo(step[key], lim.step)} ${unit}`,
+                    { accent: false },
+                ));
+            });
+            if (active.length === 0) {
+                mCell.appendChild(collapsedRow(getTranslation('Maximum'), getTranslation('Off'), { accent: false }));
+            }
+
         }
 
-        // Footer: move left / delete / insert / move right.
-        // gap drops from 40px to 16px — four 60px buttons plus 40px gaps would be
-        // 360px in a 380px column.
-        const fCell = mkCell(R.FOOTER, col, 'flex justify-center items-center gap-[16px] px-[16px] py-[8px] border-r border-[var(--border-color)]');
+        // ── Move on if row ──────────────────────────────────────────────────
+        // One horizontal line: the exit-condition chip, then the ± value —
+        // the value is simply absent while the chip reads Off.
+        const eCell = cardAttr(mkCell(R.TAIL, col,
+            `flex items-center justify-center ${CARD_BG} ${SIDE} ${HAIRLINE} px-[30px] ${padY(tight)} ${rowMinH(tight)} ${expanded ? '' : 'cursor-pointer'}`, tailCell));
+        onExpandClick(eCell);
 
-        fCell.appendChild(makeMoveBtn(index, -1, numSteps, renderStepCards, true));
+        const exitDef = readExitDef(step);
+
+        if (expanded) {
+            function writeExit(patch) {
+                const s = editorState.profile.steps[index];
+                if (patch.type === 'off') { s.exit = null; return; }
+                if (!s.exit || s.exit.type === undefined) s.exit = { type: patch.type, condition: patch.condition, value: 0 };
+                else Object.assign(s.exit, patch);
+                // Remember a real edited value so a later Off-and-back on this
+                // step restores it instead of reseeding a 0.
+                if (patch.value !== undefined) rememberExitValue(step, patch.type, patch.value);
+                renderScriptGraph();
+            }
+
+            const exitChip = createCycleChip({
+                states: EXIT_CYCLE_STATES,
+                index: exitCycleIndex(exitDef.type, exitDef.condition),
+                labelFor: exitChipParts,
+                onChange: (state) => {
+                    // Leaving a real type — remember its value before it's
+                    // dropped (Off) or overwritten (switching pressure<->flow),
+                    // so cycling back through it later is lossless.
+                    if (exitDef.type === 'pressure' || exitDef.type === 'flow') {
+                        rememberExitValue(step, exitDef.type, exitDef.value);
+                    }
+                    if (state.type === 'off') {
+                        editorState.profile.steps[index].exit = null;
+                    } else {
+                        // Bounds are per-type — pressure tops out at 12 bar, flow
+                        // at 8 mL/s. recallExitValue restores whatever this step
+                        // last had for the new type (or a sane default) rather
+                        // than carrying over 0 from readExitDef's Off fallback —
+                        // a live "pressure is over 0 bar" fires on essentially
+                        // any pressure at all.
+                        const value = recallExitValue(step, state.type);
+                        editorState.profile.steps[index].exit = { type: state.type, condition: state.condition, value };
+                    }
+                    renderStepCards(); // unit, bounds and the stepper's visibility change with the type
+                },
+            });
+            let exitStepper = null;
+            if (exitDef.type !== 'off') {
+                const EXIT_LIM = { min: 0, max: EXIT_MAX_MAP[exitDef.type], step: EXIT_STEP_MAP[exitDef.type] };
+                exitStepper = createGridStepper({
+                    value: exitDef.value,
+                    lim: EXIT_LIM,
+                    unit: EXIT_UNIT_MAP[exitDef.type],
+                    numpad: {
+                        fieldType: 'pe-exit',
+                        title: 'EXIT ' + exitDef.type.toUpperCase(),
+                        unit: EXIT_UNIT_MAP[exitDef.type] || '',
+                        min: EXIT_LIM.min, max: EXIT_LIM.max,
+                        label: `${EXIT_LIM.min}–${EXIT_LIM.max}`,
+                    },
+                    onChange: (val) => writeExit({ type: exitDef.type, condition: exitDef.condition, value: val }),
+                });
+            }
+            eCell.appendChild(controlLine(exitChip, exitStepper));
+        } else {
+            // The chip's own label, then its value — "Pressure is over 4.0 bar".
+            // Off has no value to show, so the label carries the line alone.
+            const exitLabel = exitChipLabel(
+                exitDef.type === 'off' ? { type: 'off' } : { type: exitDef.type, condition: exitDef.condition }
+            );
+            eCell.appendChild(collapsedRow(
+                exitLabel,
+                exitDef.type === 'off'
+                    ? ''
+                    : `${roundTo(exitDef.value, EXIT_STEP_MAP[exitDef.type])} ${EXIT_UNIT_MAP[exitDef.type]}`,
+            ));
+        }
+
+        // ── Footer row — trash / plus, on every card (collapsed or expanded) ──
+        const fCell = cardAttr(mkCell(R.TAIL, col,
+            `flex items-center justify-between ${CARD_BG} ${SIDE} ${HAIRLINE} rounded-b-[15px] px-[30px] ${padY(tight)} ${expanded ? '' : 'cursor-pointer'}`, tailCell));
+        onExpandClick(fCell);
 
         const deleteBtn = document.createElement('button');
         deleteBtn.type = 'button';
-        deleteBtn.className = 'pe-step-action-btn w-[60px] h-[60px] flex items-center justify-center text-[var(--mimoja-blue-v2)] hover:bg-[var(--button-grey)] rounded-[10px] cursor-pointer';
-        deleteBtn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>';
+        deleteBtn.className = FOOTER_BTN_CLASS;
         deleteBtn.setAttribute('aria-label', 'Delete step');
-        deleteBtn.addEventListener('click', async () => {
+        deleteBtn.appendChild(maskIcon(ICON_TRASH, 37.5, 'var(--action-label)'));
+        deleteBtn.addEventListener('click', async (e) => {
+            // stopPropagation so tapping trash on a collapsed card deletes the
+            // step instead of expanding the card first.
+            e.stopPropagation();
+            flashIconButton(deleteBtn);
             if (!await confirmDeleteStep(index)) return;
             removeStepAt(index);
+            if (editorState.editingStep === index) editorState.editingStep = null;
             renderStepCards();
         });
 
         const insertBtn = document.createElement('button');
         insertBtn.type = 'button';
-        insertBtn.className = 'pe-step-action-btn w-[60px] h-[60px] flex items-center justify-center text-[var(--mimoja-blue)] hover:bg-[var(--button-grey)] rounded-[10px] cursor-pointer';
-        insertBtn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" /></svg>';
+        insertBtn.className = FOOTER_BTN_CLASS;
         insertBtn.setAttribute('aria-label', 'Insert step after');
-        insertBtn.addEventListener('click', () => { insertStepAfter(index); renderStepCards(); });
+        insertBtn.appendChild(maskIcon(ICON_PLUS, 37.5, 'var(--action-label)'));
+        let insertPending = false;
+        insertBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            if (insertPending) return; // a double-tap must not insert twice
+            insertPending = true;
+            flashIconButton(insertBtn);
+            // The re-render replaces this button, so let the flash show first.
+            setTimeout(() => {
+                // Cards were re-rendered (or the editor closed) meanwhile, so
+                // `index` is stale: drop the insert rather than misplace it.
+                if (!insertBtn.isConnected) return;
+                insertStepAfter(index);
+                editorState.editingStep = index + 1;
+                renderStepCards();
+            }, 150);
+        });
 
         fCell.appendChild(deleteBtn);
         fCell.appendChild(insertBtn);
-        fCell.appendChild(makeMoveBtn(index, +1, numSteps, renderStepCards, true));
     });
 
-    // ── Add-step column ───────────────────────────────────────────────────────
-    // Full-height so it reads as a column, and so deleting the last step leaves
-    // something to click. Every other way to add a step lives in a step's own
-    // footer, which means an empty profile used to be a dead end: no columns, no
-    // "+", and Save rejects a profile with no steps.
-    const addCell = mkCell(`1 / ${TOTAL_ROWS + 1}`, numSteps + 2, 'flex items-center justify-center');
-    const addBtn = document.createElement('button');
-    addBtn.type = 'button';
-    addBtn.className = 'pe-step-action-btn w-[60px] h-[60px] flex items-center justify-center text-[var(--mimoja-blue)] hover:bg-[var(--button-grey)] rounded-[10px] cursor-pointer';
-    addBtn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" /></svg>';
-    addBtn.setAttribute('aria-label', 'Insert a step');
-    addBtn.title = getTranslation('Insert a step');
-    // -1 when there are no steps → splice(0, 0, …), which is what we want.
-    addBtn.addEventListener('click', () => { insertStepAfter(numSteps - 1); renderStepCards(); });
-    addCell.appendChild(addBtn);
+    // ── Empty state ─────────────────────────────────────────────────────────
+    // A step's own footer is the only other way to add one, so a zero-step
+    // profile needs its own affordance or it is a dead end (Save also rejects
+    // a profile with no steps).
+    if (numSteps === 0) {
+        const emptyCell = mkCell('1 / 5', 2, 'flex items-center justify-center');
+        const addBtn = document.createElement('button');
+        addBtn.type = 'button';
+        addBtn.className = 'w-[72px] h-[72px] rounded-[15px] bg-[var(--button-grey)] flex items-center justify-center cursor-pointer';
+        addBtn.setAttribute('aria-label', getTranslation('Insert a step'));
+        addBtn.title = getTranslation('Insert a step');
+        addBtn.appendChild(maskIcon(ICON_PLUS, 37.5, 'var(--text-primary)'));
+        addBtn.addEventListener('click', () => {
+            insertStepAfter(-1);
+            editorState.editingStep = 0;
+            renderStepCards();
+        });
+        emptyCell.appendChild(addBtn);
+    }
+
+    // Bindings live in initCardPaging (called once from initializeProfileEditor);
+    // only the disabled states need recomputing here, since the step count and
+    // the container's scrollWidth just changed.
+    updatePagingButtons();
+
+    // Row heights just changed (expanding a card can push its Maximum block to
+    // three lines, which is the only case this row overflows vertically), so
+    // the pill needs a fresh read of the now-final scrollHeight.
+    updateScrollThumb('editor-steps-container', 'editor-steps-container-thumb');
+
+    // A full re-render here always follows an execution-field edit — insert,
+    // delete, reorder, or a pump-mode/exit-type change that rebuilds the tab —
+    // so this is also the catch-all for those, alongside the per-control
+    // updates inside createGridStepper/createCycleChip.
+    updateSaveAsNewButtonState();
+}
+
+// ─── Flow calibration (per profile) ─────────────────────────────────────────
+// Decaid's flow multipliers are app-wide: ShotSequencer reads the global
+// setting when a shot starts, so there is no per-profile field to write. These
+// numbers therefore live in the profile's KV override (the same namespace as
+// the dose/yield tiles) and flow-calibration.js pushes them to the machine
+// whenever this profile is the active one, restoring the user's baseline for a
+// profile that has none.
+//
+// They are deliberately NOT part of the profile JSON: /profiles is
+// content-addressed, so baking a multiplier into the profile would mint a new
+// profile on every tweak. That also means they cannot ride along on Save —
+// a calibration-only edit changes no profile bytes and the save would dedup
+// back onto the original. They are written the moment they change instead,
+// exactly like the main page's tiles.
+function renderFlowCalibrationFields(col) {
+    const profileId = editorState.sourceProfileId;
+
+    const wrapper = document.createElement('div');
+    // pl-[15px] indent and gap-[15px] stack spacing match every other section
+    // row's convention in this panel (see settingsSectionRow / Beverage Type).
+    wrapper.className = 'flex flex-col gap-[15px] pl-[15px]';
+    col.appendChild(wrapper);
+
+    // Until the machine answers, `baseline` is only Decaid's default — seeding
+    // the profile from it would save 1 / 0.3 as "the same as global" for a user
+    // whose global is something else. Everything that reads it waits for `ready`.
+    let baseline = { ...FLOW_CAL_DEFAULTS };
+    let values = pickFlowCalibration(profileId ? getProfileOverride(profileId) : null);
+    let enabled = FLOW_CAL_KEYS.some(key => key in values);
+
+    async function persist() {
+        if (!profileId) return;
+        try {
+            if (enabled) await saveProfileOverride(profileId, values);
+            else await removeProfileOverrideKeys(profileId, FLOW_CAL_KEYS);
+            // Only the machine's *current* profile owns the live setting.
+            if (isActiveProfile(profileId)) await applyFlowCalibrationForProfile(profileId);
+        } catch (error) {
+            console.error('Failed to save flow calibration override:', error);
+            showToast(getTranslation('Upload failed!'), 3000, 'error');
+        }
+    }
+
+    function paint() {
+        wrapper.innerHTML = '';
+
+        // Header row: label beside its control, same as every other section
+        // (settingsSectionRow's fixed-width side label + row.gap-[15px]) --
+        // previously the label sat on its own line above the checkbox instead
+        // of level with it. Spinners/hint below don't fit that single-row
+        // shape, so only the toggle rides beside the label; they stay stacked
+        // underneath.
+        const headerRow = document.createElement('div');
+        headerRow.className = 'flex items-center gap-[15px]';
+        wrapper.appendChild(headerRow);
+
+        const label = document.createElement('div');
+        // Same label color/style every other section title uses (see
+        // settingsSectionRow), but w-[180px] instead of the shared
+        // w-[127.5px): "calibration" alone is wider than 127.5px at this
+        // font-size, so that width either forced a mid-word break (stranding
+        // a lone "n" on its own line) or, if shrunk to fit via fitTextToWidth,
+        // read visibly smaller than every sibling label at a fixed 24px.
+        // 180px fits "Flow" / "calibration" on two whole-word lines at the
+        // same 24px size as everything else -- a one-row exception to the
+        // shared gutter, not a change to it.
+        label.className = 'text-[24px] font-semibold text-[var(--settings-label-color)] w-[180px] shrink-0';
+        label.textContent = getTranslation('Flow calibration');
+        headerRow.appendChild(label);
+
+        const toggleRow = document.createElement('label');
+        toggleRow.className = 'flex items-center gap-[15px] text-[20px] text-[var(--text-primary)]'
+            + (profileId ? ' cursor-pointer' : ' opacity-40');
+        // The app's standard switch (same markup/tokens as settings.js's toggles):
+        // 100x50 track, --toggle-off-* when off, Action blue + white knob when on.
+        const switchEl = document.createElement('span');
+        switchEl.className = 'relative flex items-center flex-shrink-0 w-[100px] h-[50px]';
+        const toggle = document.createElement('input');
+        toggle.type = 'checkbox';
+        toggle.className = 'sr-only peer';
+        const switchTrack = document.createElement('span');
+        switchTrack.className = 'absolute inset-0 rounded-full border-2 transition-colors duration-200 bg-[var(--toggle-off-bg)] border-[var(--toggle-off-border)] peer-checked:bg-[var(--button-primary-bg)] peer-checked:border-[var(--button-primary-bg)]';
+        const switchKnob = document.createElement('span');
+        switchKnob.className = 'absolute top-1/2 left-[5px] -translate-y-1/2 peer-checked:translate-x-[46px] size-[40px] rounded-full transition-[transform,background-color] duration-200 bg-[var(--toggle-off-knob)] peer-checked:bg-white';
+        switchEl.append(toggle, switchTrack, switchKnob);
+        toggle.checked = enabled;
+        toggle.disabled = !profileId;
+        toggle.addEventListener('change', async () => {
+            enabled = toggle.checked;
+            // Turning it on starts from the baseline, so the profile keeps
+            // behaving exactly as it did until a number is actually moved.
+            if (enabled) {
+                await ready;
+                values = { ...baseline, ...values };
+            }
+            paint();
+            persist();
+        });
+        const toggleText = document.createElement('span');
+        toggleText.textContent = getTranslation('Use this profile\u2019s own flow calibration');
+        toggleRow.appendChild(switchEl);
+        toggleRow.appendChild(toggleText);
+        headerRow.appendChild(toggleRow);
+
+        if (enabled) {
+            // Same bordered-box convention every other spinner pair in this card
+            // uses (settingsFieldBox/settingsSectionRow) -- this used to be a
+            // plain stacked row with its own one-off label style instead.
+            const boxRow = document.createElement('div');
+            boxRow.className = 'flex items-stretch';
+            const spinnerBox = (key, text, step, unit, max, last) => {
+                const spinner = createSpinner(
+                    values[key] ?? baseline[key], step, unit,
+                    (val) => { values[key] = val; persist(); },
+                    { min: 0, max }
+                );
+                boxRow.appendChild(settingsFieldBox(getTranslation(text), spinner, { last }));
+            };
+            spinnerBox('weightFlowMultiplier', 'Weight flow multiplier', 0.1, '', 5, false);
+            spinnerBox('volumeFlowMultiplier', 'Volume flow multiplier (s)', 0.05, 's', 5, true);
+            // Indent boxRow past a spacer the same w-[127.5px]+gap-[15px] width as
+            // headerRow's label, so it starts at the same x as Stop At's own box
+            // row (settingsSectionRow indents its boxes past its label the same
+            // way) instead of flush left under the "Flow calibration" label.
+            const boxRowLine = document.createElement('div');
+            boxRowLine.className = 'flex items-start gap-[15px]';
+            const spacer = document.createElement('div');
+            spacer.className = 'w-[127.5px] shrink-0';
+            boxRowLine.appendChild(spacer);
+            boxRowLine.appendChild(boxRow);
+            wrapper.appendChild(boxRowLine);
+        }
+
+        // Nothing when off: the toggle's own label already says this profile
+        // isn't using its own calibration, and the global values live in settings.
+        if (profileId && enabled) {
+            const hint = document.createElement('p');
+            hint.className = 'text-[18px] text-[var(--text-primary)] opacity-60 leading-[1.3]';
+            hint.textContent = getTranslation('Applied while this profile is loaded. Other profiles go back to the global value.');
+            wrapper.appendChild(hint);
+        }
+    }
+
+    paint();
+
+    // Both reads are off-machine, and the editor can be the first page of the
+    // session — the saved override may not be in memory yet when this first
+    // paints. Repaint with the real values once they land, unless the tab has
+    // been rebuilt under us in the meantime.
+    const ready = Promise.all([getFlowCalibrationBaseline(), ensureProfileOverridesLoaded()]).then(([resolved]) => {
+        baseline = resolved;
+        if (!wrapper.isConnected) return;
+        if (!enabled) {
+            values = pickFlowCalibration(profileId ? getProfileOverride(profileId) : null);
+            enabled = FLOW_CAL_KEYS.some(key => key in values);
+        }
+        paint();
+    });
+}
+
+// beverage_type enum per rest_v1.yml (Profile schema) and the Figma grid
+// (node 2662-1507): espresso, filter, pourover, tea, tea_portafilter,
+// calibrate, cleaning, manual.
+const BEVERAGE_TYPE_TILES = [
+    { value: 'espresso', label: 'Espresso' },
+    { value: 'filter', label: 'Filter' },
+    { value: 'pourover', label: 'Pour Over' },
+    { value: 'tea', label: 'Tea' },
+    { value: 'tea_portafilter', label: 'Tea Portafilter' },
+    { value: 'calibrate', label: 'Calibration' },
+    { value: 'cleaning', label: 'Cleaning' },
+    { value: 'manual', label: 'Manual' },
+];
+
+// One bordered box inside a settings section row: a plain-text field label
+// over its control. Two boxes share a hairline border edge (mr-[-1.5px]) the
+// way the CARDS card footer already does, so adjoining boxes don't double
+// their border weight.
+function settingsFieldBox(labelText, controlEl, { last = false } = {}) {
+    const box = document.createElement('div');
+    // Fixed 420px (Figma 560), not flex-1: an auto-width row would size each
+    // box to its own content, so the Water Settings row (which holds the wider
+    // step cycler) would end further right than Limits and Stop At. Two boxes
+    // at 420 less the shared hairline is 839.25 -- the same right edge as the
+    // 4x210 beverage grid below them.
+    box.className = `w-[420px] shrink-0 flex flex-col items-center gap-[22.5px] border border-[var(--border-primary)] px-[30px] py-[22.5px] ${last ? '' : 'mr-[-1px]'}`;
+    const label = document.createElement('p');
+    // leading-[1.2] is the design's own line-height on this style; without it
+    // the browser default (1.5) adds ~8px to every field box, which the card
+    // has no room for.
+    label.className = 'text-[25.5px] leading-[1.2] text-[var(--text-primary)] whitespace-nowrap';
+    label.textContent = labelText;
+    box.appendChild(label);
+    box.appendChild(controlEl);
+    return box;
+}
+
+// One section row: a --mimoja-blue label in a fixed 127.5px gutter (matching
+// the CARDS card's own label-gutter convention) beside its field boxes.
+function settingsSectionRow(labelText, boxes) {
+    const row = document.createElement('div');
+    row.className = 'flex gap-[15px] items-center pl-[15px]';
+    const label = document.createElement('p');
+    label.className = 'text-[24px] font-semibold text-[var(--settings-label-color)] w-[127.5px] shrink-0';
+    label.textContent = labelText;
+    row.appendChild(label);
+    const boxRow = document.createElement('div');
+    boxRow.className = 'flex items-stretch';
+    boxes.forEach((box, i) => boxRow.appendChild(settingsFieldBox(box.label, box.control, { last: i === boxes.length - 1 })));
+    row.appendChild(boxRow);
+    return row;
+}
+
+// Pre-infusion ends after -- cycles through "None" + every step name with the
+// same prev/next arrow chrome initCardPaging uses for CARDS' own paging
+// buttons, instead of the old plain <select>. Writes target_volume_count_start,
+// the same 0..steps.length integer the dropdown wrote.
+function createStepCycler(steps, current, onChange) {
+    let index = current;
+    const wrapper = document.createElement('div');
+    wrapper.className = 'flex items-center gap-[15px]';
+
+    const label = (i) => i === 0 ? getTranslation('None') : (steps[i - 1]?.name || `${getTranslation('Step')} ${i}`);
+
+    function makeArrowBtn(rotate) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = STEPPER_BTN_CLASS;
+        const icon = maskIcon(ICON_ARROW, 37.5, 'var(--stepper-icon)');
+        if (rotate) icon.style.transform = 'rotate(180deg)';
+        btn.appendChild(icon);
+        return btn;
+    }
+
+    const prevBtn = makeArrowBtn(true);
+    const display = document.createElement('p');
+    display.className = 'font-bold text-[24px] text-center text-[var(--text-primary)] w-[150px] whitespace-nowrap overflow-hidden text-ellipsis';
+    const nextBtn = makeArrowBtn(false);
+
+    function update() {
+        display.textContent = label(index);
+        const atStart = index === 0;
+        const atEnd = index === steps.length;
+        prevBtn.classList.toggle('opacity-40', atStart);
+        prevBtn.classList.toggle('pointer-events-none', atStart);
+        nextBtn.classList.toggle('opacity-40', atEnd);
+        nextBtn.classList.toggle('pointer-events-none', atEnd);
+    }
+
+    prevBtn.addEventListener('click', () => { index = Math.max(0, index - 1); update(); onChange(index); });
+    nextBtn.addEventListener('click', () => { index = Math.min(steps.length, index + 1); update(); onChange(index); });
+    update();
+
+    wrapper.appendChild(prevBtn);
+    wrapper.appendChild(display);
+    wrapper.appendChild(nextBtn);
+    return wrapper;
+}
+
+// ── Custom scrollbars (see main.css's #editor-settings-form-card comment) —
+// native ::-webkit-scrollbar-thumb height does not override Chromium's
+// proportional thumb length in this browser, and none of these three panes
+// (settings form card, description, script steps) reliably overflow enough
+// for proportional sizing to ever look like the Figma's short pill. Each
+// hides its native scrollbar and gets a hand-drawn pill instead: same fixed
+// 119.25px height the design uses throughout, hidden entirely when its pane
+// doesn't overflow. initScrollThumb wires the (idempotent) scroll listener
+// once per container; updateScrollThumb does the actual size/position math
+// and must be re-run after any render that could change scrollHeight. ──
+// Height of the Description card's "解说" heading + divider above the
+// scrollable notes column, measured live (rather than a hardcoded constant,
+// or summing the header/divider's own offsetHeight -- that undercounted by
+// the divider's margin-top, which offsetHeight does not include) so it stays
+// correct through i18n/font changes. This is what the form card's pill gets
+// pushed down by, below. Relies on the notes card being position:relative
+// (see profile_editor.html) so offsetTop resolves against it directly.
+function getDescriptionHeaderOffset() {
+    const notesWrap = document.getElementById('editor-settings-notes-col')?.parentElement;
+    return notesWrap ? notesWrap.offsetTop : 0;
+}
+
+const SCROLL_THUMB_HEIGHT = 119.25;
+// topOffset: the settings form card has no header above its scrollable area,
+// but its neighbor (Description) does -- "解说" + the divider -- so at rest
+// the two pills read as not level with each other. Requested explicitly:
+// match the LEFT (form card) pill down to the RIGHT one's start, rather than
+// the other way around, even though that's not what the Figma reference
+// shows (its Description pill starts below its own header, not level with
+// the header-less form card). The same gap is now mirrored at the bottom of
+// the track (rather than letting the pill run flush to the container's
+// bottom edge on a full scroll) so the two ends read the same on a real
+// tablet instead of only the top having breathing room.
+function updateScrollThumb(containerId, thumbId, topOffset = 0) {
+    const container = document.getElementById(containerId);
+    const thumb = document.getElementById(thumbId);
+    if (!container || !thumb) return;
+    const maxScroll = container.scrollHeight - container.clientHeight;
+    if (maxScroll <= 0) {
+        thumb.classList.add('hidden');
+        return;
+    }
+    thumb.classList.remove('hidden');
+    const bottomOffset = topOffset;
+    const pillHeight = Math.min(SCROLL_THUMB_HEIGHT, container.clientHeight - topOffset - bottomOffset);
+    const travel = container.clientHeight - topOffset - bottomOffset - pillHeight;
+    const top = topOffset + (travel > 0 ? (container.scrollTop / maxScroll) * travel : 0);
+    thumb.style.height = `${pillHeight}px`;
+    thumb.style.top = `${top}px`;
+}
+function initScrollThumb(containerId, thumbId, topOffset = 0) {
+    const container = document.getElementById(containerId);
+    // dataset flag, not a module-level Set: cloneNode-and-replace elsewhere in
+    // this file would otherwise carry a stale flag on a since-detached node.
+    if (!container || container.dataset.scrollThumbInit) return;
+    container.dataset.scrollThumbInit = '1';
+    container.addEventListener('scroll', perFrame(() => updateScrollThumb(containerId, thumbId, topOffset)));
+    initScrollThumbDrag(container, document.getElementById(thumbId), topOffset);
+}
+
+// Drag the pill to scroll, same mechanics as the profile selector's
+// initProfileListScrollThumb. Native scrollbar thumbs can't be touch-dragged in
+// Android WebView, so the hand-drawn pill has to accept the drag itself.
+function initScrollThumbDrag(container, thumb, topOffset) {
+    if (!thumb || thumb.dataset.dragInit) return;
+    thumb.dataset.dragInit = '1';
+    let isDragging = false;
+    let startY = 0;
+    let startScrollTop = 0;
+    const pointerY = (e) => (e.touches ? e.touches[0].clientY : e.clientY);
+
+    const drag = (e) => {
+        if (!isDragging) return;
+        if (e.type === 'touchmove') e.preventDefault();
+        const clientY = pointerY(e);
+        requestAnimationFrame(() => {
+            if (!isDragging) return;
+            const maxScroll = container.scrollHeight - container.clientHeight;
+            if (maxScroll <= 0) return;
+            const pillHeight = Math.min(SCROLL_THUMB_HEIGHT, container.clientHeight - topOffset * 2);
+            const travel = container.clientHeight - topOffset * 2 - pillHeight;
+            // Finger moves in screen px, travel is in layout px: the page is drawn
+            // through scale(sx, sy) (scaling.js).
+            const scaleY = container.offsetHeight ? container.getBoundingClientRect().height / container.offsetHeight : 1;
+            const deltaY = (clientY - startY) / (scaleY || 1);
+            const deltaScroll = travel > 0 ? (deltaY / travel) * maxScroll : 0;
+            container.scrollTop = Math.max(0, Math.min(maxScroll, startScrollTop + deltaScroll));
+        });
+    };
+    const stopDrag = () => {
+        isDragging = false;
+        document.removeEventListener('mousemove', drag);
+        document.removeEventListener('mouseup', stopDrag);
+        document.removeEventListener('touchmove', drag);
+        document.removeEventListener('touchend', stopDrag);
+        document.removeEventListener('touchcancel', stopDrag);
+    };
+    const startDrag = (e) => {
+        e.preventDefault();
+        isDragging = true;
+        startY = pointerY(e);
+        startScrollTop = container.scrollTop;
+        document.addEventListener('mousemove', drag);
+        document.addEventListener('mouseup', stopDrag);
+        document.addEventListener('touchmove', drag, { passive: false });
+        document.addEventListener('touchend', stopDrag);
+        document.addEventListener('touchcancel', stopDrag);
+    };
+    thumb.addEventListener('mousedown', startDrag);
+    thumb.addEventListener('touchstart', startDrag, { passive: false });
 }
 
 function renderSettingsTab() {
-    const container = document.getElementById('editor-settings-container');
-    if (!container) return;
-    container.innerHTML = '';
+    const formCard = document.getElementById('editor-settings-form-card');
+    const notesCol = document.getElementById('editor-settings-notes-col');
+    if (!formCard || !notesCol) return;
+    formCard.innerHTML = '';
+    notesCol.innerHTML = '';
+    // Attach once: these containers are never recreated (only their innerHTML
+    // is cleared above), just re-rendered every time this function runs.
+    initScrollThumb('editor-settings-form-card', 'editor-settings-form-card-thumb', getDescriptionHeaderOffset());
+    initScrollThumb('editor-settings-notes-col', 'editor-settings-notes-col-thumb');
 
     const profile = editorState.profile;
 
-    // Create 3 column containers. Use flex ratios (1:1:2) so columns divide the
-    // ACTUAL available row space (after padding + gaps), not the parent's full
-    // width — otherwise widths sum to 100% + 160px and rightCol overflows back
-    // onto middleCol, clipping the Import button on tablet. min-w-0 lets
-    // children shrink below their intrinsic min-content width.
-    const leftCol = document.createElement('div');
-    leftCol.className = 'flex flex-col gap-[45px] min-w-0';
-    leftCol.style.flex = '1 1 0';
+    // Figma node 2662-1507 (2560px canvas at 0.75, the same convention CARDS
+    // and SCRIPT were built on).
+    // The Figma frame is over-stuffed: its own sections plus padding come to
+    // ~897px inside an 853.5px card, so it cannot be reproduced as drawn and
+    // still show everything. Two figures absorb that. pb is 45 rather than the
+    // drawn 75, and the section gap is 34 rather than 45. Everything inside a
+    // field box stays exactly on spec — the compression is all in the space
+    // between sections, where it reads as tighter rhythm rather than as
+    // shrunken controls.
+    const form = document.createElement('div');
+    form.className = 'flex flex-col gap-[34px] pl-[22.5px] pr-[30px] pt-[45px] pb-[45px]';
+    formCard.appendChild(form);
 
-    const middleCol = document.createElement('div');
-    middleCol.className = 'flex flex-col gap-[45px] min-w-0';
-    middleCol.style.flex = '1 1 0';
+    // ── Water Settings: Preheat Water Tank, Pre-infusion ends at ──
 
-    const rightCol = document.createElement('div');
-    rightCol.className = 'flex flex-col gap-[24px] min-w-0';
-    rightCol.style.flex = '2 1 0';
+    form.appendChild(settingsSectionRow(getTranslation('Water Settings'), [
+        { label: getTranslation('Preheat Water Tank'), control: createSpinner(
+            profile.tank_temperature || 0, 1, '°c', (val) => { editorState.profile.tank_temperature = val; }, { min: 0, max: 110 }
+        ) },
+        { label: getTranslation('Pre-infusion ends at'), control: createStepCycler(
+            profile.steps || [], profile.target_volume_count_start || 0,
+            (val) => { editorState.profile.target_volume_count_start = val; updateSaveAsNewButtonState(); }
+        ) },
+    ]));
 
-    container.appendChild(leftCol);
-    container.appendChild(middleCol);
-    container.appendChild(rightCol);
-
-    function addFieldTo(targetCol, labelText, element) {
-        const wrapper = document.createElement('div');
-        wrapper.className = 'flex flex-col gap-[12px]';
-        const label = document.createElement('div');
-        label.className = 'text-[24px] font-semibold text-[var(--text-primary)] break-words';
-        label.textContent = labelText;
-        wrapper.appendChild(label);
-        wrapper.appendChild(element);
-        targetCol.appendChild(wrapper);
-        return wrapper;
-    }
-
-    // ── Left column: Target Weight, Tank Temperature, Beverage Type, Author ──
-
-    // Target Weight
-    addFieldTo(leftCol, getTranslation('Target Weight (g)'), createSpinner(
-        profile.target_weight || 0, 0.1, 'g', (val) => { editorState.profile.target_weight = val; }, { min: 0, max: 1000 }
-    ));
-
-    // Tank Temperature
-    addFieldTo(leftCol, getTranslation('Tank Temperature (\u00b0c)'), createSpinner(
-        profile.tank_temperature || 0, 1, '\u00b0c', (val) => { editorState.profile.tank_temperature = val; }, { min: 0, max: 110 }
-    ));
-
-    // Limiter Tolerance — separate controls for bar (flow-pump steps) and mL/s
-    // (pressure-pump steps). A flow-pump step's limiter caps pressure, so it is
-    // the bar control; a pressure-pump step's caps flow, so it is the mL/s one.
+    // ── Limits: Flow Range (pressure-pump steps' mL/s limiter), Pressure
+    // Range (flow-pump steps' bar limiter) -- labeled by what they measure,
+    // not by the pump type that owns them. Same underlying fields the old
+    // "Limiter Tolerance" spinners wrote. ──
     {
-        // No limiter on this pump type means no tolerance: show 0, not the 0.6
-        // default, which reads as a setting someone chose. The control is dead
-        // too -- there is no step to write a range to, and decaid drops the
-        // field entirely for a limiter-less step (unified_de1.profile.dart).
-        const toleranceField = (pump, label, unit) => {
+        // No limiter on this pump type means no range to show: 0, not the 0.6
+        // default, which would read as a setting someone chose. The control is
+        // dead too -- there is no step to write a range to, and decaid drops
+        // the field entirely for a limiter-less step (unified_de1.profile.dart).
+        const rangeControl = (pump, unit) => {
             const hasLimiter = limitedSteps(pump).length > 0;
-            addFieldTo(leftCol, getTranslation(label), createSpinner(
+            return createSpinner(
                 limiterRangeOf(pump, 0), 0.1, unit,
                 // Writes reach only the steps that already have a limiter.
                 // Creating one on every step of the pump type would flatten a
                 // profile that deliberately limits a single step.
                 (val) => limitedSteps(pump).forEach(step => { step.limiter.range = val; }),
-                { min: 0, max: 5, disabled: !hasLimiter }
-            ));
+                { min: 0, max: 5, disabled: !hasLimiter, displaySize: 25.5 }
+            );
         };
 
-        toleranceField('flow', 'Limiter Tolerance (bar)', 'bar');
-        toleranceField('pressure', 'Limiter Tolerance (mL/s)', 'mL/s');
+        form.appendChild(settingsSectionRow(getTranslation('Limits'), [
+            { label: getTranslation('Flow Range'), control: rangeControl('pressure', 'mL/s') },
+            { label: getTranslation('Pressure Range'), control: rangeControl('flow', 'bar') },
+        ]));
     }
 
-    // Beverage Type (select)
-    const select = document.createElement('select');
-    select.className = 'text-[24px] text-[var(--text-primary)] bg-[var(--box-color)] border border-[var(--border-color)] rounded-[12px] px-[16px] py-[12px] outline-none focus:border-[var(--mimoja-blue)] w-full';
-    ['espresso', 'manual', 'cleaning'].forEach((type) => {
-        const opt = document.createElement('option');
-        opt.value = type;
-        opt.textContent = type.charAt(0).toUpperCase() + type.slice(1);
-        if (profile.beverage_type === type) opt.selected = true;
-        select.appendChild(opt);
-    });
-    select.addEventListener('change', () => { editorState.profile.beverage_type = select.value; });
-    addFieldTo(leftCol, getTranslation('Beverage type'), select);
+    // ── Stop At: Weight, Volume ──
 
-    // Author (text input)
-    const authorInput = document.createElement('input');
-    authorInput.type = 'text';
-    authorInput.value = profile.author || '';
-    authorInput.className = 'text-[24px] text-[var(--text-primary)] bg-[var(--box-color)] border border-[var(--border-color)] rounded-[12px] px-[16px] py-[12px] outline-none focus:border-[var(--mimoja-blue)] w-full';
-    authorInput.addEventListener('change', () => { editorState.profile.author = authorInput.value; });
-    addFieldTo(leftCol, getTranslation('Author'), authorInput);
+    form.appendChild(settingsSectionRow(getTranslation('Stop At'), [
+        { label: getTranslation('Weight'), control: createSpinner(
+            profile.target_weight || 0, 0.1, 'g', (val) => { editorState.profile.target_weight = val; }, { min: 0, max: 1000, displaySize: 25.5 }
+        ) },
+        { label: getTranslation('Volume'), control: createSpinner(
+            profile.target_volume || 0, 1, 'ml', (val) => { editorState.profile.target_volume = val; }, { min: 0, max: 500, displaySize: 25.5 }
+        ) },
+    ]));
 
-    // ── Middle column: Preinfusion ends after, After preinfusion stop the shot at ──
-
-    // Preinfusion ends after — dropdown of step names
+    // ── Beverage Type: 2x4 tile grid ──
     {
-        const steps = profile.steps || [];
-        const countStart = profile.target_volume_count_start || 0;
+        const section = document.createElement('div');
+        section.className = 'flex gap-[15px] items-center pl-[15px]';
 
-        const preinfSelect = document.createElement('select');
-        preinfSelect.className = 'text-[24px] text-[var(--text-primary)] bg-[var(--box-color)] border border-[var(--border-color)] rounded-[12px] px-[16px] py-[12px] outline-none focus:border-[var(--mimoja-blue)] w-full';
+        const label = document.createElement('p');
+        label.className = 'text-[24px] font-semibold text-[var(--settings-label-color)] w-[127.5px] shrink-0';
+        label.textContent = getTranslation('Beverage Type');
+        section.appendChild(label);
 
-        const noneOpt = document.createElement('option');
-        noneOpt.value = '0';
-        noneOpt.textContent = getTranslation('None');
-        if (countStart === 0) noneOpt.selected = true;
-        preinfSelect.appendChild(noneOpt);
-
-        steps.forEach((step, i) => {
-            const opt = document.createElement('option');
-            opt.value = String(i + 1);
-            opt.textContent = step.name || `Step ${i + 1}`;
-            if (countStart === i + 1) opt.selected = true;
-            preinfSelect.appendChild(opt);
+        const grid = document.createElement('div');
+        grid.className = 'grid grid-cols-4';
+        BEVERAGE_TYPE_TILES.forEach((tile, i) => {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            const active = profile.beverage_type === tile.value;
+            // Pull only the edges that meet another tile, so the grid's own
+            // outer edge keeps its full hairline instead of losing 1px off the
+            // last column and row. The selected tile borders in its own fill
+            // rather than dropping the border outright -- the design draws no
+            // outline on it, and a width change here would reflow the row.
+            const lastCol = i % 4 === 3;
+            const lastRow = i >= 4;
+            btn.className = `h-[72px] w-[210px] flex items-center justify-center text-center font-bold text-[24px] border ${lastCol ? '' : 'mr-[-1px]'} ${lastRow ? '' : 'mb-[-1px]'} ${
+                active ? 'bg-[var(--button-primary-bg)] border-[var(--button-primary-bg)] text-white' : 'bg-[var(--box-color)] border-[var(--border-primary)] text-[var(--tab-text-inactive)]'
+            }`;
+            btn.textContent = getTranslation(tile.label);
+            btn.setAttribute('aria-pressed', String(active));
+            btn.addEventListener('click', () => {
+                editorState.profile.beverage_type = tile.value;
+                updateSaveAsNewButtonState(); // execution field — no other render path runs after this raw listener
+                renderSettingsTab();
+            });
+            grid.appendChild(btn);
         });
-
-        preinfSelect.addEventListener('change', () => {
-            editorState.profile.target_volume_count_start = parseInt(preinfSelect.value, 10);
-        });
-
-        addFieldTo(middleCol, getTranslation('Preinfusion ends after'), preinfSelect);
+        section.appendChild(grid);
+        form.appendChild(section);
     }
 
-    // Target Volume (stop shot after preinfusion)
-    addFieldTo(middleCol, getTranslation('After preinfusion stop the shot at'), createSpinner(
-        profile.target_volume || 0, 1, 'ml', (val) => { editorState.profile.target_volume = val; }, { min: 0, max: 500 }
-    ));
+    // ── Flow calibration ──
+    // (target_volume itself now lives in the Stop At row above -- the
+    // redesigned "Volume" field is the same target_volume this used to write
+    // under "After preinfusion stop the shot at".)
+    renderFlowCalibrationFields(form);
 
-    // ── Middle column: Load Profile From (new profile only) ──
+    // ── Load Profile From (new profile only), bolted on below the
+    // redesigned fields -- the Figma frame only covers editing an existing
+    // profile, so there's no spec yet for where this belongs. ──
 
     const isNewProfile = editorState.sourceProfileId === null;
 
@@ -1187,24 +2052,46 @@ function renderSettingsTab() {
                 _sessionImportedIds.push(sourceRecord.id);
             }
         }
-        editorState.profile = deepCopy(newProfile);
+        // Normalize on the way in, same as every other entry point (the plain
+        // open-existing-profile path below, and saveDraftEdit's baseline) --
+        // without it, an imported profile carrying legacy off-pump pressure/flow
+        // keys reads as "changed" the instant it lands (saveProfile's comparison
+        // normalizes the source before diffing, so the raw copy never matches),
+        // which forks a save attempt the server then dedups back onto the very
+        // record just imported: "This change matches an existing profile" on a
+        // completely untouched import.
+        editorState.profile = normalizeLegacySteps(deepCopy(newProfile));
         editorState.sourceProfileRecord = sourceRecord || null;
         editorState.sourceProfileId = sourceRecord?.id || null;
+        editorState.editingStep = null;
         _baselineProfileJson = JSON.stringify(editorState.profile);
         const titleDisplay = document.getElementById('editor-title-display');
         if (titleDisplay) titleDisplay.textContent = editorState.profile.title || 'Untitled Profile';
+        updateSaveAsNewButtonState();
         renderStepCards();
         renderSettingsTab();
+        // iPadOS: the native file-picker sheet (Upload Local File) or the
+        // on-screen keyboard (Import from Share Code) can leave scaling.js's
+        // transform sized for the momentarily shrunk viewport if the browser's
+        // own resize/visualViewport event doesn't fire reliably once it's
+        // dismissed -- nudge the same recovery path orientationchange and
+        // fullscreenchange already rely on, so Save/Cancel don't end up
+        // transformed off-screen after a fresh import.
+        setTimeout(() => window.dispatchEvent(new Event('resize')), 200);
     }
 
     if (isNewProfile) {
         // Upload local file button
         const uploadBtn = document.createElement('button');
-        uploadBtn.className = 'w-full h-[56px] bg-[var(--mimoja-blue)] text-white text-[20px] font-semibold rounded-[12px] flex items-center justify-center gap-[10px] hover:opacity-90 transition-opacity';
+        // w-fit, not w-full: a full-width button's right edge lands exactly on
+        // this card's pr-[30px] edge, which the absolutely-positioned custom
+        // scrollbar thumb (editor-settings-form-card-thumb, right-[3px]
+        // w-[39px] on the wrap) overlaps by 12px — clipping the button.
+        uploadBtn.className = 'w-fit h-[56px] px-[24px] bg-[var(--button-primary-bg)] text-white text-[20px] font-semibold rounded-[12px] flex items-center justify-center gap-[10px] hover:opacity-90 transition-opacity';
         const uploadIcon = document.createElement('span');
         uploadIcon.innerHTML = `<svg class="w-[22px] h-[22px]" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/></svg>`;
         const uploadText = document.createElement('span');
-        uploadText.textContent = getTranslation('Upload Local File');
+        uploadText.textContent = getTranslation('Upload');
         uploadBtn.appendChild(uploadIcon);
         uploadBtn.appendChild(uploadText);
         uploadBtn.addEventListener('click', () => {
@@ -1245,11 +2132,27 @@ function renderSettingsTab() {
             };
             fileInput.click();
         });
-        addFieldTo(middleCol, getTranslation('Upload Local File'), uploadBtn);
+        // Label beside its control, same row-level convention as the Flow
+        // calibration header row above (fixed w-[127.5px] label, items-center).
+        const uploadRow = document.createElement('div');
+        uploadRow.className = 'flex items-center gap-[15px] pl-[15px]';
+        const uploadLabel = document.createElement('div');
+        uploadLabel.className = 'text-[24px] font-semibold text-[var(--settings-label-color)] w-[127.5px] shrink-0 break-words';
+        uploadLabel.textContent = getTranslation('Upload Local File');
+        uploadRow.appendChild(uploadLabel);
+        uploadRow.appendChild(uploadBtn);
+        form.appendChild(uploadRow);
 
-        // Import from share code
+        // Import from Visualizer (by share code)
+        // mr-[15px]: same scrollbar-thumb clearance issue as uploadBtn above —
+        // the input is flex-1, so it stretches the Import button flush to the
+        // card's pr-[30px] edge, 12px under the thumb, without this margin.
         const shareSection = document.createElement('div');
-        shareSection.className = 'flex flex-col gap-[10px]';
+        // flex-1 min-w-0: shareSection is now a flex item beside the field's own
+        // label (shareFieldRow below), not the label's stacked full-width child
+        // it used to be -- without this it shrinks to fit-content instead of
+        // filling the row, and shareInput's own flex-1 has nothing to grow against.
+        shareSection.className = 'flex flex-col gap-[10px] mr-[15px] flex-1 min-w-0';
 
         const shareRow = document.createElement('div');
         shareRow.className = 'flex gap-[10px]';
@@ -1265,12 +2168,12 @@ function renderSettingsTab() {
         // of the Notes column. size=4 matches maxLength so the intrinsic width is honest
         // even if the flex context changes later.
         shareInput.size = 4;
-        shareInput.className = 'flex-1 min-w-0 h-[56px] text-[22px] font-bold text-center tracking-[6px] bg-[var(--box-color)] border-2 border-[var(--border-color)] rounded-[12px] outline-none focus:border-[var(--mimoja-blue)]';
+        shareInput.className = 'flex-1 min-w-0 h-[56px] text-[22px] font-bold text-center tracking-[6px] bg-[var(--box-color)] border-2 border-[var(--border-color)] rounded-[12px] outline-none focus:border-[var(--mimoja-blue-v2)]';
         shareInput.addEventListener('input', () => { shareInput.value = shareInput.value.toUpperCase().replace(/[^A-Z0-9]/g, ''); });
 
         const shareImportBtn = document.createElement('button');
         shareImportBtn.textContent = getTranslation('Import');
-        shareImportBtn.className = 'h-[56px] px-[24px] bg-[var(--mimoja-blue)] text-white text-[20px] font-semibold rounded-[12px] hover:opacity-90 transition-opacity shrink-0';
+        shareImportBtn.className = 'h-[56px] px-[24px] bg-[var(--button-primary-bg)] text-white text-[20px] font-semibold rounded-[12px] hover:opacity-90 transition-opacity shrink-0';
 
         const shareStatus = document.createElement('p');
         shareStatus.className = 'text-[18px] text-[var(--low-contrast-white)] min-h-[24px]';
@@ -1286,18 +2189,13 @@ function renderSettingsTab() {
             shareImportBtn.textContent = getTranslation('Importing');
             shareStatus.textContent = '';
             try {
-                const vizSettings = await getPluginSettings('visualizer.reaplugin');
-                // Secure settings come back as { isSet } state, never plaintext (decaid #588).
-                const password = vizSettings?.Password;
-                const passwordSet = password == null ? false
-                    : typeof password === 'object' ? password.isSet === true
-                    : !!password; // legacy cleartext from older decaid
-                const isConfigured = vizSettings?.Enabled !== false && !!(vizSettings?.Username && passwordSet);
-                if (!isConfigured) {
+                const { VISUALIZER_PLUGIN_ID, visualizerAccountConfigured } = await import('./visualizer-account.js');
+                const vizSettings = await getPluginSettings(VISUALIZER_PLUGIN_ID);
+                if (!visualizerAccountConfigured(vizSettings)) {
                     shareStatus.innerHTML = 'No Visualizer account found. Go to <strong>Settings → Extensions → Visualizer</strong> to log in first.';
                     return;
                 }
-                const result = await callPluginEndpoint('visualizer.reaplugin', 'import', { shareCode: code });
+                const result = await callPluginEndpoint(VISUALIZER_PLUGIN_ID, 'import', { shareCode: code });
                 if (!result.success) {
                     const msg = result.error || 'Import failed';
                     const isAuthError = /credential|login|auth|unauthorized|password|username/i.test(msg);
@@ -1324,21 +2222,38 @@ function renderSettingsTab() {
         shareRow.appendChild(shareImportBtn);
         shareSection.appendChild(shareRow);
         shareSection.appendChild(shareStatus);
-        addFieldTo(middleCol, getTranslation('Import from Share Code'), shareSection);
+        // items-start, not items-center: shareSection also carries the status
+        // line below the input+button, so centering the label against the
+        // whole block would drop it below the row it's meant to label.
+        const shareFieldRow = document.createElement('div');
+        shareFieldRow.className = 'flex items-start gap-[15px] pl-[15px]';
+        const shareLabel = document.createElement('div');
+        shareLabel.className = 'text-[24px] font-semibold text-[var(--settings-label-color)] w-[127.5px] shrink-0 break-words';
+        shareLabel.textContent = getTranslation('Import from Visualizer');
+        shareFieldRow.appendChild(shareLabel);
+        shareFieldRow.appendChild(shareSection);
+        form.appendChild(shareFieldRow);
     }
 
-    // ── Right column: Notes (tall textarea filling column height) ──
+    // ── Description (right card, node 2662:1633's Description panel) ──
+    // Same tap-to-edit-in-a-modal preview the old right column used, just
+    // rendered into the redesign's own scrollable card instead of a labeled
+    // column -- the HTML shell already draws the "Description" heading, help
+    // icon and divider above #editor-settings-notes-col.
 
     const notesPreview = document.createElement('div');
-    notesPreview.className = 'text-[22px] text-[var(--text-primary)] bg-[var(--box-color)] border-2 border-[var(--border-color)] rounded-[12px] px-[20px] py-[16px] cursor-pointer select-none overflow-y-auto flex-1 whitespace-pre-wrap leading-[1.5] hover:border-[var(--mimoja-blue)] transition-colors';
+    // No h-full: that forced this block to fill the whole card even for a
+    // one-line description, pushing Author out of view below the fold on
+    // anything short. Sized to its own text, Author now sits right after it.
+    notesPreview.className = 'text-[24px] text-[var(--text-primary)] cursor-pointer select-none whitespace-pre-wrap leading-[1.5]';
     function updateNotesPreview() {
         const text = editorState.profile.notes || '';
         if (text) {
             notesPreview.textContent = text;
             notesPreview.style.color = '';
         } else {
-            notesPreview.textContent = getTranslation('Tap to edit notes\u2026');
-            notesPreview.style.color = '#959595';
+            notesPreview.textContent = getTranslation('Tap to edit notes…');
+            notesPreview.style.color = 'var(--low-contrast-white)';
         }
     }
     updateNotesPreview();
@@ -1348,287 +2263,373 @@ function renderSettingsTab() {
             updateNotesPreview();
         });
     });
-    const notesWrapper = addFieldTo(rightCol, getTranslation('Notes'), notesPreview);
-    notesWrapper.className = 'flex flex-col gap-[12px] flex-1';
+    notesCol.appendChild(notesPreview);
+
+    // ── Author (bottom of Description card) — mt-auto pins it to the bottom
+    // of notesCol (now a flex column) regardless of how short the description
+    // is, instead of just trailing whatever whitespace was left after it.
+    // "Author: xxx" sits on one row like the label + control convention used
+    // elsewhere in this panel, not stacked. Metadata field like title/notes:
+    // never part of the content hash (currentExecChanged's comment above), so
+    // no updateSaveAsNewButtonState.
+    const authorSection = document.createElement('div');
+    authorSection.className = 'flex items-center gap-[15px] mt-auto pt-[36px] border-t-[1.5px] border-[var(--border-graph-grid)] shrink-0';
+
+    const authorLabel = document.createElement('div');
+    authorLabel.className = 'text-[24px] font-semibold text-[var(--mimoja-blue-v2)] shrink-0';
+    authorLabel.textContent = getTranslation('Author');
+    authorSection.appendChild(authorLabel);
+
+    const authorInput = document.createElement('input');
+    authorInput.type = 'text';
+    authorInput.value = editorState.profile.author || '';
+    authorInput.className = 'text-[24px] text-[var(--text-primary)] bg-[var(--box-color)] border-2 border-[var(--border-color)] rounded-[12px] px-[16px] py-[12px] outline-none focus:border-[var(--mimoja-blue-v2)] flex-1 min-w-0';
+    authorInput.addEventListener('change', () => { editorState.profile.author = authorInput.value; });
+    authorSection.appendChild(authorInput);
+
+    notesCol.appendChild(authorSection);
+
+    // Content height just changed (possibly for the first time this tab has
+    // ever been shown), so each thumb's visibility/size/position needs a
+    // fresh read of the now-final scrollHeight rather than whatever it was
+    // left at from a previous render.
+    updateScrollThumb('editor-settings-form-card', 'editor-settings-form-card-thumb', getDescriptionHeaderOffset());
+    updateScrollThumb('editor-settings-notes-col', 'editor-settings-notes-col-thumb');
 }
 
-// ─── Review Tab ─────────────────────────────────────────────────────────────
+// ─── Script Tab ─────────────────────────────────────────────────────────────
+// Figma node 2662-803 (2560px canvas, so every dimension below is the design
+// value at 0.75 — the same convention the CARDS tab was built on). The profile
+// read back as prose: the left half is a "Steps Overview" script, one bulleted
+// sentence per thing a step does, and the right half is the graph preview the
+// old Review tab already drew.
+//
+// Two things the review tab had are gone, because the design does not show
+// them. Its third block — a second list of profile-wide settings under the
+// graph — duplicated fields SETTINGS (tab 1) already owns, and the design's
+// right half is the graph alone. Its per-step insert/delete/reorder buttons
+// are gone too: the redesign gave every CARDS card a footer carrying exactly
+// those three controls, and the design draws no step controls on this screen.
+//
+// Values and state words stay tappable, as they were in the review tab and as
+// the design's accent-blue highlights imply.
 
-function describeStep(step, index) {
-    const PROSE_CLASS = 'text-[20px] text-[var(--text-primary)] select-none';
-    const PILL_ACTIVE   = 'text-[var(--button-primary-bg)] text-[20px] font-semibold cursor-pointer select-none inline-flex underline decoration-dashed underline-offset-[3px] px-[4px] rounded-[4px]';
-    const TOGGLE_CLASS  = 'text-[var(--button-primary-bg)] text-[20px] font-semibold cursor-pointer select-none underline decoration-dashed underline-offset-[3px] px-[4px]';
-    // Zero-valued max fields: same pill, muted, so "not set" is legible without
-    // spending a sentence on it.
-    const PILL_MUTED    = 'text-[var(--low-contrast-white)] text-[20px] font-semibold cursor-pointer select-none inline-flex underline decoration-dashed underline-offset-[3px] px-[4px] rounded-[4px]';
+// ─── Pure script-line composition ──────────────────────────────────────────
+// Which sentences a step produces, in what order, and with which verb — kept
+// off the DOM as standalone functions so test/profile-editor.test.mjs can
+// extract and run them the same way it does readExitDef and pushChannel.
 
-    function makeProseSpan(text) {
-        const span = document.createElement('span');
-        span.className = PROSE_CLASS;
-        span.textContent = text;
-        return span;
-    }
+// Ordered as the CARDS "Maximum" row lists them, so the two tabs never
+// disagree about a step's three ceilings.
+const SCRIPT_MAX_FIELDS = [
+    { key: 'weight',  unit: 'g'   },
+    { key: 'seconds', unit: 'sec' },
+    { key: 'volume',  unit: 'ml'  },
+];
 
-    function makeToggle(initialText, onClick) {
-        const span = document.createElement('span');
-        span.className = TOGGLE_CLASS;
-        span.textContent = initialText;
-        span.addEventListener('click', () => { onClick(span); });
-        return span;
-    }
+// "Set ... to 93.0 °C" on the opening step, then "Maintain ... at", "Increase
+// ... to" or "Decrease ... to" relative to the step before it — per the Figma,
+// where step 1 reads "Set", step 2 (same target) "Maintain", and step 3 (lower
+// target) "Decrease". The stored value is an absolute setpoint either way; the
+// verb only describes how it relates to what came before.
+function temperatureVerb(prevTemp, temp) {
+    if (typeof prevTemp !== 'number') return 'Set';
+    if (temp > prevTemp) return 'Increase';
+    if (temp < prevTemp) return 'Decrease';
+    return 'Maintain';
+}
 
-    // An editable value inside a sentence. The dashed underline already says
-    // "tappable", so a tap goes straight to the numpad (tablet) or an inline
-    // input (desktop). No ± here: this is the read-it-as-prose view, and 40px
-    // buttons floated around a word mid-sentence were what overlapped the
-    // neighbouring lines. Fine adjustment lives in the grid, which has real
-    // steppers now.
-    function makeValuePill(initialValue, lim, unit, onCommit, opts = {}) {
-        let value = initialValue;
-
-        const pill = document.createElement('span');
-        pill.addEventListener('mouseenter', () => { pill.style.backgroundColor = 'var(--button-grey)'; });
-        pill.addEventListener('mouseleave', () => { pill.style.backgroundColor = ''; });
-
-        function render() {
-            pill.textContent = `${roundTo(value, lim.step)} ${unit}`;
-            pill.className = (opts.mutedWhenZero && value === 0) ? PILL_MUTED : PILL_ACTIVE;
-        }
-
-        function commit(val) {
-            value = val;
-            render();
-            onCommit(value);
-        }
-
-        pill.addEventListener('click', () => {
-            if (shouldUseNumpad()) {
-                openNumpadForField(value, {
-                    fieldType: opts.fieldType || 'pe-review',
-                    title: (opts.title || unit || 'VALUE').toUpperCase(),
-                    unit,
-                    min: lim.min, max: lim.max,
-                    label: `${lim.min}–${lim.max}`,
-                }, commit);
-                return;
-            }
-            inlineEditValue(pill, value, {
-                min: lim.min, max: lim.max, step: lim.step, unit,
-                onCommit: commit,
-            });
-        });
-
-        render();
-        return pill;
-    }
-
-    function makeLine(children) {
-        const span = document.createElement('span');
-        // flex-wrap so longer-language sentence rows wrap to a second line instead
-        // of overflowing the step cell.
-        span.className = 'inline-flex flex-wrap items-center justify-center gap-[6px]';
-        for (const child of children) {
-            if (typeof child === 'string') {
-                span.appendChild(makeProseSpan(child));
-            } else {
-                span.appendChild(child);
-            }
-        }
-        return span;
-    }
-
+function buildStepScript(step, index, profile, prevStep) {
     const lines = [];
     const isFlow = step.pump !== 'pressure';
 
-    // Line 1 — Temperature + sensor
-    {
-        let sensorValue = step.sensor || 'coffee';
-        const sensorToggle = makeToggle(
-            sensorValue === 'water' ? getTranslation('Mix') : getTranslation('Group'),
-            (span) => {
-                sensorValue = sensorValue === 'coffee' ? 'water' : 'coffee';
-                span.textContent = sensorValue === 'coffee' ? getTranslation('Group') : getTranslation('Mix');
-                editorState.profile.steps[index].sensor = sensorValue;
-                renderReviewGraph();
-            }
-        );
+    // profile.target_volume_count_start is "preinfusion ends after step N",
+    // 1-based with 0 meaning none — so volume tracking starts on the step
+    // AFTER it, at 0-based index N. The > 0 guard matters: `|| 0` turns "none"
+    // into 0, which would otherwise put the marker on step 1.
+    const countStart = profile.target_volume_count_start || 0;
+    if (countStart > 0 && countStart === index) lines.push({ kind: 'volumeStart' });
 
-        const tempSpinner = makeValuePill(
-            step.temperature ?? 93, FIELD_LIMITS.temperature, '\u00b0C',
-            (val) => { editorState.profile.steps[index].temperature = val; renderReviewGraph(); },
-            { fieldType: 'pe-review-temp', title: 'TEMPERATURE' }
-        );
+    lines.push({
+        kind: 'temperature',
+        verb: temperatureVerb(
+            typeof prevStep?.temperature === 'number' ? prevStep.temperature : null,
+            step.temperature ?? 93,
+        ),
+    });
 
-        lines.push(makeLine([sensorToggle, getTranslation('to'), tempSpinner]));
-    }
+    lines.push({ kind: 'pump', isFlow });
 
-    // Line 2 — Pump mode + ramp + target
-    {
-        // Mode leads the line for the same reason it has a button in the grid:
-        // it decides the unit, the target's bounds, and which axis the limiter
-        // constrains. The summary used to show a step's most consequential
-        // property as nothing but the unit on its value, with no way to change
-        // it — the one control on the step page with no counterpart here.
-        const modeToggle = makeToggle(
-            isFlow ? getTranslation('Flow') : getTranslation('Pressure'),
-            () => {
-                const s = editorState.profile.steps[index];
-                if (isFlow) {
-                    s.pump = 'pressure';
-                    if (!s.pressure) s.pressure = PUMP_SEED_PRESSURE;
-                    delete s.flow;
-                } else {
-                    s.pump = 'flow';
-                    if (!s.flow) s.flow = PUMP_SEED_FLOW;
-                    delete s.pressure;
-                }
-                // Full tab rebuild, not just the chart: the target pill and the
-                // limiter pill both closed over the old mode's unit and bounds.
-                renderReviewTab();
-            }
-        );
+    // Unlike the CARDS rows, an unset field is left out rather than shown
+    // muted: this half is prose, and "Limit to 0.0 bar" or "For a maximum of
+    // 0.0 g" asserts something the step does not do. Nothing becomes
+    // unreachable — CARDS keeps a permanent row for each of them, which is
+    // where one gets added.
+    if ((step.limiter?.value ?? 0) > 0) lines.push({ kind: 'limit', isFlow });
 
-        let transValue = step.transition || 'fast';
-        const transToggle = makeToggle(
-            transValue === 'fast' ? getTranslation('Quickly') : getTranslation('Slowly'),
-            (span) => {
-                transValue = transValue === 'fast' ? 'smooth' : 'fast';
-                span.textContent = transValue === 'fast' ? getTranslation('Quickly') : getTranslation('Slowly');
-                editorState.profile.steps[index].transition = transValue;
-                renderReviewGraph();
-            }
-        );
+    const maxKeys = SCRIPT_MAX_FIELDS.filter((f) => (step[f.key] ?? 0) > 0).map((f) => f.key);
+    if (maxKeys.length > 0) lines.push({ kind: 'maximum', keys: maxKeys });
 
-        const pumpLim  = isFlow ? FIELD_LIMITS.flow : FIELD_LIMITS.pressure;
-        const pumpUnit = isFlow ? 'mL/s' : 'bar';
-        const pumpSpinner = makeValuePill(
-            (isFlow ? step.flow : step.pressure) ?? 0, pumpLim, pumpUnit,
-            (val) => {
-                if (isFlow) editorState.profile.steps[index].flow = val;
-                else editorState.profile.steps[index].pressure = val;
-                renderReviewGraph();
-            },
-            isFlow
-                ? { fieldType: 'pe-review-flow', title: 'FLOW' }
-                : { fieldType: 'pe-review-pressure', title: 'PRESSURE' }
-        );
-
-        // 'Ramp' is dropped, as it was from the grid: its German (translation
-        // CSV row 1721, 'Sanfter Übergang') means *smooth transition*, so next
-        // to the transition toggle it read 'smooth transition quickly'.
-        lines.push(makeLine([modeToggle, transToggle, getTranslation('to'), pumpSpinner]));
-    }
-
-    // Line 3 — Limiter. Always present, muted at 0, exactly like the Max line
-    // below treats its unset limits. Rendering it only when it was already
-    // non-zero meant a limiter could be edited from the summary but never
-    // added — the grid at least falls back to a '+ Limit' chip.
-    {
-        const limValue = step.limiter?.value ?? 0;
-        const limUnit  = isFlow ? 'bar' : 'mL/s';
-        const limLim   = isFlow ? FIELD_LIMITS.pressureLimit : FIELD_LIMITS.flowLimit;
-        const limSpinner = makeValuePill(
-            limValue, limLim, limUnit,
-            (val) => {
-                const s = editorState.profile.steps[index];
-                if (!s.limiter) s.limiter = { value: val, range: newLimiterRange(s.pump) };
-                else s.limiter.value = val;
-                renderReviewGraph();
-            },
-            { mutedWhenZero: true, fieldType: 'pe-review-limit', title: 'LIMIT' }
-        );
-        lines.push(makeLine([getTranslation('Limit to'), limSpinner]));
-    }
-
-    // Line 4 — Max (weight / seconds / volume)
-    // All three are listed because all three are live: whichever trips first
-    // ends the step. Unset ones are muted rather than hidden, so there is always
-    // somewhere to tap to set them — the old version needed an expanded/
-    // collapsed mode, a "+ max" placeholder, a 2s timer and a focus overlay to
-    // solve that, and floated its pills over the neighbouring lines.
-    {
-        const MAX_FIELDS = [
-            { key: 'weight',  unit: 'g',   lim: FIELD_LIMITS.weight },
-            { key: 'seconds', unit: 'sec', lim: FIELD_LIMITS.seconds },
-            { key: 'volume',  unit: 'ml',  lim: FIELD_LIMITS.volume },
-        ];
-
-        const parts = [getTranslation('Up to')];
-        MAX_FIELDS.forEach(({ key, unit, lim }) => {
-            parts.push(makeValuePill(
-                step[key] ?? 0, lim, unit,
-                (val) => { editorState.profile.steps[index][key] = val; renderReviewGraph(); },
-                { mutedWhenZero: true, fieldType: MAX_NUMPAD[key].fieldType, title: MAX_NUMPAD[key].title }
-            ));
-        });
-
-        lines.push(makeLine(parts));
-    }
-
-    // Line 4 — Exit condition. Always present, 'off' included, so an exit can
-    // be added and cleared from here. It used to render only for a step that
-    // already had one, and its type toggle filtered 'off' out of the cycle —
-    // between them, the summary could reach an exit but never leave one.
-    {
-        const exitDef = readExitDef(step);
-        let exitType = exitDef.type;
-        let exitCond = exitDef.condition;
-        let exitValue = exitDef.value;
-
-        const exitTypeToggle = makeToggle(
-            getTranslation(exitType.charAt(0).toUpperCase() + exitType.slice(1)),
-            () => {
-                exitType = EXIT_TYPES[(EXIT_TYPES.indexOf(exitType) + 1) % EXIT_TYPES.length];
-                // Carry the value into the new type's range: pressure allows
-                // 12 bar, flow only 8 mL/s. 'off' has no ceiling to clamp to.
-                exitValue = clamp(exitValue, 0, EXIT_MAX_MAP[exitType] ?? exitValue);
-                const s = editorState.profile.steps[index];
-                if (!s.exit) s.exit = { type: exitType, condition: exitCond, value: exitValue };
-                else { s.exit.type = exitType; s.exit.value = exitValue; }
-                // Full tab rebuild, not just the chart. The value pill closed
-                // over the old type's unit and bounds when it was built, so
-                // renderReviewGraph() alone left it reading "2.0 bar" on a
-                // flow exit — and still enforcing pressure's ceiling of 12.
-                renderReviewTab();
-            }
-        );
-
-        // 'off' has no condition and no value, so neither control is built —
-        // the same way the grid's Exit cell drops both rather than disabling
-        // them. EXIT_MAX_MAP/EXIT_UNIT_MAP have no 'off' entry to read either.
-        if (exitType === 'off') {
-            lines.push(makeLine([getTranslation('Move on if'), exitTypeToggle]));
-            return lines;
-        }
-
-        const exitCondToggle = makeToggle(
-            getTranslation(exitCond === 'over' ? 'is over' : 'is under'),
-            (span) => {
-                exitCond = exitCond === 'over' ? 'under' : 'over';
-                span.textContent = getTranslation(exitCond === 'over' ? 'is over' : 'is under');
-                if (!editorState.profile.steps[index].exit) editorState.profile.steps[index].exit = { type: exitType, condition: exitCond, value: exitValue };
-                else editorState.profile.steps[index].exit.condition = exitCond;
-                renderReviewGraph();
-            }
-        );
-
-        const exitSpinner = makeValuePill(
-            exitValue,
-            { min: 0, max: EXIT_MAX_MAP[exitType], step: EXIT_STEP_MAP[exitType] },
-            EXIT_UNIT_MAP[exitType],
-            (val) => {
-                exitValue = val;
-                if (!editorState.profile.steps[index].exit) editorState.profile.steps[index].exit = { type: exitType, condition: exitCond, value: val };
-                else editorState.profile.steps[index].exit.value = val;
-                renderReviewGraph();
-            },
-            { fieldType: 'pe-review-exit', title: 'EXIT' }
-        );
-
-        lines.push(makeLine([getTranslation('Move on if'), exitTypeToggle, exitCondToggle, exitSpinner]));
-    }
+    if (readExitDef(step).type !== 'off') lines.push({ kind: 'exit' });
 
     return lines;
+}
+
+// Every number in the script reads to one decimal — "93.0 °C", "2.0 sec",
+// "100.0 ml" — per the Figma. roundTo() collapses a whole number back to "93",
+// so these pills format with toFixed(1) instead of createSettingPill's default.
+function scriptValueFormat(unit) {
+    return (v) => {
+        const n = Number(v).toFixed(1);
+        return unit ? `${n} ${unit}` : n;
+    };
+}
+
+// ─── End pure script-line composition ──────────────────────────────────────
+
+// An inline cycling word — the prose counterpart of the CARDS tab's boxed
+// createCycleChip. Same `states`/`labelFor` contract and the same "every chip
+// cycles an execution field, so refresh SAVE AS NEW" bookkeeping; only the
+// presentation differs, since a 114×72 box cannot sit mid-sentence.
+function createScriptChip({ states, index, labelFor, onChange }) {
+    let i = index;
+    // A real <button>, like createCycleChip — it costs nothing inline (Tailwind
+    // preflight strips the native chrome and inherits the font) and carries
+    // keyboard activation and the button role for free.
+    const chip = document.createElement('button');
+    chip.type = 'button';
+    // Same py/-my hit-area expansion as createSettingPill's PILL_CLASS.
+    // inline-block + text-center: needed for the min-width reserved below to
+    // actually hold the box open, centered so a shorter label (e.g. "Mix"
+    // against "Group"'s reserved width) sits in the middle of its tap target
+    // instead of flush against one edge.
+    chip.className = 'text-[var(--action-label)] font-semibold cursor-pointer select-none px-[4px] py-[10px] -my-[10px] rounded-[4px] inline-block text-center';
+
+    function render() { chip.textContent = labelFor(states[i], i); }
+    render();
+
+    // Reserve width for the widest of this chip's own labels (e.g. "Group" vs
+    // "Mix") once it's actually mounted and has real fonts/layout to measure
+    // against -- otherwise cycling through states reflows every word after it
+    // on the same scriptBullet line. Deferred to the next frame since the
+    // caller (scriptBullet) hasn't appended this chip into the live DOM yet;
+    // the in-frame textContent swaps below never get painted.
+    requestAnimationFrame(() => {
+        if (!chip.isConnected) return;
+        const current = chip.textContent;
+        let maxWidth = 0;
+        for (let s = 0; s < states.length; s++) {
+            chip.textContent = labelFor(states[s], s);
+            maxWidth = Math.max(maxWidth, chip.getBoundingClientRect().width);
+        }
+        chip.textContent = current;
+        chip.style.minWidth = `${maxWidth}px`;
+    });
+
+    chip.addEventListener('click', () => {
+        i = (i + 1) % states.length;
+        render();
+        onChange(states[i], i);
+        updateSaveAsNewButtonState();
+    });
+    chip.addEventListener('mouseenter', () => { chip.style.backgroundColor = 'var(--button-grey)'; });
+    chip.addEventListener('mouseleave', () => { chip.style.backgroundColor = ''; });
+
+    return chip;
+}
+
+// One bullet. Children are plain strings (prose) or elements (chips, pills);
+// the inline-flex wrap keeps a long sentence inside the 756px text column
+// instead of overflowing it, which matters most in the longer languages.
+function scriptBullet(children) {
+    const li = document.createElement('li');
+    li.className = 'leading-[1.2] text-[24px] text-[var(--text-primary)]';
+    const line = document.createElement('span');
+    line.className = 'inline-flex flex-wrap items-baseline gap-[6px]';
+    for (const child of children) {
+        if (child == null || child === '') continue;
+        if (typeof child === 'string') {
+            const span = document.createElement('span');
+            span.className = 'select-none';
+            span.textContent = child;
+            line.appendChild(span);
+        } else {
+            line.appendChild(child);
+        }
+    }
+    li.appendChild(line);
+    return li;
+}
+
+// Turns one buildStepScript descriptor into its bullet. Every editable value
+// goes through createSettingPill (the editor's one numpad-backed inline value)
+// and every state word through createScriptChip, so this function only decides
+// wording and wiring — never how a control looks or clamps.
+function renderScriptLine(line, step, index) {
+    // A commit that only changes a number: write it, replot. Anything that
+    // can change the SHAPE of the script calls renderScriptTab() instead.
+    const write = (fn) => (val) => { fn(val); renderScriptGraph(); };
+
+    switch (line.kind) {
+        case 'volumeStart':
+            return scriptBullet([getTranslation('Start tracking water volume')]);
+
+        case 'temperature': {
+            const sensorChip = createScriptChip({
+                states: ['coffee', 'water'],
+                index: (step.sensor || 'coffee') === 'water' ? 1 : 0,
+                // Coffee/Water, the same two words the CARDS sensor chip uses —
+                // the design's raw "coffee" is the stored field value, not a
+                // label this app shows anywhere else.
+                labelFor: (s) => getTranslation(s === 'water' ? 'Water' : 'Coffee'),
+                onChange: (s) => { editorState.profile.steps[index].sensor = s; },
+            });
+            const lim = FIELD_LIMITS.temperature;
+            return scriptBullet([
+                getTranslation(line.verb),
+                sensorChip,
+                getTranslation('temperature'),
+                getTranslation(line.verb === 'Maintain' ? 'at' : 'to'),
+                createSettingPill({
+                    value: step.temperature ?? 93, min: lim.min, max: lim.max, step: lim.step,
+                    unit: '°C', fieldType: 'pe-temp', title: 'TEMPERATURE',
+                    format: scriptValueFormat('°C'),
+                    // The next step's verb is computed against this value, so
+                    // the whole script is rebuilt rather than just the graph.
+                    onCommit: (v) => { editorState.profile.steps[index].temperature = v; renderScriptTab(); },
+                }),
+            ]);
+        }
+
+        case 'pump': {
+            const lim  = line.isFlow ? FIELD_LIMITS.flow : FIELD_LIMITS.pressure;
+            const unit = line.isFlow ? 'mL/s' : 'bar';
+            const modeChip = createScriptChip({
+                states: PUMP_CYCLE_STATES,
+                index: pumpCycleIndex(line.isFlow ? 'flow' : 'pressure', step.transition || 'fast'),
+                labelFor: pumpChipLabel,
+                onChange: (state) => {
+                    const s = editorState.profile.steps[index];
+                    if (state.pump === 'pressure' && s.pump !== 'pressure') {
+                        s.pump = 'pressure';
+                        if (!s.pressure) s.pressure = PUMP_SEED_PRESSURE;
+                        delete s.flow;
+                    } else if (state.pump === 'flow' && s.pump === 'pressure') {
+                        s.pump = 'flow';
+                        if (!s.flow) s.flow = PUMP_SEED_FLOW;
+                        delete s.pressure;
+                    }
+                    s.transition = state.transition;
+                    // Unit, bounds and the limiter's axis all change with the
+                    // mode, and every pill on this step closed over the old
+                    // ones — rebuild rather than repaint.
+                    renderScriptTab();
+                },
+            });
+            return scriptBullet([
+                modeChip,
+                getTranslation(line.isFlow ? 'at a rate of' : 'to'),
+                createSettingPill({
+                    value: (line.isFlow ? step.flow : step.pressure) ?? 0,
+                    min: lim.min, max: lim.max, step: lim.step, unit,
+                    fieldType: 'pe-pump', title: line.isFlow ? 'FLOW' : 'PRESSURE',
+                    format: scriptValueFormat(unit),
+                    onCommit: write((v) => {
+                        if (line.isFlow) editorState.profile.steps[index].flow = v;
+                        else editorState.profile.steps[index].pressure = v;
+                    }),
+                }),
+            ]);
+        }
+
+        case 'limit': {
+            const lim  = line.isFlow ? FIELD_LIMITS.pressureLimit : FIELD_LIMITS.flowLimit;
+            const unit = line.isFlow ? 'bar' : 'mL/s';
+            return scriptBullet([
+                getTranslation('Limit to'),
+                createSettingPill({
+                    value: step.limiter?.value ?? 0,
+                    min: lim.min, max: lim.max, step: lim.step, unit,
+                    fieldType: 'pe-lim', title: line.isFlow ? 'PRESSURE LIMIT' : 'FLOW LIMIT',
+                    format: scriptValueFormat(unit),
+                    onCommit: (v) => {
+                        const s = editorState.profile.steps[index];
+                        if (!s.limiter) s.limiter = { value: v, range: newLimiterRange(s.pump) };
+                        else s.limiter.value = v;
+                        // Zeroing it retires the sentence entirely.
+                        renderScriptTab();
+                    },
+                }),
+            ]);
+        }
+
+        case 'maximum': {
+            const parts = [getTranslation('For a maximum of')];
+            line.keys.forEach((key, n) => {
+                if (n > 0) parts.push(getTranslation('or'));
+                const { unit } = SCRIPT_MAX_FIELDS.find((f) => f.key === key);
+                const lim = FIELD_LIMITS[key];
+                parts.push(createSettingPill({
+                    value: step[key] ?? 0, min: lim.min, max: lim.max, step: lim.step, unit,
+                    fieldType: MAX_NUMPAD[key].fieldType, title: MAX_NUMPAD[key].title,
+                    format: scriptValueFormat(unit),
+                    // Zeroing one drops it from the sentence, so the line's
+                    // shape — not just its numbers — can change here.
+                    onCommit: (v) => { editorState.profile.steps[index][key] = v; renderScriptTab(); },
+                }));
+            });
+            return scriptBullet(parts);
+        }
+
+        case 'exit': {
+            const exitDef = readExitDef(step);
+            const unit = EXIT_UNIT_MAP[exitDef.type];
+            const exitChip = createScriptChip({
+                // Off is deliberately dropped from the cycle here. This line
+                // only exists while the step HAS an exit, so landing on Off
+                // would delete the very control being tapped, halfway through
+                // its own cycle — CARDS keeps a permanent Move-on-if row, and
+                // that is where an exit gets switched off. The four remaining
+                // states keep their exitCycleIndex slots (Off is last).
+                states: EXIT_CYCLE_STATES.filter((s) => s.type !== 'off'),
+                index: exitCycleIndex(exitDef.type, exitDef.condition),
+                labelFor: exitChipLabel,
+                onChange: (state) => {
+                    // Same lossless swap as the CARDS exit chip: remember the
+                    // value being left behind, and restore it (never reseed a
+                    // 0) on the way back. A live "pressure is over 0 bar" exit
+                    // fires on essentially any pressure at all.
+                    rememberExitValue(step, exitDef.type, exitDef.value);
+                    editorState.profile.steps[index].exit = {
+                        type: state.type, condition: state.condition,
+                        value: recallExitValue(step, state.type),
+                    };
+                    // Bounds and unit are per-type, and the value pill closed
+                    // over the old ones — rebuild rather than repaint.
+                    renderScriptTab();
+                },
+            });
+            return scriptBullet([
+                getTranslation('Move on if'),
+                exitChip,
+                createSettingPill({
+                    value: exitDef.value, min: 0, max: EXIT_MAX_MAP[exitDef.type],
+                    step: EXIT_STEP_MAP[exitDef.type], unit,
+                    fieldType: 'pe-exit', title: `EXIT ${exitDef.type.toUpperCase()}`,
+                    format: scriptValueFormat(unit),
+                    onCommit: write((v) => {
+                        const s = editorState.profile.steps[index];
+                        if (!s.exit) s.exit = { type: exitDef.type, condition: exitDef.condition, value: v };
+                        else s.exit.value = v;
+                        rememberExitValue(step, exitDef.type, v);
+                    }),
+                }),
+            ]);
+        }
+
+        default:
+            return null;
+    }
 }
 
 // 'smooth' is the firmware's Interpolate frame flag (de1app binary.tcl:929):
@@ -1644,18 +2645,24 @@ export function pushChannel(xArr, yArr, startT, endT, prevVal, target, transitio
     yArr.push(transition === 'smooth' ? prevVal : target, target);
 }
 
-function renderReviewGraph() {
+function renderScriptGraph() {
+    // Every execution-field edit in the SCRIPT tab (renderScriptLine's chips —
+    // sensor, pump mode, transition, exit condition) reaches this function
+    // whichever tab is active, so it doubles as the catch-all for those raw
+    // toggles — unlike the plotting below, this must run even while another
+    // tab is showing, not just on re-entry to SCRIPT.
+    updateSaveAsNewButtonState();
     // The panel stays in the DOM when hidden, so every grid edit used to replot
     // into a zero-size container. setActiveTab(2) re-renders on entry, so
     // skipping the work while another tab is up loses nothing.
     if (editorState.activeTab !== 2) return;
     const profile = editorState.profile;
-    const graphDiv = document.getElementById('review-graph');
+    const graphDiv = document.getElementById('script-graph');
     if (!graphDiv) return;
 
     const isDark = (localStorage.getItem('theme') || 'light') === 'dark';
     const stepMarkerColor = isDark ? '#7f8bbb' : '#7c7c7c';
-    const tempLineColor = isDark ? '#AE6D73' : '#ff97a1';
+    const tempLineColor = isDark ? '#653F43' : '#ff97a1';
 
     // Build step-target traces + step boundary markers
     const pressureX = [], pressureY = [], flowX = [], flowY = [], tempX = [], tempY = [];
@@ -1702,22 +2709,28 @@ function renderReviewGraph() {
         t = endT;
     }
 
+    // smooth: true rounds the frame-to-frame corners into a shot-like curve \u2014
+    // this is a preview plot of the target profile, not the live/history shot
+    // trace, so it doesn't need to stay exact point-for-point.
+    const pressureLineColor = isDark ? '#00B087' : '#17c29a';
     const traces = [
-        { x: pressureX, y: pressureY, name: 'Pressure', mode: 'lines', line: { color: '#17c29a' }, hoverinfo: 'name' },
-        { x: flowX,     y: flowY,     name: 'Flow',     mode: 'lines', line: { color: '#0358cf' }, hoverinfo: 'name' },
-        { x: tempX,     y: tempY,     name: '\u00b0C',  mode: 'lines', line: { color: tempLineColor }, hoverinfo: 'name' },
+        { x: pressureX, y: pressureY, name: 'Pressure', mode: 'lines', line: { color: pressureLineColor, smooth: true }, hoverinfo: 'name' },
+        { x: flowX,     y: flowY,     name: 'Flow',     mode: 'lines', line: { color: '#0358cf', smooth: true }, hoverinfo: 'name' },
+        { x: tempX,     y: tempY,     name: '\u00b0C',  mode: 'lines', line: { color: tempLineColor, smooth: true }, hoverinfo: 'name' },
     ];
 
+    const cardColor = getComputedStyle(document.documentElement).getPropertyValue('--card-bg').trim() || '#101217';
+    const gridColor = getComputedStyle(document.documentElement).getPropertyValue('--border-graph-grid').trim() || (isDark ? '#1E202B' : '#E8E8E8');
     const layout = isDark ? {
-        plot_bgcolor: '#0d0e14',
-        paper_bgcolor: '#0d0e14',
+        plot_bgcolor: cardColor,
+        paper_bgcolor: cardColor,
         font: { color: '#606579', size: 16 },
         autosize: true,
         margin: { l: 50, r: 50, t: 20, b: 40, pad: 0 },
         showlegend: false,
         shapes: stepShapes,
-        xaxis: { gridcolor: '#3D4255', linecolor: '#606579', tickcolor: '#606579', fixedrange: true },
-        yaxis: { gridcolor: '#3D4255', linecolor: '#606579', tickcolor: '#606579', range: [0, 10], dtick: 1, fixedrange: true },
+        xaxis: { gridcolor: gridColor, linecolor: '#606579', tickcolor: '#606579', fixedrange: true },
+        yaxis: { gridcolor: gridColor, linecolor: '#606579', tickcolor: '#606579', range: [0, 10], dtick: 1, fixedrange: true },
     } : {
         plot_bgcolor: 'white',
         paper_bgcolor: 'white',
@@ -1726,8 +2739,8 @@ function renderReviewGraph() {
         margin: { l: 50, r: 50, t: 20, b: 40, pad: 0 },
         showlegend: false,
         shapes: stepShapes,
-        xaxis: { gridcolor: '#E0E0E0', linecolor: '#959595', tickcolor: '#959595', fixedrange: true },
-        yaxis: { gridcolor: '#E0E0E0', linecolor: '#959595', tickcolor: '#959595', range: [0, 10], dtick: 1, fixedrange: true },
+        xaxis: { gridcolor: gridColor, linecolor: '#959595', tickcolor: '#959595', fixedrange: true },
+        yaxis: { gridcolor: gridColor, linecolor: '#959595', tickcolor: '#959595', range: [0, 10], dtick: 1, fixedrange: true },
     };
 
     void loadECharts().then(echarts => {
@@ -1735,133 +2748,56 @@ function renderReviewGraph() {
     });
 }
 
-function renderReviewTab() {
-    // Collapse any open review spinner since DOM is being rebuilt
-
+function renderScriptTab() {
+    const container = document.getElementById('script-steps-col');
     const profile = editorState.profile;
-    if (!profile) return;
+    if (!container || !profile) return;
+    container.innerHTML = '';
+    // Attach once: the container is never recreated (only its innerHTML is
+    // cleared above), just re-rendered every time this function runs.
+    initScrollThumb('script-steps-col', 'script-steps-col-thumb');
 
-    // ── Steps list ──────────────────────────────────────────────────────────
-    const stepsList = document.getElementById('review-steps-list');
-    if (stepsList) {
-        stepsList.innerHTML = '';
-        const steps = profile.steps || [];
-        const half = Math.ceil(steps.length / 2);
+    const steps = profile.steps || [];
 
-        const leftCol = document.createElement('div');
-        leftCol.className = 'flex flex-col gap-[20px] flex-1';
-        const rightCol = document.createElement('div');
-        rightCol.className = 'flex flex-col gap-[20px] flex-1';
-
-        steps.forEach((step, i) => {
-            const row = document.createElement('div');
-            row.className = 'flex flex-col gap-[6px] text-[var(--text-primary)]';
-
-            const nameRow = document.createElement('div');
-            nameRow.className = 'flex items-center justify-between';
-
-            const nameEl = document.createElement('p');
-            nameEl.className = 'font-semibold text-[20px] leading-[1.3]';
-            nameEl.textContent = `${i + 1}: ${step.name || 'Step'}`;
-
-            const nameActions = document.createElement('div');
-            nameActions.className = 'flex items-center gap-[4px]';
-
-            const reviewDeleteBtn = document.createElement('button');
-            reviewDeleteBtn.type = 'button';
-            reviewDeleteBtn.className = 'pe-step-action-btn w-[36px] h-[36px] flex items-center justify-center text-[var(--mimoja-blue-v2)] hover:bg-[var(--button-grey)] rounded-[10px] cursor-pointer';
-            reviewDeleteBtn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>';
-            reviewDeleteBtn.setAttribute('aria-label', 'Delete step');
-            reviewDeleteBtn.addEventListener('click', async () => {
-                if (!await confirmDeleteStep(i)) return;
-                removeStepAt(i);
-                renderReviewTab();
-            });
-
-            const reviewInsertBtn = document.createElement('button');
-            reviewInsertBtn.type = 'button';
-            reviewInsertBtn.className = 'pe-step-action-btn w-[36px] h-[36px] flex items-center justify-center text-[var(--mimoja-blue)] hover:bg-[var(--button-grey)] rounded-[10px] cursor-pointer';
-            reviewInsertBtn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" /></svg>';
-            reviewInsertBtn.setAttribute('aria-label', 'Insert step after');
-            reviewInsertBtn.addEventListener('click', () => {
-                insertStepAfter(i);
-                renderReviewTab();
-            });
-
-            nameActions.appendChild(makeMoveBtn(i, -1, steps.length, renderReviewTab, false));
-            nameActions.appendChild(reviewDeleteBtn);
-            nameActions.appendChild(reviewInsertBtn);
-            nameActions.appendChild(makeMoveBtn(i, +1, steps.length, renderReviewTab, false));
-            nameRow.appendChild(nameEl);
-            nameRow.appendChild(nameActions);
-            row.appendChild(nameRow);
-
-            const bulletCol = document.createElement('ul');
-            bulletCol.className = 'flex flex-col gap-[6px] list-disc list-inside text-[20px]';
-            for (const lineEl of describeStep(step, i)) {
-                const li = document.createElement('li');
-                li.appendChild(lineEl);
-                bulletCol.appendChild(li);
-            }
-            row.appendChild(bulletCol);
-            (i < half ? leftCol : rightCol).appendChild(row);
-        });
-
-        stepsList.appendChild(leftCol);
-        stepsList.appendChild(rightCol);
-    }
-
-    // ── Settings list ───────────────────────────────────────────────────────
-    const settingsList = document.getElementById('review-settings-list');
-    if (settingsList) {
-        settingsList.innerHTML = '';
-        const s = (label, val) => {
-            const li = document.createElement('li');
-            li.innerHTML = `${label} <span class="font-semibold text-[var(--button-primary-bg)]">${val}</span>`;
-            settingsList.appendChild(li);
-        };
-        const appendRow = (label, pillEl) => {
-            const li = document.createElement('li');
-            li.append(`${label} `);
-            li.appendChild(pillEl);
-            settingsList.appendChild(li);
-        };
-
-        if (profile.tank_temperature != null) {
-            appendRow(getTranslation('Preheat water tank'), createSettingPill({
-                value: profile.tank_temperature, step: 1, unit: '\u00b0C', min: 0, max: 110,
-                fieldType: 'pe-tank-temp', title: 'TANK TEMPERATURE',
-                onCommit: (v) => { editorState.profile.tank_temperature = v; }
-            }));
+    steps.forEach((step, i) => {
+        // Hairline between steps, drawn between rows rather than as a border on
+        // them, so the first row does not open with a rule and the last does
+        // not close with one (Figma 1008 wide at 0.75).
+        if (i > 0) {
+            const rule = document.createElement('div');
+            rule.className = 'w-[756px] h-0 border-t-[1.5px] border-[var(--border-graph-grid)] shrink-0';
+            container.appendChild(rule);
         }
-        if (profile.target_volume_count_start != null) {
-            const steps = profile.steps || [];
-            appendRow(getTranslation('Track water volume after step'), createSettingPill({
-                value: profile.target_volume_count_start, step: 1, unit: '', min: 0, max: Math.max(steps.length, 1),
-                fieldType: 'pe-vol-count-start', title: 'STEP NUMBER',
-                format: (v) => `${Math.round(v)}`,
-                onCommit: (v) => { editorState.profile.target_volume_count_start = Math.round(v); }
-            }));
-        }
-        if (profile.target_weight != null && profile.target_weight > 0) {
-            appendRow(getTranslation('Stop at weight'), createSettingPill({
-                value: profile.target_weight, step: 0.1, unit: 'g', min: 0, max: 1000,
-                fieldType: 'pe-target-weight', title: 'TARGET WEIGHT',
-                onCommit: (v) => { editorState.profile.target_weight = v; }
-            }));
-        }
-        if (profile.target_volume != null && profile.target_volume > 0) {
-            appendRow(getTranslation('Stop at volume'), createSettingPill({
-                value: profile.target_volume, step: 1, unit: 'ml', min: 0, max: 1000,
-                fieldType: 'pe-target-volume', title: 'TARGET VOLUME',
-                onCommit: (v) => { editorState.profile.target_volume = v; }
-            }));
-        }
-        if (profile.beverage_type) s(getTranslation('Beverage type'), profile.beverage_type);
-    }
 
-    // ── Graph preview ───────────────────────────────────────────────────────
-    renderReviewGraph();
+        const row = document.createElement('div');
+        row.className = 'flex gap-[15px] w-[756px] shrink-0';
+
+        // Fixed 225px name column (Figma 300) so every step's bullets start on
+        // the same left edge regardless of how long its name is.
+        const nameEl = document.createElement('p');
+        nameEl.className = 'w-[225px] shrink-0 text-[24px] font-semibold leading-[1.2] text-[var(--text-primary)] break-words';
+        // Step names are user input; textContent keeps them text.
+        nameEl.textContent = `${i + 1}: ${step.name || getTranslation('Step')}`;
+        row.appendChild(nameEl);
+
+        const bullets = document.createElement('ul');
+        bullets.className = 'flex-1 min-w-0 flex flex-col gap-[18px] list-disc pl-[36px]';
+        const prevStep = i > 0 ? steps[i - 1] : null;
+        for (const line of buildStepScript(step, i, profile, prevStep)) {
+            const li = renderScriptLine(line, step, i);
+            if (li) bullets.appendChild(li);
+        }
+        row.appendChild(bullets);
+
+        container.appendChild(row);
+    });
+
+    renderScriptGraph();
+    // Content height just changed (possibly for the first time this tab has
+    // ever been shown), so the thumb's visibility/size/position needs a
+    // fresh read of the now-final scrollHeight rather than whatever it was
+    // left at from a previous render.
+    updateScrollThumb('script-steps-col', 'script-steps-col-thumb');
 }
 
 // ─── Tab Management ─────────────────────────────────────────────────────────
@@ -1873,11 +2809,16 @@ function setActiveTab(tabIndex) {
     document.querySelectorAll('.editor-tab-btn').forEach((btn) => {
         const idx = parseInt(btn.dataset.tab, 10);
         if (idx === tabIndex) {
-            btn.className = 'editor-tab-btn font-bold px-[28px] h-[44px] rounded-[44px] transition-colors text-[20px] tracking-wide uppercase bg-[var(--button-primary-bg)] text-white';
+            btn.className = 'editor-tab-btn font-bold w-[251.25px] h-[75px] rounded-[45px] transition-colors text-[30px] tracking-[2.25px] whitespace-nowrap bg-[var(--button-primary-bg)] text-[var(--button-primary-text)]';
         } else {
-            btn.className = 'editor-tab-btn font-bold px-[28px] h-[44px] rounded-[44px] transition-colors text-[20px] tracking-wide uppercase text-[var(--button-primary-bg)] bg-transparent';
+            btn.className = 'editor-tab-btn font-bold w-[251.25px] h-[75px] rounded-[45px] transition-colors text-[30px] tracking-[2.25px] whitespace-nowrap text-[var(--tab-text-inactive)] bg-transparent';
         }
+        fitTextToWidth(btn);
     });
+
+    // Paging controls only make sense on the CARDS tab.
+    const pagingControls = document.getElementById('editor-paging-controls');
+    if (pagingControls) pagingControls.classList.toggle('hidden', tabIndex !== 0);
 
     // Show/hide panels
     for (let i = 0; i < TAB_COUNT; i++) {
@@ -1893,7 +2834,7 @@ function setActiveTab(tabIndex) {
     // next ± tap — silently reverting edits made in another tab.
     if (tabIndex === 0) renderStepCards();
     else if (tabIndex === 1) renderSettingsTab();
-    else if (tabIndex === 2) renderReviewTab();
+    else if (tabIndex === 2) renderScriptTab();
 }
 
 // ─── Title Editing ──────────────────────────────────────────────────────────
@@ -1920,6 +2861,7 @@ function initTitleEditing() {
         }
         input.classList.add('hidden');
         display.classList.remove('hidden');
+        updateSaveAsNewButtonState();
     }
 
     display.addEventListener('click', startEditing);
@@ -1947,11 +2889,36 @@ function executionChanged(orig, edited) {
 
 // Shared tail of a successful save (including the no-op "nothing changed"
 // case, which reports success without writing anything): hint the selector to
-// pre-select this profile, toast, and navigate back.
+// pre-select this profile, toast, and go to the main page.
+//
+// Saving ends the errand, so it lands on the dashboard rather than back on
+// whatever opened the editor -- a selector the user is done with, or a context
+// menu they only passed through. Cancel still returns to _returnUrl: an
+// abandoned edit leaves the user where they were.
 function finishSaveSuccess(id) {
     sessionStorage.setItem('lastEditedProfileKey', id);
     showToast(getTranslation('Saved profile'), 2000, 'success');
-    setTimeout(() => { loadPage('src/profiles/profile_selector.html'); }, 1000);
+    setTimeout(() => { loadPage('index.html'); }, 1000);
+}
+
+// A save writes to /profiles, which is the library. The machine keeps running
+// whatever updateWorkflow last sent it, so an edit to the profile currently
+// loaded stayed invisible on the machine until the user re-picked it in the
+// selector. Push it here instead: saving loads the profile.
+//
+// sendProfileRecordToMachine holds it instead of sending when the machine is
+// mid-shot -- see profile-send-gate.js for why writing then is unsafe -- and
+// app.js sends what was held once the shot ends.
+async function pushSavedProfileToMachine(saved) {
+    if (!saved?.profile) return;
+    const { sendProfileRecordToMachine } = await import('./profileManager.js');
+    const result = await sendProfileRecordToMachine(saved);
+    if (result === 'deferred') {
+        showToast(getTranslation('The machine is brewing — this profile loads when the shot ends.'), 4000, 'info');
+    }
+    // 'failed' is logged by the send itself. The save succeeded and the machine
+    // simply stays on the previous profile, which is what happened before this
+    // existed -- not worth turning a good save into a failed one.
 }
 
 // Save routing for a profile opened from a local-only draft (see
@@ -1988,6 +2955,7 @@ async function saveDraftEdit(draftRecord) {
             });
             editorState.sourceProfileRecord = updated;
             _baselineProfileJson = JSON.stringify(editorState.profile);
+            await pushSavedProfileToMachine(updated);
             finishSaveSuccess(updated.id);
             return;
         }
@@ -2032,6 +3000,7 @@ async function saveDraftEdit(draftRecord) {
         editorState.sourceProfileId = saved.id;
         _baselineProfileJson = JSON.stringify(editorState.profile);
 
+        await pushSavedProfileToMachine(saved);
         finishSaveSuccess(saved.id);
     } catch (err) {
         console.error('Draft save failed:', err);
@@ -2039,7 +3008,114 @@ async function saveDraftEdit(draftRecord) {
     }
 }
 
-async function saveProfile() {
+// A brand-new profile arrives as a stub record carrying id null (see the Add
+// Profile handler in profile_selector.js), so "is there a source profile"
+// keys off the id, not record truthiness — the stub itself is always set.
+// Shared by saveProfile (PUT-vs-POST routing) and the SAVE AS NEW button's
+// enabled state, so the two definitions of "no source" can't drift apart.
+function currentSaveSource() {
+    return editorState.sourceProfileRecord?.id ? editorState.sourceProfileRecord : null;
+}
+
+// Whether the editor's current profile differs from the source in any
+// execution field (steps, beverage_type, tank_temperature, target_weight,
+// target_volume, … — see rest_v1.yml's content-hash inputs; title/author/
+// notes are a separate metadata hash and never count). Shared by saveProfile's
+// routing and the SAVE AS NEW button's enabled state so the two can't drift —
+// the same reason currentSaveSource() above is shared rather than each caller
+// re-deriving "is there a source" its own way.
+function currentExecChanged() {
+    const src = currentSaveSource();
+    if (!src?.profile) return true;
+    const sourceProfile = normalizeLegacySteps(deepCopy(src.profile));
+    return executionChanged(sourceProfile, editorState.profile);
+}
+
+// SAVE AS NEW only makes sense once an execution field has actually changed —
+// resolveSaveTarget below returns 'blocked' for asNew && !execChanged, because
+// a rename-only POST dedups back to the source by content hash (title isn't
+// part of that hash). Gating on the title instead — as this used to — enabled
+// the button in exactly the state where it could never succeed. This has to
+// be re-evaluated on every execution-field edit, not just a title edit: see
+// the updateSaveAsNewButtonState() calls threaded through createGridStepper,
+// createCycleChip, createScriptChip, createSettingPill, createSpinner,
+// renderStepCards and renderScriptGraph.
+function updateSaveAsNewButtonState() {
+    const btn = document.getElementById('editor-save-as-btn');
+    if (!btn || !editorState.profile) return;
+    const src = currentSaveSource();
+    const enabled = !src || currentExecChanged();
+    btn.classList.toggle('opacity-40', !enabled);
+    btn.classList.toggle('pointer-events-none', !enabled);
+    btn.setAttribute('aria-disabled', String(!enabled));
+}
+
+// ─── Save routing (pure) ────────────────────────────────────────────────────
+// SAVE (asNew=false) and SAVE AS NEW (asNew=true) are the explicit choice —
+// routing no longer infers "fork vs overwrite" from titleChanged, since that
+// left the one case the buttons exist for (title changed) with no way to
+// choose between them.
+//
+// 'put'     — updateProfile(src.id, …): same id, in place. Only reachable
+//             with a source, no execution change, not a default, not asNew —
+//             a presentation-only change (rename included) is always safe to
+//             PUT because PUT never hashes/dedups by content.
+// 'post'    — uploadProfileWithParent(…): mints a record via POST. Covers
+//             three different call sites in saveProfile (forced default fork,
+//             an explicit Save As New, and a plain overwrite's hide+replace
+//             dance) — which one is decided there from the same inputs.
+// 'blocked' — neither is possible: a default with no execution change (PUT is
+//             rejected server-side, and POST would dedup by content hash back
+//             to the same default, silently dropping the rename), or an
+//             explicit Save As New with no execution change (POST would
+//             dedup back to the *source* record for the same reason — title
+//             isn't part of a record's content hash).
+function resolveSaveTarget({ hasSource, isDefault, execChanged, titleChanged, asNew }) {
+    if (!hasSource) return 'post';
+    if (!execChanged) return (isDefault || asNew) ? 'blocked' : 'put';
+    // execChanged is true from here: every branch mints a record via POST —
+    // a forced default fork, an explicit Save As New, or a plain SAVE's
+    // hide+replace overwrite. Which of the three is decided in saveProfile
+    // from the same isDefault/asNew inputs; titleChanged plays no part here.
+    return 'post';
+}
+
+// Which title actually gets saved, and whether it needs an auto-suffix to
+// avoid colliding with another profile.
+//
+// `existingTitles` is every OTHER profile's title — the caller has already
+// excluded the source by id, because for a PUT/overwrite that's exactly
+// right (the source is the record being kept, not a collision candidate).
+// A real fork is different: it mints a second record, so if the title was
+// left unchanged that second record collides with its own still-visible
+// parent — this adds sourceTitle back in for exactly that case.
+//
+//  - PUT (in place), or SAVE's hide+replace overwrite: the same profile kept
+//    under whatever title it now has — no collision check at all, even if
+//    that title happens to match something else. A bundled default's fork is
+//    one of these: plain SAVE retires the bundled record (hidden, restorable
+//    from Revert and from the selector's hidden view), so the edit inherits
+//    the name the user knows instead of becoming "… (2)" beside an untouched
+//    original that every title lookup and old favorite still points at.
+//  - Everything else that mints a record (Save As New, or a brand-new/
+//    uploaded profile) must not silently share a title with its own source,
+//    which stays visible alongside it.
+function resolveFinalTitle({ title, existingTitles, sourceId, sourceTitle, asNew, target }) {
+    const trimmed = title.trim();
+    // The no-source case (a brand-new profile, or an uploaded file) is never
+    // "in place" — sourceId gates it explicitly so it still collision-checks
+    // against existingTitles, same as before this function existed.
+    const isInPlace = !!sourceId && (target === 'put' || (target === 'post' && !asNew));
+    if (isInPlace) return trimmed;
+
+    const collisionTitles = (sourceId && sourceTitle) ? new Set([...existingTitles, sourceTitle]) : existingTitles;
+    if (!collisionTitles.has(trimmed)) return trimmed;
+    let n = 2;
+    while (collisionTitles.has(`${trimmed} (${n})`)) n++;
+    return `${trimmed} (${n})`;
+}
+
+async function saveProfile({ asNew = false } = {}) {
     if (!editorState.profile.title?.trim()) {
         showToast(getTranslation('Invalid name'), 3000, 'error');
         return;
@@ -2053,16 +3129,11 @@ async function saveProfile() {
         const { updateProfile, uploadProfileWithParent, updateProfileVisibility } = await import('./api.js');
         const { availableProfiles, remapFavorite } = await import('./profileManager.js');
 
-        // Overwrite-in-place is the default: editing an existing user profile and
-        // keeping its title updates the same record (no "(2)" cruft on a
-        // draft→test→tweak loop). Renaming via the inline title editor is the
-        // explicit save-as — titleChanged below routes it to a new record.
-        //
-        // A brand-new profile arrives as a stub record carrying id null (see the
-        // Add Profile handler in profile_selector.js), so key off the id, not the
-        // record: with the stub as `src` the no-op guard below saw the untouched
-        // defaults as "unchanged" and silently dropped the whole profile.
-        const src = editorState.sourceProfileRecord?.id ? editorState.sourceProfileRecord : null;
+        // Overwrite-in-place is the default (SAVE): editing an existing user
+        // profile updates the same record, whatever the title says (no "(2)"
+        // cruft on a draft→test→tweak loop, and no surprise fork from a typo
+        // fix). SAVE AS NEW (asNew=true) is the explicit save-as instead.
+        const src = currentSaveSource();
 
         // Editing a local-only draft (see profileManager.js duplicateProfileAsDraft
         // / createOrUpdateDraft) follows a completely separate routing: it only
@@ -2093,6 +3164,10 @@ async function saveProfile() {
         // An uploaded file also has no source record and also resets the
         // baseline, but saving it verbatim is the whole point of uploading —
         // _hasImportedInSession excludes it from the template check.
+        // Either way stay on the editor rather than bouncing to the selector: the
+        // user pressed Save meaning to keep something, and navigating away reads
+        // as success. The toast names the way forward — renaming and pressing
+        // SAVE AS NEW is the save-as route, which does mint a record.
         const editedJson = JSON.stringify(editorState.profile);
         if (sourceProfileJson) {
             if (sourceProfileJson === editedJson) {
@@ -2104,30 +3179,51 @@ async function saveProfile() {
             return;
         }
 
-        // Title change at save = user intent to save as a brand-new profile.
         const sourceTitle = (src?.profile?.title || '').trim();
         const currentTitle = editorState.profile.title.trim();
         const titleChanged = sourceTitle && currentTitle !== sourceTitle;
 
-        // Both sides normalised (see above), so a legacy field the editor drops
-        // on load can't masquerade as an execution change and fork the profile.
-        const execChanged = !src || executionChanged(sourceProfile, editorState.profile);
+        // Shared with the SAVE AS NEW button's enabled state (currentExecChanged)
+        // so the two can't drift. Both sides are normalised there the same way
+        // sourceProfile is above, so a legacy field the editor drops on load
+        // can't masquerade as an execution change and fork the profile.
+        const execChanged = currentExecChanged();
 
-        // Auto-suffix title only when minting a NEW record (a save-as, a fresh
-        // profile, or a default forked on execution change). An in-place PUT can
-        // keep its own title, so exclude self from the collision set.
-        const willCreateNew = !src || titleChanged || (src.isDefault && execChanged);
+        const target = resolveSaveTarget({
+            hasSource: !!src,
+            isDefault: !!src?.isDefault,
+            execChanged,
+            titleChanged,
+            asNew,
+        });
+
+        // Neither PUT nor POST can honor this save — say so instead of
+        // pretending it stuck (PUT is rejected for defaults; POST would dedup
+        // by content hash and silently drop the rename either way).
+        if (target === 'blocked') {
+            showToast(getTranslation('Change a setting to save a copy'), 3500, 'info');
+            return;
+        }
+
+        // existingTitles excludes the source itself — resolveFinalTitle below
+        // decides whether to add it back in (a real fork must collide with
+        // its own parent; an in-place PUT or overwrite is exempt because it's
+        // the same profile, not a second one).
         const existingTitles = new Set(
             Object.values(availableProfiles)
                 .filter(r => r.id !== src?.id)
                 .map(r => r.profile?.title)
                 .filter(Boolean)
         );
-        let finalTitle = editorState.profile.title.trim();
-        if (willCreateNew && existingTitles.has(finalTitle)) {
-            let n = 2;
-            while (existingTitles.has(`${finalTitle} (${n})`)) n++;
-            finalTitle = `${finalTitle} (${n})`;
+        const finalTitle = resolveFinalTitle({
+            title: editorState.profile.title,
+            existingTitles,
+            sourceId: src?.id ?? null,
+            sourceTitle: src?.profile?.title ?? null,
+            asNew,
+            target,
+        });
+        if (finalTitle !== editorState.profile.title.trim()) {
             editorState.profile.title = finalTitle;
             const titleDisplay = document.getElementById('editor-title-display');
             if (titleDisplay) titleDisplay.textContent = finalTitle;
@@ -2175,23 +3271,48 @@ async function saveProfile() {
         //    presentation-only change (rename included) or rehashes it (deleting
         //    the old) on a user execution change.
         let saved;
-        if (src?.isDefault && execChanged) {
-            saved = await uploadProfileWithParent(editorState.profile, src.id);
-            if (forkDeduped(saved, src.id)) {
-                showToast(getTranslation('This change matches an existing profile — nothing new was saved'), 4000, 'info');
-                return;
-            }
-        } else if (!src || (titleChanged && execChanged)) {
+        // Set by the hide+replace branch below: the source record is retired,
+        // so its id is dead and anything keyed by it (favorites, wakeProfileId,
+        // the KV override record) belongs to the new id instead.
+        let retiredSource = false;
+        if (target === 'put') {
+            // Presentation-only change (title/author/notes, no execution
+            // change), not a default, not an explicit Save As New — same id,
+            // PUT in place. Renaming a user profile with plain SAVE lands here.
+            saved = await updateProfile(src.id, editorState.profile);
+        } else if (!src || asNew) {
+            // New profile / uploaded file, or an explicit Save As New with a
+            // real execution change: a plain POST. src?.id links provenance
+            // (getProfileLineage) but the source's visibility is never
+            // touched — Save As New leaves the original completely untouched.
             saved = await uploadProfileWithParent(editorState.profile, src?.id ?? null);
             if (forkDeduped(saved, src?.id ?? null)) {
                 showToast(getTranslation('This change matches an existing profile — nothing new was saved'), 4000, 'info');
                 return;
             }
-        } else if (execChanged) {
-            // Overwrite of an existing user profile: keep the prior version as a
-            // hidden, restorable snapshot instead of letting the server drop it on
-            // rehash. The new record links back via parentId, so /lineage returns
-            // the full history the Revert picker reads.
+        } else {
+            // Plain SAVE overwriting the source with a real execution change,
+            // whether that source is one of the user's own profiles or a
+            // bundled default: the content rehashes to a new id, so keep the
+            // prior version as a hidden, restorable snapshot instead of
+            // letting the server drop it on rehash. The new record links back
+            // via parentId, so /lineage returns the full history the Revert
+            // picker reads.
+            //
+            // A default takes the same route for a different reason: Decaid
+            // refuses content edits on a bundled record outright
+            // (ProfileController.update, 'Cannot modify default profile
+            // content'), so forking is the only way to edit one at all. It
+            // used to stop there and leave the bundled record visible, which
+            // meant the edit landed as "… (2)" while the original kept the
+            // familiar name, every title lookup, and any favorite pointing at
+            // it — so the user's own button put the pre-edit profile back on
+            // the machine (streamline.js#171). Retiring it is safe and
+            // reversible: setVisibility accepts 'hidden' for a default (only
+            // 'deleted' is refused), a hidden default survives Decaid's boot
+            // re-seed untouched, /lineage ignores visibility so Revert still
+            // offers it, and the selector's hidden view can restore it.
+            retiredSource = true;
             saved = await uploadProfileWithParent(editorState.profile, src.id);
             // A dedup here would return src itself — flipping it visible then
             // straight back to hidden a few lines down and erasing the user's
@@ -2205,26 +3326,51 @@ async function saveProfile() {
                 saved = await updateProfileVisibility(saved.id, 'visible');
             }
             try { await updateProfileVisibility(src.id, 'hidden'); } catch (_) {}
-        } else {
-            // Presentation-only change (title/author/notes, no execution change)
-            // → same id, PUT in place. Renaming a user profile lands here.
-            saved = await updateProfile(src.id, editorState.profile);
         }
 
         const oldId = editorState.sourceProfileId;
         availableProfiles[saved.id] = saved;
 
-        // Only an in-place user PUT replaces the old hash — follow the favorite then.
-        if (oldId && oldId !== saved.id && !src?.isDefault && !titleChanged) {
+        // The retired id is dead: drop it from the list and repoint the
+        // favorite slots and wakeProfileId at the edit, or the user's own
+        // button keeps loading the PRE-EDIT content it still names.
+        if (retiredSource && oldId && oldId !== saved.id) {
             delete availableProfiles[oldId];
             await remapFavorite(oldId, saved.id);
+        }
+
+        // A rehash mints a new id, and the overrides (dose/yield/grind/brew-
+        // temp/steam/flow calibration) are keyed by the old one. Move them, or
+        // the edited profile silently loses numbers the user set — including
+        // the flow calibration they may have just typed on this tab.
+        //
+        // Only on the overwrite path, where the new record IS the old profile
+        // under a new hash. Save As New mints a deliberately separate profile
+        // and its source keeps its own numbers, so it starts from the profile's
+        // baked-in defaults and the last values set anywhere, like any other
+        // profile the user has never dialled in.
+        if (retiredSource && oldId && oldId !== saved.id) {
+            await ensureProfileOverridesLoaded();
+            const carried = getProfileOverride(oldId);
+            if (carried) {
+                const merged = await saveProfileOverride(saved.id, carried);
+                saved.metadata = { ...(saved.metadata || {}), ...merged };
+                // The old id will never be loaded again, so its copy is dead
+                // weight in the synchronized KV record — one stale entry per
+                // edit, forever. A later Revert to this version re-carries the
+                // numbers forward from whatever is current, so nothing the user
+                // can reach loses a value.
+                await clearProfileOverride(oldId);
+            }
         }
 
         // Rebind editor to the saved record so repeat saves update in place.
         editorState.sourceProfileRecord = saved;
         editorState.sourceProfileId = saved.id;
         _baselineProfileJson = JSON.stringify(editorState.profile);
+        updateSaveAsNewButtonState();
 
+        await pushSavedProfileToMachine(saved);
         finishSaveSuccess(saved.id);
     } catch (err) {
         console.error('Profile save failed:', err);
@@ -2248,7 +3394,7 @@ function promptConfirm({ title, message, confirmLabel, cancelLabel }) {
                 <p class="text-[20px] text-[var(--text-primary)]">${message}</p>
                 <div class="flex flex-wrap justify-end gap-[12px] mt-[8px]">
                     <button type="button" data-act="cancel" class="px-[18px] py-[10px] rounded-[10px] bg-[var(--button-grey)] text-[var(--text-primary)] text-[20px] font-semibold cursor-pointer">${cancelLabel}</button>
-                    <button type="button" data-act="ok" class="px-[18px] py-[10px] rounded-[10px] bg-[var(--mimoja-blue)] text-white text-[20px] font-semibold cursor-pointer">${confirmLabel}</button>
+                    <button type="button" data-act="ok" class="px-[18px] py-[10px] rounded-[10px] bg-[var(--button-primary-bg)] text-white text-[20px] font-semibold cursor-pointer">${confirmLabel}</button>
                 </div>
             </div>`;
 
@@ -2306,7 +3452,7 @@ async function cancelEditor() {
             }
         } catch (_) {}
     }
-    loadPage('index.html');
+    loadPage(_returnUrl);
 }
 
 
@@ -2337,8 +3483,8 @@ function normalizeLegacySteps(profile) {
 function promptVersionRestore(versions) {
     return new Promise((resolve) => {
         const ROW_BASE     = 'text-left px-[16px] py-[14px] rounded-[10px] border-2 bg-[var(--box-color)] cursor-pointer';
-        const ROW_IDLE     = `${ROW_BASE} border-[var(--border-color)] hover:border-[var(--mimoja-blue)]`;
-        const ROW_SELECTED = `${ROW_BASE} border-[var(--mimoja-blue)]`;
+        const ROW_IDLE     = `${ROW_BASE} border-[var(--border-color)] hover:border-[var(--mimoja-blue-v2)]`;
+        const ROW_SELECTED = `${ROW_BASE} border-[var(--mimoja-blue-v2)]`;
 
         const dlg = document.createElement('dialog');
         dlg.className = 'pe-history-dialog rounded-[16px] bg-[var(--box-color)] p-0 border border-[var(--border-color)] max-w-[560px] w-[90vw] shadow-2xl';
@@ -2351,7 +3497,7 @@ function promptVersionRestore(versions) {
                 <div data-rows class="flex flex-col gap-[10px] max-h-[46vh] overflow-y-auto"></div>
                 <div class="flex flex-wrap justify-end gap-[12px] mt-[8px]">
                     <button type="button" data-act="cancel" class="px-[18px] py-[10px] rounded-[10px] bg-[var(--button-grey)] text-[var(--text-primary)] text-[20px] font-semibold cursor-pointer">${getTranslation('Cancel')}</button>
-                    <button type="button" data-act="ok" class="hidden px-[18px] py-[10px] rounded-[10px] bg-[var(--mimoja-blue)] text-white text-[20px] font-semibold cursor-pointer">${getTranslation('Confirm')}</button>
+                    <button type="button" data-act="ok" class="hidden px-[18px] py-[10px] rounded-[10px] bg-[var(--button-primary-bg)] text-white text-[20px] font-semibold cursor-pointer">${getTranslation('Confirm')}</button>
                 </div>
             </div>`;
 
@@ -2455,6 +3601,7 @@ async function openVersionHistory() {
     editorState.profile = normalizeLegacySteps(deepCopy(chosen.profile));
     const titleDisplay = document.getElementById('editor-title-display');
     if (titleDisplay) titleDisplay.textContent = editorState.profile.title || 'Untitled Profile';
+    updateSaveAsNewButtonState();
     // Baseline deliberately not reset: a restored version is unsaved work, so
     // Cancel must still warn before throwing it away.
     setActiveTab(editorState.activeTab || 0);
@@ -2463,7 +3610,16 @@ async function openVersionHistory() {
 
 // ─── Init ───────────────────────────────────────────────────────────────────
 
+// The page the editor was opened from -- the main page's header/context menu,
+// the profile selector, or a favorite's context menu. Save and Cancel both
+// return here instead of to a fixed page. Resolved once at init: by the time
+// either fires, the router's "previous page" is the editor's own origin only
+// if nothing else navigated, and nothing can without leaving the editor.
+let _returnUrl = 'index.html';
+
 export async function initializeProfileEditor() {
+    _returnUrl = getPreviousPageUrl() || 'index.html';
+
     console.log('[ProfileEditor] initializeProfileEditor called');
     console.log('[ProfileEditor] window.__pendingEditProfile=', window.__pendingEditProfile);
     console.log('[ProfileEditor] typeof window.__pendingEditProfile=', typeof window.__pendingEditProfile);
@@ -2484,25 +3640,27 @@ export async function initializeProfileEditor() {
     editorState.sourceProfileId = profileRecord.id;
     editorState.profile = normalizeLegacySteps(deepCopy(profileRecord.profile));
     editorState.activeTab = 0;
+    editorState.editingStep = null; // every card starts collapsed
     _baselineProfileJson = JSON.stringify(editorState.profile);
     _isNewProfileSession = !profileRecord.id;
     _sessionImportedIds = [];
     _hasImportedInSession = false;
-    // Re-arm the ± hint for each editing session, but not for the re-renders
-    // within one (tab switch, step insert/delete).
-    _hintSteppers = [];
-    _hintsDismissed = false;
-    _activeStepper = null;
 
     // 3. Populate title
     const titleDisplay = document.getElementById('editor-title-display');
     if (titleDisplay) titleDisplay.textContent = editorState.profile.title || 'Untitled Profile';
+    updateSaveAsNewButtonState();
 
     // 4. Render tabs — setActiveTab renders whichever panel it shows.
+    // Paging must be bound before the first renderStepCards() call inside it
+    // (renderStepCards only recomputes disabled states via
+    // updatePagingButtons — the icons and click/scroll listeners live here).
+    initCardPaging(); // idempotent — the router re-mounts this page
     setActiveTab(0);
 
     // 5. Wire event listeners
     initTitleEditing();
+    installOutsideClickHandler(); // idempotent — the router re-mounts this page
 
     // Tab buttons
     document.querySelectorAll('.editor-tab-btn').forEach((btn) => {
@@ -2511,22 +3669,34 @@ export async function initializeProfileEditor() {
         });
     });
 
-    // Save / Cancel
+    // Close / Save / Save As New
     const saveBtn = document.getElementById('editor-save-btn');
-    const cancelBtn = document.getElementById('editor-cancel-btn');
-    if (saveBtn) saveBtn.addEventListener('click', saveProfile);
-    if (cancelBtn) cancelBtn.addEventListener('click', cancelEditor);
-
-    // Version history — only for an already-saved, non-default, non-draft
-    // profile. A draft never reached the server, so it has no lineage to show.
-    const historyBtn = document.getElementById('editor-history-btn');
-    if (historyBtn) {
-        historyBtn.addEventListener('click', openVersionHistory);
-        if (editorState.sourceProfileId && !editorState.sourceProfileRecord?.isDefault && !editorState.sourceProfileRecord?.isDraft) {
-            historyBtn.classList.remove('hidden');
-            historyBtn.classList.add('flex');
-        }
-    }
+    const saveAsBtn = document.getElementById('editor-save-as-btn');
+    const closeBtn = document.getElementById('editor-close-btn');
+    // SAVE and SAVE AS NEW both call saveProfile(), but with an explicit
+    // `asNew` flag rather than inferring the fork-vs-overwrite choice from
+    // whether the title changed — see resolveSaveTarget. SAVE AS NEW is
+    // disabled via updateSaveAsNewButtonState() until the title actually
+    // differs from the source profile's.
+    if (saveBtn) saveBtn.addEventListener('click', () => saveProfile({ asNew: false }));
+    if (saveAsBtn) saveAsBtn.addEventListener('click', () => {
+        if (saveAsBtn.getAttribute('aria-disabled') === 'true') return;
+        saveProfile({ asNew: true });
+    });
+    if (closeBtn) closeBtn.addEventListener('click', cancelEditor);
 
     console.log('Profile Editor: Initialization complete.');
+}
+
+// The router replaces #subpage-host's innerHTML wholesale on every navigation,
+// which tears down every listener bound to elements inside it — but the
+// outside-click handler above is bound to `document`, so it survives that and
+// has to be removed explicitly. Router.js calls this before loading the next
+// page (see cleanupCurrentPage). The paging scroll handler is bound to
+// #editor-steps-container, which normally goes with the rest of the injected
+// HTML — but drop it defensively too, since nothing here guarantees this
+// runs before that element is gone.
+export function cleanupProfileEditor() {
+    removeOutsideClickHandler();
+    removeCardPagingScrollHandler();
 }

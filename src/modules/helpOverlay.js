@@ -24,13 +24,23 @@ const PAGES = {
     home: [
         { sel: '#fav-profile-btn-0', title: 'Favourite profiles', tip: 'Tap to switch profile. Long-press to assign a different one.' },
         { sel: '#profile-name', title: 'Current profile', tip: 'Tap to browse profiles. Long-press to browse, edit or revert the current profile.' },
+        { sel: '#profile-select-btn', title: 'Browse profiles', tip: 'Tap to open the profile list.' },
+        { sel: '#profile-edit-btn', title: 'Edit profile', tip: 'Tap to open the current profile in the editor.' },
         { sel: '#dose-label', title: 'Adjust a value', tip: 'Tap +/- to step. Tap the number to type an exact value.' },
         { sel: '#temp-presets', title: 'Presets', tip: 'Tap to apply. Long-press to edit, save the current value, or reset.' },
+        { sel: '#steam-label', title: 'Steam settings', tip: 'Tap to open the steam settings page.' },
         { sel: '#steam-mode-toggle', title: 'Mode switch', tip: 'Tap to switch between Time and Flow, Hot water Temperature and Volume.' },
         { sel: '#hot-water-mode-toggle', ringOnly: true },
+        // Explains this release's rename/behavior change rather than a gesture —
+        // remove once the "Mix"/"Group" labels are no longer a fresh surprise to
+        // returning users.
+        { sel: '#telemetry-row', title: 'Machine telemetry', tip: '"Mix" is now called "Water". "Group" is now "Puck" and only appears while a shot is running.' },
         { sel: '#data-weight', title: 'Scale', tip: 'Tap the weight to tare the connected scale.' },
         { sel: '#ghc-controls', title: 'Machine controls', tip: 'Coffee, Water, Steam, Flush — and Stop.' },
-        { sel: '#shot-history-panel', title: 'Shot history', tip: 'Use the arrows to browse past shots.' },
+        // Injected into the machine-status line by ui.js only while a shot step
+        // is running; skipped on every other screen state.
+        { sel: '#skip-step-indicator', title: 'Skip step', tip: 'Tap to end the current step and move straight to the next one.' },
+        { sel: '#shot-history-panel', title: 'Shot history', tip: 'Use the arrows to browse past shots. With DYE2 on, tap the shot details to edit them.' },
         { sel: '#sleep-button', title: 'Sleep', tip: 'Put the machine to sleep.' },
         { sel: '#settings-btn', title: 'Settings', tip: 'Open the settings page.' },
         { sel: '#fullscreen-toggle-btn', title: 'Fullscreen', tip: 'Toggle fullscreen mode.' },
@@ -46,34 +56,34 @@ const PAGES = {
         { sel: '#add_profile', title: 'Add profile', tip: 'Start a new profile from scratch, upload a file, or import a share code.', below: true },
         { sel: '#view_profile', title: 'View all', tip: 'Show all hidden profiles.' },
         { sel: '#search_profile', title: 'Search', tip: 'Search your profiles.' },
-        { sel: '#ai_generate_profile', title: 'Decent Profile Generator', tip: 'Design your next espresso profile in a few simple steps.', below: true },
         { sel: '#delete_profile', title: 'Delete', tip: 'Delete the selected profile. Built-in profiles are hidden instead of removed.' },
-        { sel: '#assign-fav-btn-0', title: 'Assign favourite', tip: 'Assign the selected profile to a favourite slot (1–5) shown on the home screen.' },
-        { sel: '#profile-list', title: 'Profiles', tip: 'Tap a profile to preview its graph and notes. Long-press for more options: hide, assign to a favourite, or edit.' },
+        { sel: '#profile-list', title: 'Profiles', tip: 'Tap a profile to preview its graph and notes. Long-press for more options: hide, assign to a favourite, duplicate, or edit.' },
         { sel: '#edit_profile', title: 'Edit', tip: 'Open the selected profile in the editor.' },
-        { sel: '#reset_btn', title: 'Reset', tip: 'Restore the selected profile to its original settings.' },
+        { sel: '#reset_btn', title: 'Reset', tip: 'Only for a saved copy. Tap to pick an earlier version to restore — the current copy is deleted and this cannot be undone.' },
         { sel: '#cancel-profile-btn', title: 'Cancel', tip: 'Discard changes and return without switching profile.' },
         { sel: '#confirm-profile-btn', title: 'Confirm', tip: 'Use this profile for your next shot.' },
     ],
     profile_editor: [
         { sel: '#editor-title-display', title: 'Profile name', tip: 'Tap the title to rename. Saving under a new name leaves the original untouched and keeps this as a separate profile.', right: true },
-        { sel: '.editor-tab-btn[data-tab="0"]', title: 'Grid view', tip: 'Edit the profile as step cards.' },
-        { sel: '.editor-tab-btn[data-tab="2"]', title: 'Text view', tip: 'Edit the profile as plain sentences, with a graph preview.' },
-        { sel: '.editor-tab-btn[data-tab="1"]', title: 'Settings view', tip: 'Profile-wide settings (dose, yield, temperature…).' },
-        { sel: '#editor-steps-container', title: 'Steps', tip: 'Each column is a step. Tap any value to edit it, or use +/-. The card buttons insert or delete steps.' },
+        { sel: '.editor-tab-btn[data-tab="0"]', title: 'Cards', tip: 'Edit the profile as step cards. Tap a card to expand it.' },
+        { sel: '.editor-tab-btn[data-tab="2"]', title: 'Script', tip: 'Edit the profile as plain sentences, with a graph preview.' },
+        { sel: '.editor-tab-btn[data-tab="1"]', title: 'Settings', tip: 'Profile-wide settings (dose, yield, temperature…).' },
+        // Hidden outside the CARDS tab, so this mark only appears there.
+        { sel: '#editor-paging-controls', title: 'Card paging', tip: 'Tap the arrows to reach step cards that are off-screen.' },
+        { sel: '#editor-steps-container', title: 'Steps', tip: 'Each card is a step. Tap a card to expand it, then tap any value to edit it, or use +/-. The card footer inserts or deletes steps.' },
         { sel: '#editor-row-temp', title: 'Temp', tip: 'Target temperature for the step, and which sensor it follows (Coffee or Water).' },
-        { sel: '#editor-row-pump', title: 'Pump', tip: 'Sets the step’s pressure or flow and how fast it ramps there. “Limit to” caps the opposite value.' },
-        { sel: '#editor-row-max', title: 'Max', tip: 'The longest this step runs before moving to the next one.' },
-        { sel: '#editor-row-exit', title: 'Exit if', tip: 'End the step early when pressure or flow goes over or under a set value.' },
+        { sel: '#editor-row-pump', title: 'Pump', tip: 'Sets the step’s pressure or flow and how fast it ramps there. The limiter caps the opposite value.' },
+        { sel: '#editor-row-max', title: 'Maximum', tip: 'The longest this step runs before moving to the next one.' },
+        { sel: '#editor-row-exit', title: 'Move on if', tip: 'End the step early when pressure or flow goes over or under a set value.' },
         { sel: '#editor-settings-container', title: 'Profile settings', tip: 'Set profile-wide options. Tap a value to change it.' },
-        { sel: '#review-steps-list', title: 'Text review', tip: 'Each step in plain words. Tap any blue value to edit it.' },
-        { sel: '#review-graph', title: 'Graph preview', tip: 'Live preview of the profile’s pressure / flow curve.' },
-        { sel: '#review-settings-list', title: 'Profile settings', tip: 'Profile-wide settings. Tap any blue value to edit it.' },
-        // Hidden (Tailwind `hidden`) on a default or an unsaved profile, so
-        // visibleRect skips this mark on its own — no extra condition needed.
-        { sel: '#editor-history-btn', title: 'Version history', tip: 'Restore an earlier version of this profile.' },
-        { sel: '#editor-cancel-btn', title: 'Cancel', tip: 'Discard changes and exit the editor.' },
-        { sel: '#editor-save-btn', title: 'Save', tip: 'Saves over this profile. To keep the original too, rename it first.' },
+        { sel: '#script-steps-col', title: 'Steps Overview', tip: 'Each step in plain words. Tap any blue value or word to edit it.' },
+        { sel: '#script-graph', title: 'Graph preview', tip: 'Live preview of the profile’s pressure / flow curve.' },
+        { sel: '#editor-close-btn', title: 'Close', tip: 'Discard changes and exit the editor.' },
+        // Greyed out (pointer-events-none) until the title differs from the
+        // source profile's — visibleRect doesn't check that, so this mark
+        // shows even while the button is disabled.
+        { sel: '#editor-save-as-btn', title: 'Save As New', tip: 'Save under the new title as a separate profile, leaving the original untouched.' },
+        { sel: '#editor-save-btn', title: 'Save', tip: 'Saves over this profile.' },
     ],
 };
 
@@ -293,6 +303,7 @@ export function initializeHelpOverlay(button = null) {
         btn,
         () => (overlay ? close() : open()),
         () => setHidden(true),
+        { touchAction: 'none' }, // a drag on the button must not pan the page (#177)
     );
     if (!btn.isConnected) document.body.appendChild(btn);
 

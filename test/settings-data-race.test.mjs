@@ -130,3 +130,73 @@ test('failed startup refresh preserves a valid cached setting', async () => {
     assert.equal(writes.some(([key, value]) => key === 'settings-rea' && value === null), false);
     assert.match(settings.getSnapshot().error, /returned no data/);
 });
+
+// ── A background refresh must not discard unsaved edits ─────────────────────
+//
+// The settings page renders from an IDB-backed cache immediately and fetches
+// from the network in the background, so the page is editable before the fetch
+// lands. `rea` merged its staged edits over the fetched values; `de1`,
+// `de1Advanced` and the workflow blocks did not, so a preload arriving mid-edit
+// reset the displayed value to the machine's. The Fan Threshold stepper reads
+// the displayed number, so the next tap stepped from the wrong base and saved a
+// value the user never chose. While the DE1 is unreachable the page re-preloads
+// every 3 seconds, which made this near-certain rather than a narrow race.
+
+const settingsSource = readFileSync(new URL('../src/settings/settings.js', import.meta.url), 'utf8');
+const mergeStagedOverFetched = (() => {
+    const match = settingsSource.match(/export function mergeStagedOverFetched\(fetched, staged\) \{[\s\S]*?\r?\n\}/);
+    assert.ok(match, 'mergeStagedOverFetched not found in settings.js');
+    return new Function(`${match[0].replace('export ', '')}\nreturn mergeStagedOverFetched;`)();
+})();
+
+test('a staged edit survives a slower fetch that started before it', () => {
+    const merged = mergeStagedOverFetched({ fan: 40, flushTemp: 90 }, { fan: 45 });
+    assert.equal(merged.fan, 45);
+    assert.equal(merged.flushTemp, 90, 'untouched fields still come from the machine');
+});
+
+test('with nothing staged the fetched settings are used as they are', () => {
+    const fetched = { fan: 40 };
+    assert.equal(mergeStagedOverFetched(fetched, {}), fetched);
+});
+
+test('a failed fetch is passed through rather than turned into an object', () => {
+    // The caller distinguishes null (unreachable, show the retry page) from an
+    // empty object, so merging must not manufacture one.
+    assert.equal(mergeStagedOverFetched(null, { fan: 45 }), null);
+    assert.equal(mergeStagedOverFetched(undefined, { fan: 45 }), undefined);
+});
+
+test('a staged zero is kept, not treated as absent', () => {
+    // 0 is a real value here: fan threshold 0 and steam target 0 both mean
+    // something, so a falsy check instead of a key check would drop them.
+    assert.equal(mergeStagedOverFetched({ fan: 40 }, { fan: 0 }).fan, 0);
+});
+
+const stageWorkflowField = (() => {
+    const match = settingsSource.match(/export function stageWorkflowField\(pending, block, key, value\) \{[\s\S]*?\r?\n\}/);
+    assert.ok(match, 'stageWorkflowField not found in settings.js');
+    return new Function(`${match[0].replace('export ', '')}\nreturn stageWorkflowField;`)();
+})();
+
+test('staging one workflow field stages only that key, then adds others', () => {
+    const pending = {};
+    stageWorkflowField(pending, 'steamSettings', 'flow', 1.5);
+    assert.deepEqual(pending, { steamSettings: { flow: 1.5 } });
+    stageWorkflowField(pending, 'steamSettings', 'duration', 0);
+    assert.deepEqual(pending, { steamSettings: { flow: 1.5, duration: 0 } });
+});
+
+test('workflow blocks are staged separately', () => {
+    const pending = {};
+    stageWorkflowField(pending, 'steamSettings', 'flow', 1.5);
+    stageWorkflowField(pending, 'hotWaterData', 'volume', 100);
+    assert.deepEqual(pending, { steamSettings: { flow: 1.5 }, hotWaterData: { volume: 100 } });
+});
+
+test('a partially staged block keeps the fetched duration', () => {
+    const pending = {};
+    stageWorkflowField(pending, 'steamSettings', 'flow', 1.5);
+    const merged = mergeStagedOverFetched({ duration: 35, flow: 1 }, pending.steamSettings);
+    assert.deepEqual(merged, { duration: 35, flow: 1.5 });
+});

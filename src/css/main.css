@@ -35,9 +35,10 @@
     min-height: 0;
 }
 
-/* profile_selector's fixed panel heights (list 850, chart 675, notes 275) add up to
-   the design canvas exactly; grow the list and the graph so the pair still reaches
-   the bottom when the canvas is taller. Notes keeps its 275. */
+/* profile_selector's panel heights (Figma 2662-1343 at 0.75: chart 558 between its
+   hairlines, notes 370.5) add up to the design canvas exactly; the chart takes
+   whatever the fixed notes pane leaves, so it is 558 on the 1200 canvas and grows
+   with it when the canvas is taller. Notes keeps its 370.5. */
 #profile-list,
 #profile-chart-wrap {
     height: auto;
@@ -85,9 +86,16 @@
     min-height: 0;
 }
 
+/* Basis 0 so the chart absorbs the free space the band and footer leave, and a
+   floor well under the 643px design height so it also GIVES space back when the
+   canvas is shorter than 1200 rows (16:9 and 1340x800 panels). The band above it
+   positions its name/telemetry absolutely and so cannot shrink without clipping
+   them, which is what happened while this floor was 643: the band lost the rows
+   instead. scaling.js keeps the canvas at or above MIN_CANVAS_HEIGHT, which is
+   derived from this floor. */
 #chart-wrap {
     flex: 1 1 0;
-    min-height: 650px;   /* the design height -- never shrink below it */
+    min-height: 450px;
 }
 
 /* Scoped to the main page on purpose: profile_selector.html reuses the
@@ -144,11 +152,17 @@
 @font-face { font-family: 'Inter'; src: url('../ui/Inter-ExtraBold.woff2') format('woff2'); font-weight: 800; font-display: swap; }
 @font-face { font-family: 'Inter'; src: url('../ui/Inter-Black.woff2') format('woff2'); font-weight: 900; font-display: swap; }
 
+@font-face { font-family: 'NotoSansMono'; src: url('../ui/NotoSansMono-Medium.woff2') format('woff2'); font-weight: 500; font-display: swap; }
 @font-face { font-family: 'NotoSansMono'; src: url('../ui/NotoSansMono-SemiBold.woff2') format('woff2'); font-weight: 600; font-display: swap; }
 @font-face { font-family: 'NotoSansMono'; src: url('../ui/NotoSansMono-ExtraBold.woff2') format('woff2'); font-weight: 800; font-display: swap; }
 
 html, body {
     overflow: hidden;
+    /* Android 12+ WebViews play the stretch overscroll animation even on a page
+       that cannot scroll, so a drag anywhere reads as the whole UI rubber-banding
+       (#177, decaid#963). The skin letterboxes its own canvas and never scrolls
+       the root, so nothing here wants that gesture. */
+    overscroll-behavior: none;
 }
 
 * {
@@ -163,6 +177,17 @@ body {
     font-family: 'NotoSansMono', monospace;
 }
 
+/* NotoSansMono draws U+2192 low: the glyph's centre sits 191/1000 em under the
+   digits' centre (digits span -10..724, the arrow 49..283), so "75→84" reads
+   with the arrow down on the baseline instead of between the numbers as the
+   design has it. Lift it by that difference. `position: relative` so the shift
+   is purely visual -- the advance width stays put, which the shot-data columns
+   are measured against. */
+.range-arrow {
+    position: relative;
+    top: -0.19em;
+}
+
 .font-inter-custom {
     font-family: 'Inter', sans-serif;
 }
@@ -172,18 +197,34 @@ body {
     --mimoja-blue: #385A92;
 
     --profile-button-outline-color: #c5cdda;
+    --muted-pill-bg: rgba(197, 205, 218, 0.3); /* 30% of --profile-button-outline-color; no color-mix for older WebViews */
     --profile-button-background-color: #FFFFFF;
-    --profile-button-text-color: #7583b0;
+    --profile-button-text-color: #5F7BA8;
     --box-color: #f8f9fb;
     --profileselectorbg: #FFFFFF;
     --low-contrast-white: #959595;
     --text-primary: #121212; /* Renamed from --dark-gray */
     --text-primary-disabled: #c8cacc;
+    --text-primary-inactive: #DDDDDD; /* style guide Light Mode/Text/Primary.Inactive: hidden profile rows */
     --preset-value-color: #AAAAAA;
     --preset-value-color-disabled: #e3e4e6;
     --preset-label-selected-color: #777777;
     --green: #65Ac8a;
     --button-grey: #EDEDED;
+    /* +/- adjust button, Figma 4351-1658: Buttons/Adjust.Active resting,
+       Adjust.Inactive once the value sits on that end's limit, with the glyph
+       dropping to Text/Primary.Inactive. Both ends behave the same way -- the
+       minus greys at the minimum, the plus at the maximum. */
+    --stepper-btn-bg: #EDEDED;
+    --stepper-btn-bg-disabled: #F3F3F3;
+    --settings-label-color: var(--mimoja-blue-v2); /* Settings-tab gutter labels: Action.Primary.Active (Figma 2662:1507) */
+    /* The "this is a control" label colour: Action/Action.Primary.Active in
+       both modes (#385A92 light, #415996 dark per designer; the dark value is
+       a known low-contrast choice on the dark card). Used by the cycle chips,
+       the collapsed chip-backed labels and the bare card-footer glyphs. */
+    --action-label: #385a92;
+    --stepper-icon: #121212;
+    --stepper-icon-disabled: #DDDDDD;
 
     /* Plus Minus Flash Colors (Light Mode) */
     --plus-minus-flash-on-color: #b8b8b8;
@@ -196,13 +237,13 @@ body {
     --bgmain-color : #FFFFFF;
     --data-card-title-text-color:#707485;
     /* left label text colors */
-    --left-label-text : #385992;
+    --left-label-text : var(--mimoja-blue-v2);
     /*status mesg */
     --heatingstatus:#1967d4;
     --status-ready-green:#17c29a;
     --status-green-color: #0CA581;
     --status-red-color: #DA515E;
-    --status-clickable-color: #1967d4;
+    --status-clickable-color: var(--mimoja-blue-v2);
     --fav-button-wait:#e3e4e6;
 
     /* Presence Settings (Light Mode) */
@@ -213,39 +254,74 @@ body {
     --presence-input-text: #121212;
     --presence-input-border: #c5cdda;
     --button-primary-bg: #385a92;
+    --button-primary-tint: rgba(56, 90, 146, 0.15); /* 15% of --button-primary-bg; no color-mix for older WebViews */
     --button-primary-text: #ffffff;
+    --dye-toggle-inactive-bg: #D7DEE9; /* Figma Action.Primary.Inactive (2386:1119): DYE strip P/F/R idle pill */
     --button-secondary-bg: #e8e8e8;
     --button-secondary-text: #121212;
     /* bg colors in profile editor */
-    --secondary-button-bg:#b6c3d7; 
+    --secondary-button-bg:#b6c3d7;
     --secondary-button-outline:#385a92;
+
+    /* Profile editor CARDS redesign (Figma, Light Mode only export) */
+    --bg-tertiary: #E9F1F8;
+    --card-bg: #FFFFFF; /* Figma Background.Primary: step-card fill */
+    --bg-secondary: #F6F8FA;
+    --border-primary: #C9C9C9;
+    --border-graph-grid: #E8E8E8;
+    --tab-text-inactive: #5F7BA8;
 }
 
 [data-theme='dark'] {
     --profile-button-outline-color: #17191e;
+    --muted-pill-bg: rgba(23, 25, 30, 0.3); /* 30% of --profile-button-outline-color; no color-mix for older WebViews */
     --profile-button-background-color: #292c38;
-    --profile-button-text-color: #FFFFFF;
+    --profile-button-text-color: #E8E8E8;
+
+    /* Profile editor CARDS redesign. Step-card fill (--card-bg) is Figma's
+       Background.Primary (#101217); the ground behind the cards (--bg-tertiary)
+       is Background.Secondary (#17191E) from the style guide, so cards sit darker
+       than their ground. --bg-secondary is Background.Secondary too.
+       --tab-text-inactive reuses Figma's FavButton.Text.NotSelected (#5F7BA8)
+       per the designer; contrast on dark cards is low by choice. */
+    --bg-tertiary: #17191E; /* style guide Dark Mode/Background/Background.Secondary */
+    --card-bg: #101217; /* style guide Dark Mode/Background/Background.Primary */
+    --bg-secondary: #17191E; /* style guide Dark Mode/Background/Background.Secondary: selector header + list panel */
+    --border-primary: #3d4255; /* style guide Dark Mode/Border/Primary */
+    --border-graph-grid: #1E202B;
+    --tab-text-inactive: #5F7BA8;
     --box-color: #17191e;
-    --profileselectorbg:#17191e;
-    --button-grey: #2a2d36;
-    --secondary-button-bg: #2a3a5a;
+    --profileselectorbg: #101217; /* style guide Dark Mode/Background/Background.Primary: right panel rows */
+    --button-grey: #292c38; /* style guide Buttons/Primary.Background.Inactive */
+    --stepper-btn-bg: #101115;
+    --stepper-btn-bg-disabled: #101115; /* dark keeps its fill; only the glyph mutes */
+    --settings-label-color: var(--mimoja-blue-v2); /* Action.Primary.Active per designer */
+    --action-label: var(--mimoja-blue-v2); /* Action.Primary.Active per designer */
+    --stepper-icon: #959595;
+    --stepper-icon-disabled: #272727;
+    --secondary-button-bg: #707485; /* scrollbar thumbs only; style guide Text/Tertiary, ~3.8:1 on the dark card */
     /* Plus Minus Flash Colors (Dark Mode) */
-    --plus-minus-flash-on-color: #4a4f5e;
-    --plus-minus-flash-on-color2: #3a3e4a;
+    --plus-minus-flash-on-color: #272A34;
+    --plus-minus-flash-on-color2: #1b1d24;
     --plus-minus-flash-off-color: #2a2d36;
     --bgmain-color : #101217;
     --mimoja-blue-v2: #415996;
     --text-primary: #e8e8e8;
     --text-primary-disabled: #4a4a4a;
+    --text-primary-inactive: #707485; /* style guide Dark Primary.Inactive is #232325 (~1.1:1), so Text/Tertiary until the designer fixes it */
     --preset-value-color: #4e5559;
     --preset-value-color-disabled: #262a2c;
     --preset-label-selected-color: #999999;
     --data-card-title-text-color:#707485;
      /* left label text colors */
-    --left-label-text :#415996;
+    --left-label-text : var(--mimoja-blue-v2);
     --status-green-color: #0CA581; /* Same as light mode */
     --status-red-color: #DA515E;   /* Same as light mode */
     --status-clickable-color: #415996;
+    /* One step lighter than the button, the way the light value is one step
+       darker than its own. The light #e3e4e6 left unset here read as a white
+       flash against a dark main page while the profile loaded. */
+    --fav-button-wait: #353948;
 
     /* Presence Settings (Dark Mode) */
     --presence-card-bg: #17181D;
@@ -255,7 +331,9 @@ body {
     --presence-input-text: #e8e8e8;
     --presence-input-border: #415996;
     --button-primary-bg: #415996;
+    --button-primary-tint: rgba(65, 89, 150, 0.15); /* 15% of --button-primary-bg; no color-mix for older WebViews */
     --button-primary-text: #e8e8e8;
+    --dye-toggle-inactive-bg: #292c38; /* dark Buttons/Primary.Background.Inactive */
     --button-secondary-bg: #292c38;
     --button-secondary-text: #e8e8e8;
 }
@@ -329,13 +407,43 @@ body {
     transform: translateX(0);
 }
 
-.no-select {
+/* Long-press on Android WebView starts text selection on labels and values
+   (issue #151). Off everywhere except editable fields and opt-in content. */
+body {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+
+input,
+textarea,
+[contenteditable=""],
+[contenteditable="true"],
+.selectable,
+.selectable * {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.no-select,
+.settings-nav-btn,
+.settings-subnav-btn {
   -webkit-user-select: none;
   -ms-user-select: none;
   user-select: none;
   -webkit-touch-callout: none;
   -webkit-tap-highlight-color: transparent;
 }
+
+/* Touch devices fake a persistent :hover on whatever row a drag last crossed,
+   so dragging across the settings nav used to leave several rows looking
+   selected at once (issue #88). This is handled in tailwind.config.js now:
+   hoverOnlyWhenSupported wraps the nav rows' own hover:text-white /
+   hover:bg-[#2c4a7a] utilities in @media (hover: hover), so no sticky hover
+   reaches them. Do not re-add a neutralising @media (hover: none) override
+   here: the previous one had to restate the resting colour and used
+   `color: inherit`, which resolved to the body colour (#E8E8E8 in dark mode)
+   and left the dragged row's text looking as white as the open row's. */
 
 @keyframes button-flash {
     0% { background-color: var(--plus-minus-flash-on-color2); }
@@ -346,6 +454,23 @@ body {
 
 .flash-animation {
     animation: button-flash 0.28s linear forwards; /* 'forwards' keeps the end state */
+}
+
+/* Profile selector icon buttons: a tap flashes the active blue (style guide
+   Buttons/Background.Active) with selected-button text on the icon, then eases
+   back to the button's own fill — no end keyframe, so it returns to whatever
+   background the button had (including search's inline active state). */
+@keyframes icon-flash {
+    0%, 45% { background-color: var(--button-primary-bg); }
+}
+.icon-flash {
+    animation: icon-flash 0.35s ease-out;
+}
+.icon-flash svg path {
+    stroke: var(--button-primary-text) !important;
+}
+.icon-flash .pe-icon-mask {
+    background-color: var(--button-primary-text) !important;
 }
 
 /* Brightness Slider Styling */
@@ -370,7 +495,7 @@ body {
   width: 24px;
   height: 24px;
   border-radius: 50%;
-  background: #385a92;
+  background: var(--button-primary-bg);
   cursor: pointer;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
   border: 2px solid #c5cdda;
@@ -386,7 +511,7 @@ body {
   width: 24px;
   height: 24px;
   border-radius: 50%;
-  background: #385a92;
+  background: var(--button-primary-bg);
   cursor: pointer;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
   border: 2px solid #c5cdda;
@@ -404,7 +529,7 @@ body {
 }
 
 .brightness-slider::-moz-range-progress {
-  background: #385a92;
+  background: var(--button-primary-bg);
   height: 8px;
   border-radius: 5px;
 }
@@ -419,7 +544,7 @@ body {
   width: 104.8px;
   height: 62.88px;
   background-color: #e8e8e8;
-  border: 2px solid #c9c9c9;
+  border: 2px solid var(--border-primary);
   border-radius: 2617.374px;
   cursor: pointer;
   position: relative;
@@ -440,8 +565,8 @@ body {
 }
 
 .brightness-toggle-checkbox:checked + .brightness-toggle-label {
-  background-color: #385a92;
-  border-color: #385a92;
+  background-color: var(--button-primary-bg);
+  border-color: var(--button-primary-bg);
 }
 
 .brightness-toggle-checkbox:checked + .brightness-toggle-label::after {
@@ -475,7 +600,7 @@ body {
 /* Toggle styling for Wake Lock and Presence Settings */
 .toggle {
   background-color: #e8e8e8;
-  border-color: #c5cdda;
+  border-color: var(--border-primary);
 }
 
 .toggle:checked {
@@ -485,7 +610,7 @@ body {
 
 [data-theme='dark'] .toggle {
   background-color: #292c38;
-  border-color: #415996;
+  border-color: var(--border-primary);
 }
 
 [data-theme='dark'] .toggle:checked {
@@ -504,36 +629,70 @@ body {
   background: rgba(0, 0, 0, 0.55);
 }
 
-/* Profile editor scrollbars. The steps grid scrolls sideways and the summary
-   columns scroll down, but on a touch device Chromium uses overlay scrollbars
-   that fade out — so there was nothing on screen saying the panel scrolls at
-   all. Declaring ::-webkit-scrollbar switches that pane back to a classic
-   space-taking scrollbar, which is what makes the trough permanently visible;
-   the colours just make it legible.
-
-   Neutral translucent rather than var(--mimoja-blue): dark mode redefines that
-   token to #292c38, which would vanish against a dark panel. These id
-   selectors outrank the app-wide [data-theme="dark"] scrollbar rules in
-   dark-mode.css, so both themes are set here. */
+/* Profile editor scrollbars. The CARDS row's bars are hidden and drawn by
+   hand, the same way the three panes below are: in dark mode dark-mode.css
+   sets scrollbar-color on :root, which inherits everywhere and switches
+   Chromium to its standard scrollbar renderer, so every ::-webkit-scrollbar
+   width here was silently ignored (measured: a 19px OS-default bar even with
+   !important). scrollbar-width works in BOTH renderers, so that is what the
+   hiding leans on. It is not axis-scoped -- there is no way to keep one bar
+   native and hide the other -- and the CARDS spec (node 2662-936) draws no
+   scroll bar at all, only the paging arrows, so both go and
+   #editor-steps-container-thumb supplies the vertical pill. */
+/* SCRIPT's Steps Overview (node 2662-803), SETTINGS' Description column
+   (node 2662:1644), and the SETTINGS form card (node 2662-816) all draw the
+   same short fixed pill in the Figma -- not the browser's usual proportional
+   thumb length. ::-webkit-scrollbar-thumb's height property claims to
+   override that, but does not actually do so in this Chromium (confirmed by
+   live-injecting !important height/color and forcing reflow/scroll on each
+   of these three: only the color ever took, the thumb stayed proportional
+   to how much the pane happens to overflow -- fine when that's a lot, reads
+   as "too long" when it's a little). All three hide their native scrollbar
+   and draw a decorative pill by hand instead (updateScrollThumb /
+   initScrollThumb in profile_editor.js) -- see #editor-settings-form-card-thumb,
+   #editor-settings-notes-col-thumb, #script-steps-col-thumb. */
 #editor-steps-container,
-#review-steps-col,
-#review-right-col {
-  scrollbar-color: rgba(0, 0, 0, 0.42) rgba(0, 0, 0, 0.10); /* Firefox + Chromium 121+ */
-  scrollbar-gutter: stable;
+#editor-settings-form-card,
+#editor-settings-notes-col,
+#script-steps-col {
+  scrollbar-width: none;
 }
 #editor-steps-container::-webkit-scrollbar,
-#review-steps-col::-webkit-scrollbar,
-#review-right-col::-webkit-scrollbar {
-  width: 14px;
-  height: 14px;
+#editor-settings-form-card::-webkit-scrollbar,
+#editor-settings-notes-col::-webkit-scrollbar,
+#script-steps-col::-webkit-scrollbar {
+  display: none;
 }
-#editor-steps-container::-webkit-scrollbar-track,
-#review-steps-col::-webkit-scrollbar-track,
-#review-right-col::-webkit-scrollbar-track {
-  background: rgba(0, 0, 0, 0.10);
-  border-radius: 8px;
+
+/* Profile selector's list (Figma node 2662-1356) draws the same bare pill as
+   the profile editor's panes above -- 60px wide on the canvas, in
+   --secondary-button-bg -- so it reuses that treatment rather than the
+   browser's default bar. Same reasoning as #editor-steps-container: declaring
+   ::-webkit-scrollbar keeps a classic space-taking thumb instead of an
+   overlay one that fades out on touch, the id outranks dark-mode.css's
+   app-wide scrollbar rules, and the token carries its own dark value. */
+#profile-list {
+  scrollbar-gutter: stable;
 }
-#editor-steps-container::-webkit-scrollbar-thumb,
+@supports not selector(::-webkit-scrollbar) {
+  #profile-list {
+    scrollbar-color: var(--secondary-button-bg) transparent;
+  }
+}
+#profile-list::-webkit-scrollbar {
+  width: 45px;
+}
+#profile-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+#profile-list::-webkit-scrollbar-thumb {
+  background-color: var(--secondary-button-bg);
+  border-radius: 9999px;
+  /* Inset so it reads as a floating pill rather than a full-width bar. */
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+
 #review-steps-col::-webkit-scrollbar-thumb,
 #review-right-col::-webkit-scrollbar-thumb {
   background-color: rgba(0, 0, 0, 0.42);
@@ -542,31 +701,102 @@ body {
   border: 3px solid transparent;
   background-clip: content-box;
 }
-#editor-steps-container::-webkit-scrollbar-thumb:hover,
 #review-steps-col::-webkit-scrollbar-thumb:hover,
 #review-right-col::-webkit-scrollbar-thumb:hover {
   background-color: rgba(0, 0, 0, 0.62);
 }
 
-[data-theme='dark'] #editor-steps-container,
 [data-theme='dark'] #review-steps-col,
 [data-theme='dark'] #review-right-col {
   scrollbar-color: rgba(255, 255, 255, 0.42) rgba(255, 255, 255, 0.10);
 }
-[data-theme='dark'] #editor-steps-container::-webkit-scrollbar-track,
 [data-theme='dark'] #review-steps-col::-webkit-scrollbar-track,
 [data-theme='dark'] #review-right-col::-webkit-scrollbar-track {
   background: rgba(255, 255, 255, 0.10);
 }
-[data-theme='dark'] #editor-steps-container::-webkit-scrollbar-thumb,
 [data-theme='dark'] #review-steps-col::-webkit-scrollbar-thumb,
 [data-theme='dark'] #review-right-col::-webkit-scrollbar-thumb {
   background-color: rgba(255, 255, 255, 0.42);
 }
-[data-theme='dark'] #editor-steps-container::-webkit-scrollbar-thumb:hover,
 [data-theme='dark'] #review-steps-col::-webkit-scrollbar-thumb:hover,
 [data-theme='dark'] #review-right-col::-webkit-scrollbar-thumb:hover {
   background-color: rgba(255, 255, 255, 0.62);
+}
+
+/* Profile selector's list scrollbar (Figma node 2662-1377): a hand-drawn,
+   touch-draggable pill (#profile-list-thumb, wired in profile_selector.js's
+   initProfileListScrollThumb) instead of the native ::-webkit-scrollbar-thumb
+   -- native scrollbar thumbs can't be touch-dragged in Android WebView, only
+   swipe-scrolled. Proportional thumb height since the list's length varies
+   with the profile count instead of the editor's fixed-height panes. */
+#profile-list {
+  /* Figma (node 2662-1343, x0.75): list ends at 673, thumb spans 709-754,
+     panel border at 793. So the thumb sits 40px clear of the border -- which
+     is also the drag separator, so a thumb flush against it (as it once was)
+     made finger taps on the thumb land on the separator -- and 35px right of
+     the list. The thumb is 45px wide, hence 40 + 45 + 35 = 120.
+     Margin, not padding, so #left-panel's background shows in the gutter. The
+     thumb is absolutely positioned against #left-panel (a sibling of
+     #profile-list, not a wrapper -- #profile-list must stay a direct flex
+     child for the flex/min-height rule below to size it). */
+  margin-right: 120px;
+  /* Figma's row highlight ends 19px inside the list (654 of 673 at x0.75); the
+     p-3 on the element would leave 12. */
+  padding-right: 19px;
+  scrollbar-width: none;
+}
+#profile-list::-webkit-scrollbar {
+  display: none;
+}
+
+/* Search field injected by initSearchButton (profile_selector.js). */
+#profile-search-input::placeholder {
+  color: var(--data-card-title-text-color);
+}
+
+/* Profile editor CARDS icons — SVGs rendered as a CSS mask so the glyph picks
+   up `currentColor`/a theme token instead of the fixed stroke baked into the
+   source file. Size and mask-image are set inline per instance (they vary per
+   icon); this class only carries the mask mechanics shared by all of them. */
+.pe-icon-mask {
+  display: inline-block;
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+  mask-position: center;
+  -webkit-mask-size: contain;
+  mask-size: contain;
+}
+
+/* Skip-step arrow in the machine-status line (ui.js SKIP_STEP_GLYPH). Composes
+   with .pe-icon-mask for the shared mask mechanics; this class only adds the
+   size, mask-image and colour specific to this one instance. Colour is pinned
+   to --mimoja-blue-v2 (Figma's #385A92 in light mode) rather than
+   currentColor: the surrounding --status-clickable-color span is a different
+   blue used for the plain ">>" text this replaced, and doesn't
+   match the Figma icon's own colour. */
+.skip-step-glyph {
+  vertical-align: middle;
+  width: 30px;
+  height: 22px;
+  background-color: var(--mimoja-blue-v2);
+  -webkit-mask-image: url('../ui/icons/icon_skip_step.svg');
+  mask-image: url('../ui/icons/icon_skip_step.svg');
+}
+
+/* Shared 72x45 bordered icon-button frame: #profile-select-btn, #profile-edit-btn
+   (index.html) and the skip-step glyph's box (ui.js SKIP_STEP_GLYPH). Figma
+   node 2662:781 "Frame 311" — border #C9C9C9. One class so the three stay in
+   sync instead of three copies of the same Tailwind arbitrary-value string. */
+.header-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  vertical-align: middle;
+  width: 72px;
+  height: 45px;
+  border: 2px solid var(--border-primary);
+  border-radius: 10px;
 }
 
 /* ── Bengle Lighting settings ──────────────────────────────────────────────
@@ -621,10 +851,10 @@ body {
   transition: background-color 0.15s ease-out, color 0.15s ease-out;
 }
 .led-tab[aria-selected='true'] {
-  background-color: var(--mimoja-blue);
+  background-color: var(--button-primary-bg);
   color: #fff;
 }
-.led-tab:focus-visible { outline: 3px solid var(--mimoja-blue); outline-offset: 2px; }
+.led-tab:focus-visible { outline: 3px solid var(--mimoja-blue-v2); outline-offset: 2px; }
 
 /* Transport bar -- the one loud element on the Sequence tab. It carries the
    play control, the loop switch, and the colours that are on the strip RIGHT
@@ -645,7 +875,7 @@ body {
   padding: 0 40px;
   border: 0;
   border-radius: 32px;
-  background-color: var(--mimoja-blue);
+  background-color: var(--button-primary-bg);
   color: #fff;
   font-size: 22px;
   font-weight: 700;
@@ -682,8 +912,8 @@ body {
 /* Toggled by the runner directly (ledSeqPaintActiveStep), not a re-render --
    the playback tick must never rebuild the page under the user's fingers. */
 .led-step.led-seq-step-active {
-  border-color: var(--mimoja-blue);
-  border-left-color: var(--mimoja-blue);
+  border-color: var(--mimoja-blue-v2);
+  border-left-color: var(--mimoja-blue-v2);
   background-color: var(--led-tint);
 }
 .led-step-index {
@@ -751,11 +981,102 @@ body {
   transition: background-color 0.15s ease-out, color 0.15s ease-out;
 }
 .led-chip[aria-pressed='true'] {
-  background-color: var(--mimoja-blue);
-  border-color: var(--mimoja-blue);
+  background-color: var(--button-primary-bg);
+  border-color: var(--button-primary-bg);
   color: #fff;
 }
 
 @media (prefers-reduced-motion: reduce) {
   .led-tab, .led-step, .led-chip { transition: none; }
+}
+
+/* Profile editor CARDS icons — SVGs rendered as a CSS mask so the glyph picks
+   up `currentColor`/a theme token instead of the fixed stroke baked into the
+   source file. Size and mask-image are set inline per instance (they vary per
+   icon); this class only carries the mask mechanics shared by all of them. */
+.pe-icon-mask {
+  display: inline-block;
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+  mask-position: center;
+  -webkit-mask-size: contain;
+  mask-size: contain;
+}
+
+/* Full-screen chart (TCL "zoomed" page): chart.js toggles .chart-zoomed on
+   #main-page. Header and telemetry band stay; the machine-button column, the
+   dashboard and the dial-in sidebar go, and the zoomed chart takes the plot's
+   place out to the full width and down to the bottom of the screen (#chart-wrap
+   is already the flex item that absorbs free space). */
+/* The strip and the chart share #chart-wrap's height instead of both taking all
+   of it: #expanded-chart's h-full was measured against the wrap, so the chart
+   hung the strip's own height past the bottom of the screen and took the x tick
+   labels with it. Column flex gives the strip its line and the chart the rest. */
+#main-page.chart-zoomed #chart-wrap {
+    display: flex;
+    flex-direction: column;
+}
+
+#main-page.chart-zoomed #expanded-chart {
+    display: block !important;
+    flex: 1 1 0;
+    height: auto;
+    min-height: 0;
+}
+
+#main-page.chart-zoomed #plotly-chart,
+#main-page.chart-zoomed #shot-settings,
+#main-page.chart-zoomed #shot-history-panel,
+#main-page.chart-zoomed #shot-data-panel {
+    display: none;
+}
+
+/* The machine-button column goes behind the zoomed chart: on a non-GHC machine
+   it is a 172px flex sibling of the chart column, so leaving it in place keeps
+   that width off the plot. Hidden by the class, never by the inline style that
+   showGhcControls()/scaling.js read, so the layout returns untouched on exit. */
+#main-page.chart-zoomed #ghc-controls {
+    display: none !important;
+}
+
+#main-page.chart-zoomed main {
+    padding-bottom: 0;
+}
+
+/* The dial-in line above the zoomed chart: the hidden sidebar's values, in the
+   telemetry row's own idiom (label in the card-title colour, value in mono). */
+#zoom-dialin {
+    display: none;
+}
+
+#main-page.chart-zoomed #zoom-dialin {
+    display: flex;
+    align-items: center;
+    gap: 34px;
+    padding: 0 40px 10px;
+    white-space: nowrap;
+    overflow: hidden;
+}
+
+.zoom-dialin-pair {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 10px;
+}
+
+.zoom-dialin-label {
+    color: var(--data-card-title-text-color);
+    font-family: 'Inter', sans-serif;
+    font-size: 22.5px;
+    font-weight: 600;
+    line-height: 1.5rem;
+}
+
+.zoom-dialin-value {
+    color: var(--text-primary);
+    font-family: 'NotoSansMono', monospace;
+    font-size: 22.5px;
+    font-weight: 600;
+    line-height: 1.5rem;
 }

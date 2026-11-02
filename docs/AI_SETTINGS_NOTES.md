@@ -44,6 +44,7 @@ Current partial-extraction modules are:
 
 - `src/settings/categories/quick-adjustments.js`
 - `src/settings/categories/maintenance.js`
+- `src/settings/categories/connections.js` (the Grinder page; Machine and Scale fall through to the legacy bridge)
 
 They can render supported subcategories and delegate the rest to the legacy bridge. Use their mount/cleanup/delegation shape as the model for further extraction.
 
@@ -80,6 +81,19 @@ The save loop deliberately handles a mutation that occurs while an earlier batch
 Use the shared data API for fields it owns. Legacy categories can still have their own established save paths; do not create a second owner for the same field.
 
 ## Common Changes
+
+### Plugin-Owned Settings UI
+
+Plugin authors can mark individual manifest settings with `"hidden": true` to
+omit their controls and search keywords in Streamline. Keep the settings in the
+manifest: Decaid needs those declarations to retain and validate saved values.
+`plugin-view.js` owns this visibility policy; it is a presentation hint, not a
+security boundary. Decaid's native settings screen and other skins may ignore it.
+
+The generic **Open** link passes `returnTo` with the current skin's full address
+and `page=settings`. Preserve the actual host, port and path: skin origins are
+assigned by Decaid, and the browser referrer can omit the route. Plugin UIs must
+validate the return URL before using it. See [Plugin settings UI](plugin-settings-ui.md).
 
 ### Add A Navigation Item
 

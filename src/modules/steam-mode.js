@@ -209,11 +209,15 @@ export function milkTelemetryText(present, tempC) {
  * (Bengle machine + probe present) and the armed milk stop
  * (workflow stopAtTemperature > 0). Re-run whenever either input changes.
  *
- * With milk available the tile offers Milk|Flow: an armed stop pins Milk
- * ('temperature'); otherwise 'temperature' (just disarmed) and 'time' (not in
- * this pair) land on 'flow' — an un-armed stop never jumps back to Milk on its
- * own, so after a probe round-trip the mode stays on the fallback until the
- * user re-selects Milk. Without milk the tile offers Time|Flow: leaving
+ * With milk available the tile offers Milk|Flow, and the milk stop stays armed
+ * across BOTH of them (ui.js toggleSteamMode) — the tile shows the milk target
+ * either way and Flow only changes which number +/- edits. So an armed stop no
+ * longer implies Milk mode: Flow stays Flow, while 'temperature' (just
+ * disarmed) and 'time' (not in this pair) land on 'flow'. An un-armed stop
+ * never jumps back to Milk on its own, so after a probe round-trip the mode
+ * stays on the fallback until the user re-selects Milk (the probe-return
+ * restore in setMilkProbePresent pins it explicitly instead). Without milk the
+ * tile offers Time|Flow: leaving
  * 'temperature' falls back to the user's recorded non-temperature stop mode —
  * 'off' shows the flow knob (no auto-stop → duration is meaningless), anything
  * else the duration knob ('time'); non-temperature modes pass through.
@@ -225,11 +229,24 @@ export function milkTelemetryText(present, tempC) {
  */
 export function resolveSteamTileMode(currentMode, milkAvailable, milkStopArmed, fallbackMode) {
     if (milkAvailable) {
-        if (milkStopArmed) return 'temperature';
-        return (currentMode === 'temperature' || currentMode === 'time') ? 'flow' : currentMode;
+        if (currentMode === 'flow') return 'flow';
+        return milkStopArmed ? 'temperature' : 'flow';
     }
     if (currentMode === 'temperature') return fallbackMode === 'off' ? 'flow' : 'time';
     return currentMode;
+}
+
+/**
+ * Which field the steam tile's duration slot currently HOLDS, so an editor
+ * opened on it edits what the user is looking at. The slot is not always a
+ * steam duration: with milk available (Bengle + probe) and the stop armed it
+ * shows the milk target in BOTH halves of the Milk|Flow pair.
+ * @param {boolean} milkAvailable  Bengle with the milk probe present
+ * @param {boolean} milkStopArmed  workflow stopAtTemperature > 0
+ * @returns {'milk-stop'|'steam-duration'}  a numpad field type
+ */
+export function steamSlotField(milkAvailable, milkStopArmed) {
+    return milkAvailable && milkStopArmed ? 'milk-stop' : 'steam-duration';
 }
 
 // ── Steam push sync state ────────────────────────────────────────────────────
@@ -241,6 +258,13 @@ export function resolveSteamTileMode(currentMode, milkAvailable, milkStopArmed, 
 
 /** Retries allowed after a failed steam push before the tile stops chasing it. */
 export const STEAM_SYNC_RETRY_LIMIT = 3;
+
+/**
+ * Wait before each successive retry (index = retries already spent). Backing off
+ * keeps a brief outage from stranding the red mark for 8 s while a long one is
+ * not hammered.
+ */
+export const STEAM_SYNC_RETRY_DELAYS_MS = [2000, 4000, 8000];
 
 /** Clean (everything the user set is on the machine) sync state. */
 export const STEAM_SYNC_SYNCED = { field: null, retriesLeft: 0 };
@@ -281,6 +305,13 @@ export function foldSteamSyncState(prev, event) {
         default:
             return state;
     }
+}
+
+/** Delay before the next retry for this sync state; clamps to the last rung. */
+export function steamSyncRetryDelay(state) {
+    const spent = STEAM_SYNC_RETRY_LIMIT - (state?.retriesLeft ?? STEAM_SYNC_RETRY_LIMIT);
+    const index = Math.min(Math.max(0, spent), STEAM_SYNC_RETRY_DELAYS_MS.length - 1);
+    return STEAM_SYNC_RETRY_DELAYS_MS[index];
 }
 
 /** Whether a retry is still owed for the current sync state. */

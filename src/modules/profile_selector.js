@@ -1,16 +1,19 @@
-import { init as initProfileManager, unhideProfile,availableProfiles, assignProfile, setActiveProfile, getActiveProfileId, translateProfileTitle, deleteOrHideProfile, loadAssignments, handleProfileUpload , verifyProfileChange, renameProfile, applyWorkflowToMainPageUI, withSavedBrewTemp, duplicateProfileAsDraft, deleteProfileDraft } from './profileManager.js';
+import { init as initProfileManager, unhideProfile,availableProfiles, assignProfile, setActiveProfile, getActiveProfileId, translateProfileTitle, deleteOrHideProfile, loadAssignments, verifyProfileChange, applyWorkflowToMainPageUI, withSavedBrewTemp, duplicateProfileAsDraft, deleteProfileDraft, lastGrinderSetting, lastTargetDoseWeight, applySavedSteamSettings, DEFAULT_DOSE_WEIGHT } from './profileManager.js';
 import { resolveProfileKeyByTitle } from './active-profile.js';
 import { openDB } from './idb.js';
 import { logger } from './logger.js';
-import { initResizablePanels, showToast, initFullscreenHandler, updateProfileName, setupPressAndHold } from './ui.js';
-import { sendProfile, getWorkflow, updateWorkflow, callPluginEndpoint, getPluginSettings, setPluginSettings, verifyVisualizerCredentials, deleteProfile, updateProfileVisibility, API_BASE_URL } from './api.js';
+import { initResizablePanels, showToast, initFullscreenHandler, updateProfileName, setupPressAndHold, flashIconButton } from './ui.js';
+import { sendProfile, getWorkflow, updateWorkflow, deleteProfile, updateProfileVisibility, getProfileLineage } from './api.js';
+import { profileSendBlocked, setPendingProfileSend } from './profile-send-gate.js';
+import { recipeIdPatch } from './dye-selection.js';
+import { currentMachineState } from './api.js';
 import { initChart, plotProfile } from './chart.js';
 import { translatePage, getTranslation } from './i18n.js';
 import { loadPage } from './router.js';
 import { openContextMenu, closeContextMenu } from './context-menu.js';
+import { pluginMenuEntries } from './plugin-menu-items.js';
+import { showProfileQrModal, initQrShareModal } from './qrShare.js';
 
-// Visualizer credentials storage
-let cachedVisualizerCredentials = null;
 const initializedProfileRoots = new WeakSet();
 // True when the pre-selected profile is just "the first row" rather than the
 // profile the machine actually has loaded -- see initializeProfileSelector.
@@ -28,327 +31,11 @@ function ensureProfilesUpdatedListener() {
     profilesUpdatedListenerInstalled = true;
 }
 
-/**
- * Check if Visualizer credentials are configured
- * @returns {Promise<{configured: boolean, username: string|null, passwordSet: boolean}>}
- */
-async function checkVisualizerCredentials() {
-    if (cachedVisualizerCredentials) {
-        return cachedVisualizerCredentials;
-    }
-    
-    try {
-        const settings = await getPluginSettings('visualizer.reaplugin');
-        const enabled = settings?.Enabled !== false; // Default to enabled
-        const username = settings?.Username;
-        // Secure settings come back as { isSet } state, never plaintext (decaid #588).
-        const password = settings?.Password;
-        const passwordSet = password == null ? false
-            : typeof password === 'object' ? password.isSet === true
-            : !!password; // legacy cleartext from older decaid
-
-        cachedVisualizerCredentials = {
-            configured: enabled && !!(username && passwordSet),
-            enabled: enabled,
-            username: username || null,
-            passwordSet
-        };
-        
-        return cachedVisualizerCredentials;
-    } catch (error) {
-        logger.error('Error checking Visualizer credentials:', error);
-        return { configured: false, enabled: true, username: null, passwordSet: false };
-    }
-}
-
-/**
- * Show the add profile options modal
- */
-function showAddProfileModal() {
-    const modal = document.getElementById('add-profile-modal');
-    if (modal) {
-        modal.showModal();
-    }
-}
-
-/**
- * Close the add profile options modal
- */
-function closeAddProfileModal() {
-    const modal = document.getElementById('add-profile-modal');
-    if (modal) {
-        modal.close();
-    }
-}
-
-/**
- * Handle upload local file button click
- */
-function handleUploadLocalClick() {
-    closeAddProfileModal();
-    const fileInput = document.getElementById('profile-upload-input');
-    if (fileInput) {
-        fileInput.click();
-    }
-}
-
-/**
- * Show the share code input modal
- */
-async function handleImportShareCodeClick() {
-    closeAddProfileModal();
-    
-    // Check credentials first
-    const creds = await checkVisualizerCredentials();
-    
-    if (!creds.enabled) {
-        showToast('Visualizer plugin is disabled. Enable it in Settings.', 4000, 'warning');
-        return;
-    }
-    
-    if (!creds.configured) {
-        // Show login required modal
-        showLoginRequiredModal();
-        return;
-    }
-    
-    // Show share code input modal
-    const modal = document.getElementById('share-code-modal');
-    if (modal) {
-        const input = document.getElementById('share-code-input');
-        const errorMsg = document.getElementById('share-code-error');
-        const importBtn = document.getElementById('share-code-import-btn');
-        
-        // Clear previous input and error
-        if (input) input.value = '';
-        if (errorMsg) {
-            errorMsg.textContent = '';
-            errorMsg.classList.add('hidden');
-        }
-        if (importBtn) importBtn.disabled = false;
-        
-        modal.showModal();
-        
-        // Focus the input after modal opens
-        setTimeout(() => {
-            if (input) input.focus();
-        }, 100);
-    }
-}
-
-/**
- * Show the login required modal
- */
-function showLoginRequiredModal() {
-    const modal = document.getElementById('login-required-modal');
-    if (modal) {
-        modal.showModal();
-    }
-}
-
-/**
- * Close the share code modal
- */
-function closeShareCodeModal() {
-    const modal = document.getElementById('share-code-modal');
-    if (modal) {
-        modal.close();
-    }
-}
-
-/**
- * Close the login required modal
- */
-function closeLoginRequiredModal() {
-    const modal = document.getElementById('login-required-modal');
-    if (modal) {
-        modal.close();
-    }
-}
-
-/**
- * Handle share code import
- */
-async function handleShareCodeImport() {
-    const input = document.getElementById('share-code-input');
-    const errorMsg = document.getElementById('share-code-error');
-    const importBtn = document.getElementById('share-code-import-btn');
-    
-    if (!input) return;
-    
-    const shareCode = input.value.trim();
-    
-    // Validate input
-    if (!shareCode || shareCode.length !== 4) {
-        if (errorMsg) {
-            errorMsg.textContent = 'Please enter a valid 4-digit share code';
-            errorMsg.classList.remove('hidden');
-        }
-        return;
-    }
-    
-    // Disable button during import
-    if (importBtn) {
-        importBtn.disabled = true;
-        importBtn.textContent = 'Importing...';
-    }
-    
-    try {
-        logger.info(`Importing profile from share code: ${shareCode}`);
-        
-        // Call the plugin import endpoint
-        const result = await callPluginEndpoint(
-            'visualizer.reaplugin',
-            'import',
-            { shareCode: shareCode }
-        );
-        
-        logger.info('Profile import result:', result);
-        
-        if (result.success) {
-            // Check for duplicate profile title and handle it
-            const importedTitle = result.profileTitle || 'Imported Profile';
-            
-            // Check if a profile with the same title already exists in current profiles
-            const existingProfileKey = Object.keys(availableProfiles).find(key => {
-                const profile = availableProfiles[key];
-                return profile && profile.profile && profile.profile.title === importedTitle;
-            });
-            
-            let finalTitle = importedTitle;
-            let profileIdToRename = result.profileId;
-            
-            if (existingProfileKey && profileIdToRename) {
-                // Profile with same title exists - rename with suffix
-                let counter = 1;
-                let newTitle = `${importedTitle} (${counter})`;
-                
-                // Keep incrementing until we find a unique name
-                while (Object.values(availableProfiles).some(p => p.profile.title === newTitle)) {
-                    counter++;
-                    newTitle = `${importedTitle} (${counter})`;
-                }
-                finalTitle = newTitle;
-                
-                // Rename the newly imported profile
-                try {
-                    await renameProfile(profileIdToRename, finalTitle);
-                    logger.info(`Renamed duplicate profile to: ${finalTitle}`);
-                } catch (renameError) {
-                    logger.warn('Could not rename duplicate profile:', renameError);
-                }
-            }
-            
-            closeShareCodeModal();
-            showToast(`Profile "${finalTitle}" imported successfully!`, 4000, 'success');
-            
-            // Reinitialize profile manager to refresh the list
-            await initProfileManager();
-            
-            // Re-render profiles
-            renderProfiles();
-        } else {
-            throw new Error(result.error || 'Import failed');
-        }
-    } catch (error) {
-        logger.error('Failed to import profile from share code:', error);
-        
-        if (errorMsg) {
-            errorMsg.textContent = error.message || 'Failed to import profile';
-            errorMsg.classList.remove('hidden');
-        }
-        
-        if (importBtn) {
-            importBtn.disabled = false;
-            importBtn.textContent = getTranslation('Import');
-        }
-    }
-}
-
-/**
- * Initialize modal event listeners
- */
-function initModals() {
-    // Add profile modal buttons
-    const uploadLocalBtn = document.getElementById('upload-local-btn');
-    if (uploadLocalBtn) {
-        uploadLocalBtn.addEventListener('click', handleUploadLocalClick);
-    }
-    
-    const importShareCodeBtn = document.getElementById('import-share-code-btn');
-    if (importShareCodeBtn) {
-        importShareCodeBtn.addEventListener('click', handleImportShareCodeClick);
-    }
-    
-    const addProfileModalClose = document.getElementById('add-profile-modal-close');
-    if (addProfileModalClose) {
-        addProfileModalClose.addEventListener('click', closeAddProfileModal);
-    }
-    
-    // Share code modal buttons
-    const shareCodeCancelBtn = document.getElementById('share-code-cancel-btn');
-    if (shareCodeCancelBtn) {
-        shareCodeCancelBtn.addEventListener('click', closeShareCodeModal);
-    }
-    
-    const shareCodeImportBtn = document.getElementById('share-code-import-btn');
-    if (shareCodeImportBtn) {
-        shareCodeImportBtn.addEventListener('click', handleShareCodeImport);
-    }
-    
-    const shareCodeModalClose = document.getElementById('share-code-modal-close');
-    if (shareCodeModalClose) {
-        shareCodeModalClose.addEventListener('click', closeShareCodeModal);
-    }
-    
-    // Share code input - Enter key support
-    const shareCodeInput = document.getElementById('share-code-input');
-    if (shareCodeInput) {
-        shareCodeInput.addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') {
-                handleShareCodeImport();
-            }
-        });
-        
-        // Limit to 4 characters (alphanumeric)
-        shareCodeInput.addEventListener('input', (e) => {
-            e.target.value = e.target.value.replace(/[^a-zA-Z0-9]/g, '').slice(0, 4);
-            
-            // Enable/disable import button based on length
-            const importBtn = document.getElementById('share-code-import-btn');
-            if (importBtn) {
-                importBtn.disabled = e.target.value.length !== 4;
-            }
-        });
-    }
-    
-    // Login required modal buttons
-    const loginModalCancelBtn = document.getElementById('login-modal-cancel-btn');
-    if (loginModalCancelBtn) {
-        loginModalCancelBtn.addEventListener('click', closeLoginRequiredModal);
-    }
-    
-    const loginModalGoBtn = document.getElementById('login-modal-go-btn');
-    if (loginModalGoBtn) {
-        loginModalGoBtn.addEventListener('click', () => {
-            closeLoginRequiredModal();
-            // Navigate to settings page
-            loadPage('src/settings/settings.html');
-        });
-    }
-    
-    const loginRequiredModalClose = document.getElementById('login-required-modal-close');
-    if (loginRequiredModalClose) {
-        loginRequiredModalClose.addEventListener('click', closeLoginRequiredModal);
-    }
-}
-
 let selectedProfileKey = null;
 let isShowingHidden = false; // State to track if hidden profiles should be shown
 let isSearching = false; // State to track if search mode is active
-const LONG_PRESS_DURATION = 400; // ms
+let searchOutsideHandler = null; // document click listener that dismisses the search bar
 const FAV_COUNT = 5;
-let favoriteButtons = [];
 
 // Suppress browser-default text selection, context menu, tap-highlight, drag, and
 // iOS callout across an entire subtree. Inputs/textareas/contenteditable are
@@ -376,10 +63,159 @@ function suppressBrowserActions(root) {
     root.addEventListener('dragstart', block);
 }
 
-function getEyeIconSVG(strokeColor) {
-    return `<svg aria-hidden="true" class="w-[36px] h-[36px]" viewBox="0 0 66 66" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M5.5 33C5.5 33 13.75 13.75 33 13.75C52.25 13.75 60.5 33 60.5 33C60.5 33 52.25 52.25 33 52.25C13.75 52.25 5.5 33 5.5 33Z" stroke="${strokeColor}" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/><path d="M33 41.25C37.5563 41.25 41.25 37.5563 41.25 33C41.25 28.4437 37.5563 24.75 33 24.75C28.4437 24.75 24.75 28.4437 24.75 33C24.75 37.5563 28.4437 41.25 33 41.25Z" stroke="${strokeColor}" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+function getEyeIconSVG(strokeColor, sizeClass = 'w-[49.5px] h-[49.5px]', strokeWidth = 4) {
+    return `<svg aria-hidden="true" class="${sizeClass}" viewBox="0 0 66 66" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M5.5 33C5.5 33 13.75 13.75 33 13.75C52.25 13.75 60.5 33 60.5 33C60.5 33 52.25 52.25 33 52.25C13.75 52.25 5.5 33 5.5 33Z" stroke="${strokeColor}" stroke-width="${strokeWidth}" stroke-linecap="round" stroke-linejoin="round"/><path d="M33 41.25C37.5563 41.25 41.25 37.5563 41.25 33C41.25 28.4437 37.5563 24.75 33 24.75C28.4437 24.75 24.75 28.4437 24.75 33C24.75 37.5563 28.4437 41.25 33 41.25Z" stroke="${strokeColor}" stroke-width="${strokeWidth}" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 }
 
+// lucide:search, the same glyph profile_selector.html draws in #search_profile
+// -- the button's innerHTML is rebuilt on init and on reset, and both used to
+// hand-roll it at w-[36px], leaving the search icon visibly smaller than the
+// plus/eye/trash beside it (Figma 2662-1343 draws all four at 66 in a 110 box).
+function getSearchIconSVG() {
+    return `<svg aria-hidden="true" class="w-[49.5px] h-[49.5px]" viewBox="0 0 66 66" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M30.25 52.25C42.4003 52.25 52.25 42.4003 52.25 30.25C52.25 18.0997 42.4003 8.25 30.25 8.25C18.0997 8.25 8.25 18.0997 8.25 30.25C8.25 42.4003 18.0997 52.25 30.25 52.25Z" stroke="currentColor" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/><path d="M57.7498 57.7508L45.9248 45.9258" stroke="currentColor" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+}
+
+// Quick-hide affordance on the selected row (Figma: inline eye-off icon).
+// strokeWidth is in the 66 viewBox: 4 for the action-bar glyph, 5.5 for the
+// white glyph in the selected row (Figma keeps it heavier there).
+function getEyeOffIconSVG(strokeColor, sizeClass = 'w-[49.5px] h-[49.5px]', strokeWidth = 4) {
+    return `<svg aria-hidden="true" class="${sizeClass}" viewBox="0 0 66 66" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M5.5 33C5.5 33 13.75 13.75 33 13.75C52.25 13.75 60.5 33 60.5 33C60.5 33 52.25 52.25 33 52.25C13.75 52.25 5.5 33 5.5 33Z" stroke="${strokeColor}" stroke-width="${strokeWidth}" stroke-linecap="round" stroke-linejoin="round"/><path d="M33 41.25C37.5563 41.25 41.25 37.5563 41.25 33C41.25 28.4437 37.5563 24.75 33 24.75C28.4437 24.75 24.75 28.4437 24.75 33C24.75 37.5563 28.4437 41.25 33 41.25Z" stroke="${strokeColor}" stroke-width="${strokeWidth}" stroke-linecap="round" stroke-linejoin="round"/><path d="M9 9L57 57" stroke="${strokeColor}" stroke-width="${strokeWidth}" stroke-linecap="round"/></svg>`;
+}
+
+// Shared by the row context menu's "Hide" item and the selected-row inline
+// eye-off icon so both stay in sync with the draft-vs-real-profile distinction.
+async function hideOrDeleteProfile(key, profileRecord) {
+    if (profileRecord.isDraft) {
+        // A draft never reached the server — nothing to hide there, and
+        // deleteOrHideProfile would 404 trying. Just drop the local copy.
+        await deleteProfileDraft(key);
+    } else {
+        await deleteOrHideProfile(key, { forceHide: true });
+    }
+    const container = document.getElementById('profile-list');
+    if (container) {
+        const item = container.querySelector(`[data-profile-key="${key}"]`);
+        if (item) item.click(); else updateSelectedProfileView(null);
+    }
+    if (profileRecord.isDraft) document.dispatchEvent(new CustomEvent('profiles-updated'));
+}
+
+// Short, human-readable summary of what a Reset to `other` would actually
+// change versus `current` -- shown next to each row's date so picking a
+// version isn't a blind guess from timestamps alone. Execution fields only
+// (steps, shot parameters) -- the same fields REA hashes into the profile
+// id -- so a title-only rename never shows up here, matching the
+// PRESENTATION_FIELDS split profile_editor.js's saveProfile uses.
+const DIFF_FIELD_LABELS = [
+    ['target_weight', 'target weight'],
+    ['target_volume', 'target volume'],
+    ['beverage_type', 'beverage type'],
+    ['tank_temperature', 'tank temperature'],
+    ['target_volume_count_start', 'pre-infusion end'],
+];
+function summarizeProfileDiff(current, other) {
+    if (!current || !other) return '';
+    const parts = [];
+    const stepsA = current.steps || [];
+    const stepsB = other.steps || [];
+    if (stepsA.length !== stepsB.length) {
+        parts.push(`${stepsB.length} step${stepsB.length === 1 ? '' : 's'}`);
+    } else {
+        let changed = 0;
+        for (let i = 0; i < stepsA.length; i++) {
+            if (JSON.stringify(stepsA[i]) !== JSON.stringify(stepsB[i])) changed++;
+        }
+        if (changed) parts.push(`${changed} step${changed === 1 ? '' : 's'} changed`);
+    }
+    for (const [field, label] of DIFF_FIELD_LABELS) {
+        if ((current[field] ?? null) !== (other[field] ?? null)) parts.push(label);
+    }
+    return parts.length ? parts.join(', ') : 'No changes';
+}
+
+// Version picker for the Reset flow. Returns the chosen ProfileRecord, or
+// null on cancel. Picking a row selects it; Confirm applies it -- a row used
+// to restore on the single tap that selected it, which put an unconfirmed,
+// destructive profile swap one stray tap away. `currentProfile` is what a
+// row's date-and-summary line is diffed against -- the profile Reset would
+// actually replace.
+function promptVersionRestore(versions, currentProfile) {
+    return new Promise((resolve) => {
+        const ROW_BASE     = 'text-left px-[16px] py-[14px] rounded-[10px] border-2 bg-[var(--box-color)] cursor-pointer';
+        const ROW_IDLE     = `${ROW_BASE} border-[var(--border-color)] hover:border-[var(--mimoja-blue-v2)]`;
+        const ROW_SELECTED = `${ROW_BASE} border-[var(--mimoja-blue-v2)]`;
+
+        const dlg = document.createElement('dialog');
+        dlg.className = 'pe-history-dialog rounded-[16px] bg-[var(--box-color)] p-0 border border-[var(--border-color)] max-w-[560px] w-[90vw] shadow-2xl';
+        dlg.style.marginTop = '8vh';
+        dlg.style.marginBottom = 'auto';
+
+        dlg.innerHTML = `
+            <div class="flex flex-col gap-[16px] p-[24px]">
+                <h3 class="text-[24px] font-bold text-[var(--text-primary)]">${getTranslation('Version')}</h3>
+                <div data-rows class="flex flex-col gap-[10px] max-h-[46vh] overflow-y-auto"></div>
+                <div class="flex flex-wrap justify-end gap-[12px] mt-[8px]">
+                    <button type="button" data-act="cancel" class="px-[18px] py-[10px] rounded-[10px] bg-[var(--button-grey)] text-[var(--text-primary)] text-[20px] font-semibold cursor-pointer">${getTranslation('Cancel')}</button>
+                    <button type="button" data-act="ok" class="hidden px-[18px] py-[10px] rounded-[10px] bg-[var(--button-primary-bg)] text-white text-[20px] font-semibold cursor-pointer">${getTranslation('Confirm')}</button>
+                </div>
+            </div>`;
+
+        const rowsHost  = dlg.querySelector('[data-rows]');
+        const confirmBtn = dlg.querySelector('[data-act="ok"]');
+        let selected = null;
+
+        // Rows are built as DOM, not interpolated markup: the title is
+        // user-supplied text and this dialog is rendered with innerHTML.
+        const rowBtns = versions.map((v, i) => {
+            const when  = new Date(v.createdAt);
+            const label = isNaN(when.getTime()) ? '' : when.toLocaleString();
+            const summary = summarizeProfileDiff(currentProfile, v.profile);
+
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = ROW_IDLE;
+            btn.dataset.idx = String(i);
+            btn.setAttribute('aria-pressed', 'false');
+
+            const title = document.createElement('div');
+            title.className = 'text-[20px] font-semibold text-[var(--text-primary)]';
+            title.textContent = v.profile?.title || 'Untitled';
+
+            const stamp = document.createElement('div');
+            stamp.className = 'text-[16px] text-[var(--text-primary)]';
+            stamp.style.opacity = '0.6';
+            stamp.textContent = summary ? `${label} · ${summary}` : label;
+
+            btn.appendChild(title);
+            btn.appendChild(stamp);
+            btn.addEventListener('click', () => {
+                selected = v;
+                rowBtns.forEach((b) => {
+                    const on = b === btn;
+                    b.className = on ? ROW_SELECTED : ROW_IDLE;
+                    b.setAttribute('aria-pressed', on ? 'true' : 'false');
+                });
+                confirmBtn.classList.remove('hidden');
+            });
+
+            rowsHost.appendChild(btn);
+            return btn;
+        });
+
+        function done(result) {
+            try { dlg.close(); } catch (_) {}
+            dlg.remove();
+            resolve(result);
+        }
+
+        dlg.querySelector('[data-act="cancel"]').addEventListener('click', () => done(null));
+        confirmBtn.addEventListener('click', () => done(selected));
+        dlg.addEventListener('cancel', (e) => { e.preventDefault(); done(null); });
+
+        document.body.appendChild(dlg);
+        dlg.showModal();
+    });
+}
 
 // Copied from profileManager.js to keep that module's interface clean
 // async function verifyProfileChange(sentProfileTitle, retries = 5, delay = 300) {
@@ -403,6 +239,21 @@ function getEyeIconSVG(strokeColor) {
 
 let isConfirmingProfile = false;
 
+// Reflects why the user landed here: a long press on an unassigned/replaceable
+// favorite button on the main page routes here with pendingAssignmentIndex set
+// (see profileManager.js handleProfileClick/openFavoriteContextMenu) — that is
+// now the only way to assign a favorite, so the header button must say so
+// instead of a generic CONFIRM.
+function applyConfirmButtonLabel(button) {
+    const pendingAssignmentIndex = sessionStorage.getItem('pendingAssignmentIndex');
+    const parsedIndex = pendingAssignmentIndex !== null ? parseInt(pendingAssignmentIndex) : NaN;
+    if (!isNaN(parsedIndex) && parsedIndex >= 0 && parsedIndex < FAV_COUNT) {
+        button.textContent = `${getTranslation('ASSIGN TO')} #${parsedIndex + 1}`;
+    } else {
+        button.textContent = getTranslation('CONFIRM');
+    }
+}
+
 async function handleConfirm() {
     if (isConfirmingProfile) return;
 
@@ -420,14 +271,25 @@ async function handleConfirm() {
         showToast(`An error occurred: selected profile not found.`, 3000, 'alert');
         return;
     }
+    // Never write profile frames into a shot the machine is running -- see
+    // profile-send-gate.js. Hold the switch; app.js sends it when the shot ends.
+    if (profileSendBlocked(currentMachineState)) {
+        setPendingProfileSend(profileRecord);
+        showToast(getTranslation('The machine is brewing — this profile loads when the shot ends.'), 4000, 'info');
+        return;
+    }
     const profile = profileRecord.profile;
     const meta = profileRecord.metadata || {};
-    const savedGrind = meta.grinderSetting ?? null;
+    // Same fallback chains as sendProfileRecordToMachine (profileManager) --
+    // keep them in step. Neither dose nor grind is a
+    // profile field (see DEFAULT_DOSE_WEIGHT), so behind the user's saved override
+    // for this profile there is only the last number they set anywhere. Yield is a
+    // profile field, so the recipe answers for it.
+    const savedGrind = meta.grinderSetting ?? lastGrinderSetting();
     const grindContext = savedGrind != null ? { grinderSetting: savedGrind } : { grinderSetting: null };
-    const effectiveDose  = meta.targetDoseWeight  ?? (profile.dose_weight   || 18);
+    const targetDoseWeight = meta.targetDoseWeight ?? lastTargetDoseWeight() ?? DEFAULT_DOSE_WEIGHT;
     const effectiveYield = meta.targetYield        ?? parseFloat(profile.target_weight);
-    // Same saved-override fold the favourite buttons do (profileManager
-    // applyProfileToMachine) -- this page is the other way into a profile
+    // Same saved-override fold sendProfileRecordToMachine does -- this page is the other way into a profile
     // switch, and without it a brew-temp edit is lost coming through here.
     const profileToSend = withSavedBrewTemp(profile, meta);
 
@@ -469,16 +331,18 @@ async function handleConfirm() {
             const workflowUpdate = {
                 profile: profileToSend,
                 context: {
-                    targetDoseWeight: effectiveDose,
+                    targetDoseWeight,
                     targetYield: effectiveYield,
-                    ...grindContext
+                    ...grindContext,
+                    // Profile change: release the recipe (dye2#36).
+                    ...recipeIdPatch(null)
                 }
             };
 
-            sentworkflow = await updateWorkflow(workflowUpdate);
+            sentworkflow = await updateWorkflow(workflowUpdate, 'profile.send');
         } else {
             const displayYield = isNaN(effectiveYield) ? 0 : effectiveYield;
-            sentworkflow = await updateWorkflow({ profile: profileToSend, context: { targetDoseWeight: effectiveDose, targetYield: displayYield, ...grindContext } });
+            sentworkflow = await updateWorkflow({ profile: profileToSend, context: { targetDoseWeight, targetYield: displayYield, ...grindContext, ...recipeIdPatch(null) } }, 'profile.send');
         }
 
         const verified = sentworkflow.profile.title === profile.title;
@@ -489,6 +353,11 @@ async function handleConfirm() {
             // so the user lands on a page that already reflects what's on Rea
             // instead of waiting for the next WS snapshot to repaint.
             applyWorkflowToMainPageUI(sentworkflow);
+            // Steam rides its own setters, not the workflow context, so the
+            // paint above cannot carry it -- same call the favourite buttons
+            // make (profileManager applySavedSteamSettings). Without it a profile
+            // switched through this page kept the previous profile's steam.
+            await applySavedSteamSettings(meta);
             if (!assignWasRejected) {
                 showToast(`Profile Set`, 3000, 'success');
             }
@@ -509,6 +378,37 @@ function handleCancel() {
 }
 
 
+const NOTES_TRUNCATE_LENGTH = 220;
+
+function escapeHtml(text) {
+    return text.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+// Notes come from profile JSON (uploaded files, imports) so they're untrusted
+// text -- always escape before injecting. Truncates long notes behind a
+// READ MORE/READ LESS toggle (Figma). The toggle button is recreated on every
+// call, so there is never a stale listener to clean up.
+function renderProfileNotes(notesElement, rawNotes, expanded = false) {
+    const safe = escapeHtml(rawNotes || 'No notes for this profile.');
+    const isLong = safe.length > NOTES_TRUNCATE_LENGTH;
+    const body = isLong && !expanded ? `${safe.slice(0, NOTES_TRUNCATE_LENGTH).trim()}&hellip;` : safe;
+    const toggleLabel = expanded ? 'READ LESS' : 'READ MORE';
+    const toggle = isLong ? ` <button type="button" class="font-bold text-[var(--mimoja-blue-v2)]" data-notes-toggle>${toggleLabel}</button>` : '';
+    notesElement.innerHTML = `<p>${body}${toggle}</p>`;
+    notesElement.querySelector('[data-notes-toggle]')?.addEventListener('click', () => {
+        renderProfileNotes(notesElement, rawNotes, !expanded);
+    });
+}
+
+// RESET only makes sense on a saved copy (has a parentId to revert to) --
+// an original profile has nothing to reset, so the button stays out of the
+// way instead of being clickable just to show an error toast.
+function updateResetButtonVisibility(profileRecord) {
+    const btn = document.getElementById('reset_btn');
+    if (!btn) return;
+    btn.classList.toggle('hidden', !profileRecord?.parentId);
+}
+
 function updateSelectedProfileView(profileItem) {
     console.log('updateSelectedProfileView: Updating selected profile view');
     if (!profileItem) {
@@ -524,6 +424,7 @@ function updateSelectedProfileView(profileItem) {
         }
         plotProfile(null); // Clear chart
         selectedProfileKey = null;
+        updateResetButtonVisibility(null);
         return;
     }
 
@@ -542,6 +443,7 @@ function updateSelectedProfileView(profileItem) {
 
     const profileRecord = availableProfiles[selectedProfileKey];
     console.log('updateSelectedProfileView: Profile record found:', !!profileRecord);
+    updateResetButtonVisibility(profileRecord);
 
     if (profileRecord && profileRecord.profile) {
         const profile = profileRecord.profile;
@@ -549,7 +451,7 @@ function updateSelectedProfileView(profileItem) {
         // Update notes
         const notesElement = document.getElementById('profile_notes');
         if (notesElement) {
-            notesElement.innerHTML = `<p>${profile.notes || 'No notes for this profile.'}</p>`;
+            renderProfileNotes(notesElement, profile.notes);
             console.log('updateSelectedProfileView: Updated profile notes');
         }
 
@@ -571,21 +473,7 @@ function showProfileContextMenu(key, profileRecord, anchorEl) {
     const isHidden = profileRecord.visibility === 'hidden';
     const isDraft = profileRecord.isDraft === true;
 
-    async function doHide() {
-        if (isDraft) {
-            // A draft never reached the server — nothing to hide there, and
-            // deleteOrHideProfile would 404 trying. Just drop the local copy.
-            await deleteProfileDraft(key);
-        } else {
-            await deleteOrHideProfile(key, { forceHide: true });
-        }
-        const container = document.getElementById('profile-list');
-        if (container) {
-            const item = container.querySelector(`[data-profile-key="${key}"]`);
-            if (item) item.click(); else updateSelectedProfileView(null);
-        }
-        if (isDraft) document.dispatchEvent(new CustomEvent('profiles-updated'));
-    }
+    const doHide = () => hideOrDeleteProfile(key, profileRecord);
 
     async function doAssign(slotIndex) {
         try {
@@ -593,11 +481,25 @@ function showProfileContextMenu(key, profileRecord, anchorEl) {
             const pr = availableProfiles[key];
             if (pr?.profile) {
                 const meta = pr.metadata || {};
-                const dose     = meta.targetDoseWeight ?? (pr.profile.dose_weight || 18);
+                // Same chain as handleConfirm and the favourite buttons: the user's
+                // override for this profile, then the last dose they set anywhere.
+                const targetDoseWeight = meta.targetDoseWeight ?? lastTargetDoseWeight() ?? DEFAULT_DOSE_WEIGHT;
                 const yieldVal = meta.targetYield ?? parseFloat(pr.profile.target_weight);
-                const grind    = meta.grinderSetting ?? null;
-                try {
-                    await updateWorkflow({ profile: pr.profile, context: { targetDoseWeight: dose, targetYield: isNaN(yieldVal) ? 0 : yieldVal, grinderSetting: grind } });
+                const grind    = meta.grinderSetting ?? lastGrinderSetting();
+                // ...and the same mid-shot guard, for the same reason: this is a
+                // profile switch, so it would rewrite the frames of a running
+                // shot (profile-send-gate.js). Hold it for the end of the shot.
+                if (profileSendBlocked(currentMachineState)) {
+                    // The assignment itself already landed, so only the switch is
+                    // held -- fall through to the "assigned" toast below.
+                    setPendingProfileSend(pr);
+                    showToast(getTranslation('The machine is brewing — this profile loads when the shot ends.'), 4000, 'info');
+                } else try {
+                    // Assigning from here switches the machine to the profile, so it
+                    // owes the same saved overrides as the other two ways in: the
+                    // brew temp folded onto the profile, and steam pushed after.
+                    await updateWorkflow({ profile: withSavedBrewTemp(pr.profile, meta), context: { targetDoseWeight, targetYield: isNaN(yieldVal) ? 0 : yieldVal, grinderSetting: grind, ...recipeIdPatch(null) } }, 'profile.send');
+                    await applySavedSteamSettings(meta);
                     setActiveProfile(key);
                     updateProfileName(pr.profile.title);
                 } catch (_) {}
@@ -624,6 +526,10 @@ function showProfileContextMenu(key, profileRecord, anchorEl) {
             },
         },
         {
+            label: getTranslation('Share'),
+            onSelect: () => showProfileQrModal(profileRecord.profile),
+        },
+        {
             label: getTranslation('Duplicate'),
             onSelect: async () => {
                 try {
@@ -638,6 +544,8 @@ function showProfileContextMenu(key, profileRecord, anchorEl) {
         },
     ];
 
+    // Entries plugins add (kind `menu-item`, menu `profile`) for the profile pressed.
+    items.push(...pluginMenuEntries('profile', { profileId: String(key) }));
     openContextMenu(anchorEl, items);
 }
 
@@ -695,7 +603,70 @@ function renderProfiles() {
             container.appendChild(h);
         };
 
-        const renderProfileItem = ([key, profileRecord]) => {
+        // A family with no real profile named just the base ("A-Flow") gets
+        // this plain, unselectable label as its head instead -- no
+        // data-profile-key, so selectItem's full-list sweep and the initial
+        // auto-select logic both skip right over it.
+        const renderFamilyHeader = (base) => {
+            const h = document.createElement('div');
+            h.className = 'px-3 py-[15.75px] leading-[1.2] text-[30px] text-[var(--text-primary)] select-none';
+            h.setAttribute('role', 'presentation');
+            h.textContent = base;
+            container.appendChild(h);
+        };
+
+        // Group profiles that share a name family: either a common prefix
+        // before a "/", "•" or ":" separator ("A-Flow / default-dark",
+        // "A-Flow / default-light", ... -> family "A-Flow"), or -- when there
+        // is no separator -- an auto-suffixed duplicate title ("Adaptive v2"
+        // / "Adaptive v2 (2)" -> family "Adaptive v2"). Pure title match,
+        // unrelated to parentId/clone lineage -- the "from X" badge below
+        // still covers that separately.
+        const isProfileVisible = (rec) => isShowingHidden || rec.visibility !== 'hidden';
+        const familyBaseTitle = (title) => {
+            const t = title || '';
+            const sep = t.match(/^(.*?)\s*[/•:]\s*\S.*$/);
+            if (sep) return sep[1].trim();
+            return t.replace(/\s*\(\d+\)\s*$/, '').trim();
+        };
+        const familyGroups = new Map();
+        for (const [key, rec] of sortedProfiles) {
+            const title = translateProfileTitle(rec.profile?.title) || rec.profile?.title || '';
+            const base = familyBaseTitle(title);
+            if (!familyGroups.has(base)) familyGroups.set(base, []);
+            familyGroups.get(base).push([key, rec, title]);
+        }
+        // Headed family: one member's own title IS the bare base name, so it
+        // renders normally at depth 0 and the rest nest under it (existing
+        // profile as head). Headless family (no member is titled just the
+        // base -- "A-Flow" itself isn't a profile): a synthetic, unselectable
+        // label row stands in as the head instead.
+        const childrenByFamily = new Map();
+        const syntheticFamilies = new Map();
+        for (const [base, members] of familyGroups) {
+            const visibleMembers = members.filter(([, rec]) => isProfileVisible(rec));
+            if (visibleMembers.length < 2) continue;
+            const headIdx = visibleMembers.findIndex(([, , title]) => title === base);
+            if (headIdx !== -1) {
+                const [headKey] = visibleMembers[headIdx];
+                const children = visibleMembers.filter((_, i) => i !== headIdx).map(([k, rec]) => [k, rec]);
+                if (children.length > 0) childrenByFamily.set(headKey, children);
+            } else {
+                syntheticFamilies.set(base, {
+                    members: visibleMembers.map(([k, rec]) => [k, rec]),
+                    isDefault: visibleMembers[0][1].isDefault === true,
+                });
+            }
+        }
+        const nestedChildKeys = new Set();
+        for (const kids of childrenByFamily.values()) {
+            for (const [k] of kids) nestedChildKeys.add(k);
+        }
+        for (const { members } of syntheticFamilies.values()) {
+            for (const [k] of members) nestedChildKeys.add(k);
+        }
+
+        const renderProfileItem = ([key, profileRecord], depth = 0) => {
             const profile = profileRecord.profile;
             if (!profile) return;
 
@@ -712,7 +683,7 @@ function renderProfiles() {
             const displayTitle = translateProfileTitle(profile.title) || 'Untitled Profile';
 
             const div = document.createElement('div');
-            div.className = 'p-3 text-[30px] cursor-pointer flex justify-between items-center no-select';
+            div.className = 'px-3 py-[15.75px] leading-[1.2] text-[30px] cursor-pointer flex justify-between items-center no-select';
             div.dataset.profileKey = key;
             div.dataset.profileTitle = displayTitle;
             div.setAttribute('role', 'option');
@@ -720,16 +691,40 @@ function renderProfiles() {
             div.setAttribute('aria-label', displayTitle);
             div.tabIndex = -1;
 
+            // Tree indent step matches the Figma spec (node 2662-1377,
+            // Group 315/316: solid black 2px lines) scaled by this app's
+            // usual 0.75 design-px factor (70px indent -> 52px). Each row
+            // draws its own "L" corner (border-left down to its own
+            // mid-height, border-bottom turning right) as ONE element, so it
+            // is always connected by construction -- adjacent siblings'
+            // left borders chain into what reads as one continuous trunk
+            // with a branch off it per row, matching Group 315/316.
+            if (depth > 0) {
+                const indent = depth * 52;
+                div.classList.add('relative');
+                div.style.paddingLeft = `${12 + indent}px`;
+                const connector = document.createElement('span');
+                connector.setAttribute('aria-hidden', 'true');
+                connector.className = 'absolute top-0 bottom-1/2 pointer-events-none';
+                connector.style.left = `${12 + indent - 20}px`;
+                connector.style.width = '20px';
+                connector.style.borderLeft = '2px solid var(--border-primary)';
+                connector.style.borderBottom = '2px solid var(--border-primary)';
+                div.appendChild(connector);
+            }
+
             const leftSide = document.createElement('div');
             leftSide.className = 'flex items-baseline gap-2 min-w-0';
             const titleSpan = document.createElement('span');
             titleSpan.textContent = displayTitle;
             leftSide.appendChild(titleSpan);
 
-            // Lineage badge — "from <parent>" when this is a user-edited clone of a default
+            // Lineage badge only when this row could not be nested under its
+            // parent (parent hidden/filtered out) -- otherwise tree position
+            // already conveys it.
             const parentRecord = profileRecord.parentId ? availableProfiles[profileRecord.parentId] : null;
             const parentTitle = parentRecord?.profile?.title;
-            if (parentTitle) {
+            if (parentTitle && !nestedChildKeys.has(key)) {
                 const badge = document.createElement('span');
                 badge.className = 'text-[16px] px-2 py-0.5 rounded-full bg-white/15 whitespace-nowrap';
                 badge.textContent = `from ${translateProfileTitle(parentTitle)}`;
@@ -737,13 +732,33 @@ function renderProfiles() {
             }
             div.appendChild(leftSide);
 
+            const createHideButton = () => {
+                const hideButton = document.createElement('button');
+                // 49.5px glyph (Figma 66 box); -my-[6.75px] keeps the row at its 36px text height (30px * 1.2).
+                hideButton.className = 'profile-hide-btn px-1 py-0 -my-[6.75px] rounded-full flex-shrink-0';
+                hideButton.title = 'Hide this profile';
+                hideButton.setAttribute('aria-label', `Hide profile ${displayTitle}`);
+                hideButton.innerHTML = getEyeOffIconSVG('currentColor', undefined, 5.5);
+                hideButton.addEventListener('click', async (e) => {
+                    e.stopPropagation();
+                    await hideOrDeleteProfile(key, profileRecord);
+                    renderProfiles();
+                });
+                hideButton.addEventListener('pointerdown', (e) => e.stopPropagation());
+                return hideButton;
+            };
+
+            if (!isHidden && key === selectedProfileKey) {
+                div.appendChild(createHideButton());
+            }
+
             if (isHidden) {
-                div.classList.add('text-[var(--low-contrast-white)]');
+                div.classList.add('text-[var(--text-primary-inactive)]');
                 const unhideButton = document.createElement('button');
-                unhideButton.className = 'p-1 hover:bg-gray-200 rounded-full';
+                unhideButton.className = 'px-1 py-0 -my-[6.75px] hover:bg-[var(--button-grey)] rounded-full text-[var(--button-primary-bg)]';
                 unhideButton.title = 'Show this profile';
                 unhideButton.setAttribute('aria-label', `Show profile ${displayTitle}`);
-                unhideButton.innerHTML = `<svg class="w-6 h-6" aria-hidden="true" viewBox="0 0 66 66" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M5.5 33C5.5 33 13.75 13.75 33 13.75C52.25 13.75 60.5 33 60.5 33C60.5 33 52.25 52.25 33 52.25C13.75 52.25 5.5 33 5.5 33Z" stroke="#385A92" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/><path d="M33 41.25C37.5563 41.25 41.25 37.5563 41.25 33C41.25 28.4437 37.5563 24.75 33 24.75C28.4437 24.75 24.75 28.4437 24.75 33C24.75 37.5563 28.4437 41.25 33 41.25Z" stroke="#385A92" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+                unhideButton.innerHTML = getEyeIconSVG('currentColor');
 
                 unhideButton.addEventListener('click', async (e) => {
                     e.stopPropagation();
@@ -753,11 +768,15 @@ function renderProfiles() {
                 });
                 unhideButton.addEventListener('pointerdown', (e) => e.stopPropagation());
                 div.appendChild(unhideButton);
+            } else if (key === selectedProfileKey) {
+                // Either/or, never both: two text-[...] utilities on one row have
+                // equal specificity, so the winner is whichever Tailwind emitted
+                // last, not whichever was added last. Stacking them left the
+                // selected row reading --text-primary, which is only visible in
+                // light mode -- in dark the two tokens are the same #e8e8e8.
+                div.classList.add('bg-[var(--button-primary-bg)]', 'text-[var(--button-primary-text)]', 'rounded-[7.5px]');
             } else {
                 div.classList.add('text-[var(--text-primary)]');
-                if (key === selectedProfileKey) {
-                    div.classList.add('bg-[#385a92]', 'text-white', 'rounded-[8px]');
-                }
             }
 
             const selectItem = () => {
@@ -766,23 +785,26 @@ function renderProfiles() {
 
                 const allItems = clickedItem.parentElement.querySelectorAll('[data-profile-key]');
                 for(const item of allItems) {
-                    item.classList.remove('bg-[#385a92]', 'text-white', 'rounded-[8px]', 'bg-gray-200', 'text-black');
+                    item.classList.remove('bg-[var(--button-primary-bg)]', 'text-[var(--button-primary-text)]', 'rounded-[7.5px]', 'bg-[var(--button-grey)]', 'text-black', 'text-[var(--text-primary-inactive)]', 'text-[var(--low-contrast-white)]');
                     item.setAttribute('aria-selected', 'false');
+                    item.querySelector('.profile-hide-btn')?.remove();
                     const itemKey = item.dataset.profileKey;
                     if (itemKey && availableProfiles[itemKey] && availableProfiles[itemKey].visibility === 'hidden') {
-                        item.classList.add('text-[var(--low-contrast-white)]');
+                        item.classList.add('text-[var(--text-primary-inactive)]');
                     } else {
                         item.classList.add('text-[var(--text-primary)]');
                     }
                 }
 
                 if (isHidden) {
-                    clickedItem.classList.add('bg-gray-200', 'rounded-[8px]');
-                    clickedItem.classList.remove('text-white');
+                    clickedItem.classList.add('bg-[var(--button-grey)]', 'rounded-[7.5px]');
+                    clickedItem.classList.remove('text-[var(--button-primary-text)]');
+                    clickedItem.classList.add('text-[var(--low-contrast-white)]'); // Primary.Inactive vanishes on --button-grey
 
                 } else {
-                    clickedItem.classList.add('bg-[#385a92]', 'text-white', 'rounded-[8px]');
-                    clickedItem.classList.remove('text-[#121212]');
+                    clickedItem.classList.add('bg-[var(--button-primary-bg)]', 'text-[var(--button-primary-text)]', 'rounded-[7.5px]');
+                    clickedItem.classList.remove('text-[var(--text-primary)]');
+                    clickedItem.appendChild(createHideButton());
                 }
 
                 clickedItem.setAttribute('aria-selected', 'true');
@@ -807,47 +829,108 @@ function renderProfiles() {
             });
 
             container.appendChild(div);
+
+            const kids = childrenByFamily.get(key);
+            if (kids) kids.forEach(child => renderProfileItem(child, depth + 1));
+
+            return div;
         };
 
-        // Partition: built-in defaults vs user-owned (kv records, includes clones)
-        const defaultsList = sortedProfiles.filter(([, r]) => r.isDefault === true);
-        const yoursList = sortedProfiles.filter(([, r]) => r.isDefault !== true);
+        // Resolve the initial selection BEFORE building any rows -- the
+        // per-row render logic below (hide icon, selected background) keys
+        // off selectedProfileKey, so it has to be set first or the very row
+        // it points at renders as if nothing were selected.
+        let justAutoSelected = false;
+        if (!selectedProfileKey) {
+            // Honor a return-from-editor hint, then the loaded profile, before
+            // falling back to the first visible item.
+            const lastEditedKey = sessionStorage.getItem('lastEditedProfileKey');
+            let initialKey = null;
+            if (lastEditedKey) {
+                sessionStorage.removeItem('lastEditedProfileKey');
+                if (availableProfiles[lastEditedKey] && isProfileVisible(availableProfiles[lastEditedKey])) {
+                    initialKey = lastEditedKey;
+                }
+            }
+            if (!initialKey) {
+                const activeKey = findActiveProfileKey();
+                if (activeKey && availableProfiles[activeKey] && isProfileVisible(availableProfiles[activeKey])) {
+                    initialKey = activeKey;
+                }
+            }
+            selectionIsFallback = !initialKey;
+            if (!initialKey) {
+                const firstVisible = sortedProfiles.find(([, r]) => isProfileVisible(r));
+                initialKey = firstVisible ? firstVisible[0] : null;
+            }
+            if (initialKey) {
+                selectedProfileKey = initialKey;
+                justAutoSelected = true;
+            }
+        }
+
+        // Top-level rows: real profiles not absorbed into a family (as a head
+        // or a child either way), plus one synthetic entry per headless
+        // family -- merged and re-sorted together so a family sits wherever
+        // its base name falls alphabetically, same as any other row.
+        const topLevelEntries = [];
+        for (const [key, rec] of sortedProfiles) {
+            if (nestedChildKeys.has(key)) continue;
+            const title = translateProfileTitle(rec.profile?.title) || rec.profile?.title || '';
+            topLevelEntries.push({ type: 'profile', key, rec, sortLabel: title, isDefault: rec.isDefault === true });
+        }
+        for (const [base, info] of syntheticFamilies) {
+            topLevelEntries.push({ type: 'family', base, members: info.members, sortLabel: base, isDefault: info.isDefault });
+        }
+        topLevelEntries.sort((a, b) => a.sortLabel.localeCompare(b.sortLabel));
+
+        const renderTopLevelEntry = (entry) => {
+            if (entry.type === 'family') {
+                renderFamilyHeader(entry.base);
+                entry.members.forEach(member => renderProfileItem(member, 1));
+            } else {
+                renderProfileItem([entry.key, entry.rec], 0);
+            }
+        };
+
+        // Partition: built-in defaults vs user-owned (kv records, includes clones).
+        // Nested children are rendered by their parent's recursive call above,
+        // not as their own top-level row.
+        const defaultsList = topLevelEntries.filter((e) => e.isDefault);
+        const yoursList = topLevelEntries.filter((e) => !e.isDefault);
 
         if (yoursList.length > 0) {
             renderSectionHeader('Your Profiles');
-            yoursList.forEach(renderProfileItem);
+            yoursList.forEach(renderTopLevelEntry);
         }
         if (defaultsList.length > 0) {
             renderSectionHeader('Built-In Profiles');
-            defaultsList.forEach(renderProfileItem);
+            defaultsList.forEach(renderTopLevelEntry);
         }
 
         console.log('renderProfiles: Total visible profiles:', visibleProfileCount);
-        if (visibleProfileCount > 0 && !selectedProfileKey) {
-            // Honor a return-from-editor hint, then the loaded profile, before
-            // falling back to first item.
-            const lastEditedKey = sessionStorage.getItem('lastEditedProfileKey');
-            let initialItem = null;
-            if (lastEditedKey) {
-                initialItem = container.querySelector(`[data-profile-key="${CSS.escape(lastEditedKey)}"]`);
-                sessionStorage.removeItem('lastEditedProfileKey');
-            }
-            if (!initialItem) {
-                const activeKey = findActiveProfileKey();
-                if (activeKey) initialItem = container.querySelector(`[data-profile-key="${CSS.escape(activeKey)}"]`);
-            }
-            selectionIsFallback = !initialItem;
-            if (!initialItem) initialItem = container.querySelector('[data-profile-key]');
-            if (initialItem) {
-                initialItem.classList.add('bg-[#385a92]', 'text-white', 'rounded-[8px]');
-                initialItem.setAttribute('aria-selected', 'true');
-                updateSelectedProfileView(initialItem);
+        if (justAutoSelected) {
+            const selectedEl = container.querySelector(`[data-profile-key="${CSS.escape(selectedProfileKey)}"]`);
+            if (selectedEl) {
+                updateSelectedProfileView(selectedEl);
                 // The list is taller than the pane and sorted alphabetically, so the
-                // pre-selected item is usually out of view. 'nearest' leaves an
-                // already-visible item alone instead of yanking the list.
-                initialItem.scrollIntoView({ block: 'nearest' });
+                // pre-selected item is usually out of view on open. Center it at eye
+                // level rather than snapped to whichever edge it scrolled in from.
+                // justAutoSelected only fires once per page-open (selectedProfileKey
+                // is reset in initializeProfileSelector and set by hand on every
+                // later click), so this never yanks the list out from under someone
+                // who has since scrolled or picked a row.
+                //
+                // Scrolled by hand on #profile-list itself rather than via
+                // scrollIntoView: that walks every scrollable ancestor, including
+                // the app-wide #scaling-container (overflow:hidden but still a JS
+                // scroll target), which shifts the whole scaled page and clips the
+                // fixed-height subpage header off-screen.
+                container.scrollTop = selectedEl.offsetTop - container.clientHeight / 2 + selectedEl.clientHeight / 2;
             }
         }
+
+        syncProfileListScrollThumb();
 
         logger.info(`Profile Editor: Rendered ${visibleProfileCount} profiles.`);
 
@@ -861,82 +944,125 @@ function renderProfiles() {
     }
 }
 
-async function initFavoriteButtons() {
-    await loadAssignments();
+// Hand-drawn, touch-draggable replacement for #profile-list's native
+// scrollbar thumb (see main.css's #profile-list comment): native thumbs
+// can't be touch-dragged in Android WebView, only swipe-scrolled. Mirrors
+// the pill mechanics in profile_editor.js's updateScrollThumb/initScrollThumb
+// (proportional height/position kept in sync with the container's scroll
+// state) but adds drag-to-scroll, since this is the one list in the app
+// whose scrollbar thumb itself needs to be touch-draggable.
+// syncProfileListScrollThumb is standalone (not a closure inside
+// initProfileListScrollThumb) so renderProfiles can call it directly after
+// rebuilding the list, without re-wiring listeners.
+// Fixed pill, same 119.25px the editor panes use, so the thumb doesn't swell
+// when a search leaves only a few rows (capped for very short lists).
+const PROFILE_THUMB_HEIGHT = 119.25;
+function profileListThumbHeight(container) {
+    return Math.min(PROFILE_THUMB_HEIGHT, container.clientHeight);
+}
 
-    favoriteButtons = [];
+function syncProfileListScrollThumb() {
+    const container = document.getElementById('profile-list');
+    const thumb = document.getElementById('profile-list-thumb');
+    if (!container || !thumb) return;
+    const maxScroll = container.scrollHeight - container.clientHeight;
+    if (maxScroll <= 0) {
+        thumb.classList.add('hidden');
+        return;
+    }
+    thumb.classList.remove('hidden');
+    const thumbHeight = profileListThumbHeight(container);
+    const travel = container.clientHeight - thumbHeight;
+    const top = travel > 0 ? (container.scrollTop / maxScroll) * travel : 0;
+    thumb.style.height = `${thumbHeight}px`;
+    // offsetTop: the thumb is positioned against #left-panel (the nearest
+    // positioned ancestor now that #profile-list is no longer wrapped), so
+    // the fixed header row above #profile-list must be added back in.
+    thumb.style.top = `${container.offsetTop + top}px`;
+}
 
-    for (let i = 0; i < FAV_COUNT; i++) {
-        const button = document.getElementById(`assign-fav-btn-${i}`);
-        if (button) {
-            favoriteButtons.push(button);
-        }
+function initProfileListScrollThumb() {
+    const container = document.getElementById('profile-list');
+    const thumb = document.getElementById('profile-list-thumb');
+    if (!container || !thumb) return;
+
+    // dataset flag, not a module-level Set: mirrors profile_editor.js's
+    // initScrollThumb guard so repeated calls don't double-attach.
+    if (!container.dataset.scrollThumbInit) {
+        container.dataset.scrollThumbInit = '1';
+        container.addEventListener('scroll', syncProfileListScrollThumb);
     }
 
-    favoriteButtons.forEach((button, index) => {
-        let pressTimer = null;
+    if (!thumb.dataset.dragInit) {
+        thumb.dataset.dragInit = '1';
 
-        // Browser long-press defaults (text selection, context menu, iOS callout,
-        // tap-highlight, drag) are suppressed at the page root via
-        // suppressBrowserActions(). No per-button wiring needed here.
+        let isDragging = false;
+        let dragStartY = 0;
+        let dragStartScrollTop = 0;
 
-        const startPress = async () => {
-            if (index < 0 || index >= FAV_COUNT) {
-                logger.error(`Invalid button index ${index} in initFavoriteButtons startPress - must be between 0 and ${FAV_COUNT - 1}`);
-                return;
+        // clientY of a mouse or touch event; `||` would treat a mouse at y=0 as
+        // "no clientY" and fall through to the undefined touches list.
+        const pointerY = (e) => (e.touches ? e.touches[0].clientY : e.clientY);
+
+        const startDrag = (e) => {
+            e.preventDefault();
+            isDragging = true;
+            dragStartY = pointerY(e);
+            dragStartScrollTop = container.scrollTop;
+
+            document.addEventListener('mousemove', drag);
+            document.addEventListener('mouseup', stopDrag);
+
+            document.addEventListener('touchmove', drag, { passive: false });
+            document.addEventListener('touchend', stopDrag);
+            // A touch interrupted by the system (e.g. a webview reinterpreting it
+            // as a scroll) fires touchcancel instead of touchend -- without this,
+            // stopDrag never runs and the drag state is stuck.
+            document.addEventListener('touchcancel', stopDrag);
+        };
+
+        const drag = (e) => {
+            if (!isDragging) return;
+
+            if (e.type === 'touchmove') {
+                e.preventDefault();
             }
-            clearTimeout(pressTimer);
-            showToast(`Hold to assign profile.`, 1500, 'info');
-            pressTimer = setTimeout(async () => {
-                if (selectedProfileKey) {
-                    let assignResult = 'unchanged';
-                    try {
-                        assignResult = await assignProfile(index, selectedProfileKey);
-                    } catch (e) {
-                        logger.warn('Caught expected error from assignProfile modal close:', e.message);
-                    }
-                    const profileRecord = availableProfiles[selectedProfileKey];
-                    if (profileRecord && profileRecord.profile) {
-                        const profile = profileRecord.profile;
-                        const meta = profileRecord.metadata || {};
-                        const savedGrind = meta.grinderSetting ?? null;
-                        const grindContext = savedGrind != null ? { grinderSetting: savedGrind } : { grinderSetting: null };
-                        const effectiveDose = meta.targetDoseWeight ?? (profile.dose_weight || 18);
-                        const effectiveYield = meta.targetYield ?? parseFloat(profile.target_weight);
-                        const displayYield = isNaN(effectiveYield) ? 0 : effectiveYield;
-                        try {
-                            await updateWorkflow({
-                                profile,
-                                context: { targetDoseWeight: effectiveDose, targetYield: displayYield, ...grindContext }
-                            });
-                            setActiveProfile(selectedProfileKey);
-                            updateProfileName(profile.title);
-                        } catch (e) {
-                            logger.error('Failed to send profile to machine after assignment:', e);
-                        }
-                        // Only on a genuinely new assignment — a rejected assign has
-                        // already shown its own error toast.
-                        if (assignResult === 'assigned') {
-                            showToast(`${getTranslation('Assign to favourite {n}').replace('{n}', index + 1)}: ${translateProfileTitle(profile.title)}`, 3000, 'success');
-                        }
-                    }
-                } else {
-                    showToast('Please select a profile from the list to assign it.', 3000, 'error');
-                }
-                pressTimer = null;
-            }, LONG_PRESS_DURATION);
+
+            // Read the pointer now: by the time the frame runs a touchend may
+            // have emptied e.touches.
+            const clientY = pointerY(e);
+            requestAnimationFrame(() => {
+                if (!isDragging) return;
+                const maxScroll = container.scrollHeight - container.clientHeight;
+                if (maxScroll <= 0) return;
+                const thumbHeight = profileListThumbHeight(container);
+                const travel = container.clientHeight - thumbHeight;
+                // The page is drawn through scale(sx, sy) (scaling.js), so finger
+                // movement is in screen px while travel is in layout px. Without
+                // this the thumb drifts from the finger on every non-1:1 tablet.
+                const scaleY = container.offsetHeight ? container.getBoundingClientRect().height / container.offsetHeight : 1;
+                const deltaY = (clientY - dragStartY) / (scaleY || 1);
+                const deltaScroll = travel > 0 ? (deltaY / travel) * maxScroll : 0;
+                container.scrollTop = Math.max(0, Math.min(maxScroll, dragStartScrollTop + deltaScroll));
+            });
         };
 
-        const cancelPress = () => {
-            clearTimeout(pressTimer);
+        const stopDrag = () => {
+            isDragging = false;
+
+            document.removeEventListener('mousemove', drag);
+            document.removeEventListener('mouseup', stopDrag);
+
+            document.removeEventListener('touchmove', drag);
+            document.removeEventListener('touchend', stopDrag);
+            document.removeEventListener('touchcancel', stopDrag);
         };
 
-        button.addEventListener('mousedown', startPress);
-        button.addEventListener('mouseup', cancelPress);
-        button.addEventListener('mouseleave', cancelPress);
-        button.addEventListener('touchstart', startPress, { passive: true });
-        button.addEventListener('touchend', cancelPress);
-    });
+        thumb.addEventListener('mousedown', startDrag);
+        thumb.addEventListener('touchstart', startDrag, { passive: false });
+    }
+
+    syncProfileListScrollThumb();
 }
 
 function initDeleteButton() {
@@ -1035,9 +1161,13 @@ function initViewButton() {
     const button = newViewButton;
 
     // Set initial state on load, corresponding to isShowingHidden = false (default bg, blue icon)
-    button.innerHTML = getEyeIconSVG('#385a92'); // Blue icon
-    button.classList.remove("bg-[var(--mimoja-blue)]");
-    button.classList.add("bg-[var(--button-grey)]"); // Use CSS variable for background
+    // Icon shows what the list is doing: crossed eye while hidden profiles are
+    // hidden, open eye (on the active blue) while they are listed.
+    const BIG_ICON = 'w-[49.5px] h-[49.5px]';
+    button.innerHTML = getEyeOffIconSVG('currentColor', BIG_ICON);
+    button.setAttribute('aria-label', 'Show hidden profiles');
+    button.title = 'Show hidden profiles';
+    button.classList.remove("bg-[var(--button-primary-bg)]");
     console.log('initViewButton: Initial state set');
 
     button.addEventListener('click', () => {
@@ -1047,19 +1177,25 @@ function initViewButton() {
         if (isShowingHidden) {
             // State: SHOWING hidden profiles -> blue background, white icon
             button.innerHTML = getEyeIconSVG('currentColor');
+            // On the blue fill the glyph switches to the on-primary colour;
+            // clearing it below drops back to the button's own token class.
+            button.style.color = 'var(--button-primary-text)';
+            button.setAttribute('aria-label', 'Hide hidden profiles');
+            button.title = 'Hide hidden profiles';
             // Use direct style manipulation instead of Tailwind arbitrary values
-            button.style.backgroundColor = 'var(--mimoja-blue)';
-            button.classList.remove("bg-[var(--button-grey)]");
+            button.style.backgroundColor = 'var(--button-primary-bg)';
             if (page_title) {
                 page_title.textContent = "All Profiles";
             }
             console.log('initViewButton: Now showing hidden profiles');
         } else {
             // State: HIDING hidden profiles -> default background, blue icon
-            button.innerHTML = getEyeIconSVG('#385a92');
+            button.innerHTML = getEyeOffIconSVG('currentColor', BIG_ICON);
+            button.setAttribute('aria-label', 'Show hidden profiles');
+            button.title = 'Show hidden profiles';
             // Reset to default background
+            button.style.color = '';
             button.style.backgroundColor = '';
-            button.classList.add("bg-[var(--button-grey)]");
             if (page_title) {
                 page_title.textContent = "Profiles";
             }
@@ -1069,10 +1205,33 @@ function initViewButton() {
         // Force a reflow to ensure style changes are applied
         button.offsetHeight;
 
-        console.log('initViewButton: Calling renderProfiles');
-        renderProfiles();
+        // Re-run an active search under the new scope instead of dropping it.
+        const searchInput = document.getElementById('profile-search-input');
+        if (isSearching && searchInput?.value) {
+            console.log('initViewButton: Re-filtering active search');
+            filterProfiles(searchInput.value.toLowerCase());
+        } else {
+            console.log('initViewButton: Calling renderProfiles');
+            renderProfiles();
+        }
     });
     console.log('initViewButton: Event listener attached');
+}
+
+// Tap feedback for the toolbar's icon buttons. One delegated listener on the
+// toolbar (the buttons themselves get cloned by their init functions, which
+// would drop per-button listeners); see .icon-flash in main.css.
+function initIconFlash() {
+    const toolbar = document.querySelector('#left-panel > div');
+    if (!toolbar || toolbar.dataset.iconFlash) return;
+    toolbar.dataset.iconFlash = '1';
+    toolbar.addEventListener('click', (e) => {
+        // composedPath: the view/search handlers swap their icon first, which
+        // detaches e.target from the button it was clicked in.
+        const btn = e.composedPath().find(el => el.matches?.('#add_profile, #view_profile, #search_profile, #delete_profile'));
+        if (!btn) return;
+        flashIconButton(btn);
+    });
 }
 
 function initSearchButton() {
@@ -1101,9 +1260,8 @@ function initSearchButton() {
     const button = newSearchButton;
 
     // Set initial state on load (default bg, blue icon)
-    button.innerHTML = `<svg class="w-[36px] h-[36px]" viewBox="0 0 66 66" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M30.25 52.25C42.4003 52.25 52.25 42.4003 52.25 30.25C52.25 18.0997 42.4003 8.25 30.25 8.25C18.0997 8.25 8.25 18.0997 8.25 30.25C8.25 42.4003 18.0997 52.25 30.25 52.25Z" stroke="#385A92" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/><path d="M57.7498 57.7508L45.9248 45.9258" stroke="#385A92" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/></svg>`; // Blue icon
-    button.classList.remove("bg-[var(--mimoja-blue)]");
-    button.classList.add("bg-[var(--button-grey)]"); // Use CSS variable for background
+    button.innerHTML = getSearchIconSVG();
+    button.classList.remove("bg-[var(--button-primary-bg)]");
     console.log('initSearchButton: Initial state set');
 
     let searchInput = null;
@@ -1114,10 +1272,11 @@ function initSearchButton() {
 
         if (isSearching) {
             // Enter search mode
-            button.innerHTML = `<svg aria-hidden="true" class="w-[36px] h-[36px]" viewBox="0 0 66 66" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M30.25 52.25C42.4003 52.25 52.25 42.4003 52.25 30.25C52.25 18.0997 42.4003 8.25 30.25 8.25C18.0997 8.25 8.25 18.0997 8.25 30.25C8.25 42.4003 18.0997 52.25 30.25 52.25Z" stroke="#FFFFFF" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/><path d="M57.7498 57.7508L45.9248 45.9258" stroke="#FFFFFF" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/></svg>`; // Blue icon
+            button.innerHTML = getSearchIconSVG();
+            // On the blue fill the glyph switches to the on-primary colour, like the view button.
+            button.style.color = 'var(--button-primary-text)';
             // Use direct style manipulation instead of Tailwind arbitrary values
-            button.style.backgroundColor = 'var(--mimoja-blue)';
-            button.classList.remove("bg-[var(--button-grey)]");
+            button.style.backgroundColor = 'var(--button-primary-bg)';
 
             // Create search input field between search_profile and delete_profile buttons
             if (button.parentNode && deleteButton) {
@@ -1127,23 +1286,40 @@ function initSearchButton() {
                 searchInput.enterKeyHint = 'search';
                 searchInput.placeholder = 'Search profile names...';
                 searchInput.setAttribute('aria-label', 'Search profile names');
-                searchInput.className = 'w-[400px] h-[82px] mx-[30px] px-4 py-2 rounded-[20px] border border-solid border-[var(--border-color)] text-[var(--text-primary)] bg-[var(--profile-button-background-color)] focus:outline-none focus:ring-2 focus:ring-[var(--mimoja-blue)]';
+                searchInput.id = 'profile-search-input';
+                searchInput.className = 'absolute z-10 h-[82.5px] px-4 rounded-[15px] border-[1.5px] border-solid border-[var(--border-primary)] text-[var(--text-primary)] bg-[var(--profile-button-background-color)] focus:outline-none focus:border-[var(--button-primary-bg)]';
                 searchInput.style.fontSize = '28px';
                 searchInput.style.fontWeight = 'bold';
 
-                // Find the element between search and delete buttons and insert the search input there
-                const parentElement = button.parentNode;
-                const searchIndex = Array.prototype.indexOf.call(parentElement.children, button);
-                const deleteIndex = Array.prototype.indexOf.call(parentElement.children, deleteButton);
-
-                // Ensure search button comes before delete button in the DOM
-                if (searchIndex < deleteIndex) {
-                    // Insert after the search button but before the delete button
-                    parentElement.insertBefore(searchInput, deleteButton);
-                } else {
-                    // If delete button comes before search, insert after search button
-                    parentElement.insertBefore(searchInput, button.nextSibling);
-                }
+                // Overlay the toolbar from just right of the search button to its
+                // right padding edge, covering the delete button instead of
+                // pushing it aside; tapping anywhere else dismisses it.
+                const toolbar = document.querySelector('#left-panel > div');
+                toolbar.classList.add('relative');
+                searchInput.style.left = `${button.offsetLeft + button.offsetWidth + 30}px`;
+                searchInput.style.right = '37.5px';
+                searchInput.style.top = '50%';
+                searchInput.style.transform = 'translateY(-50%)';
+                toolbar.appendChild(searchInput);
+                // composedPath, not target.closest: opening the bar swaps the
+                // search button's icon, which detaches the clicked <path> before
+                // this listener runs, so closest() can no longer reach the button.
+                // The profile list is exempt so a result can be picked with search
+                // still open; tapping the search button, Escape, or anywhere else
+                // on the page leaves search.
+                searchOutsideHandler = (e) => {
+                    // Page unmounted (or re-mounted) with search open: the input
+                    // is gone, so drop this listener instead of acting on stale DOM.
+                    if (!document.getElementById('profile-search-input')) {
+                        document.removeEventListener('click', searchOutsideHandler);
+                        searchOutsideHandler = null;
+                        isSearching = false;
+                        return;
+                    }
+                    if (e.composedPath().some(el => el.id === 'profile-search-input' || el.id === 'search_profile' || el.id === 'profile-list')) return;
+                    exitSearchMode();
+                };
+                document.addEventListener('click', searchOutsideHandler);
 
                 // Focus the input
                 searchInput.focus();
@@ -1206,23 +1382,23 @@ function exitSearchMode(originalTitle = null) {
 
     if (searchButton) {
         // Reset the search button to its original state
-        searchButton.innerHTML = `<svg class="w-[36px] h-[36px]" viewBox="0 0 66 66" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M30.25 52.25C42.4003 52.25 52.25 42.4003 52.25 30.25C52.25 18.0997 42.4003 8.25 30.25 8.25C18.0997 8.25 8.25 18.0997 8.25 30.25C8.25 42.4003 18.0997 52.25 30.25 52.25Z" stroke="#385A92" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/><path d="M57.7498 57.7508L45.9248 45.9258" stroke="#385A92" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/></svg>`; // Blue icon
+        searchButton.innerHTML = getSearchIconSVG();
         // Reset to default background
         searchButton.style.backgroundColor = '';
-        searchButton.classList.add("bg-[var(--button-grey)]");
+        searchButton.style.color = '';
     }
 
     // Remove the search input if it exists
-    const searchInput = document.querySelector('#search_profile + input[type="text"]');
-    if (searchInput) {
-        searchInput.remove();
+    document.getElementById('profile-search-input')?.remove();
+    if (searchOutsideHandler) {
+        document.removeEventListener('click', searchOutsideHandler);
+        searchOutsideHandler = null;
     }
 
     if (page_title) {
-        // Restore original title if needed
-        if (page_title.textContent !== 'Profiles') {
-            page_title.textContent = originalTitle || 'Profiles';
-        }
+        // Title follows the eye toggle, not a fixed "Profiles": leaving search
+        // while hidden profiles are listed must keep "All Profiles".
+        page_title.textContent = originalTitle || (isShowingHidden ? 'All Profiles' : 'Profiles');
     }
 
     // Reset the search state and show all profiles
@@ -1259,11 +1435,10 @@ function filterProfiles(searchTerm) {
 
         const profileTitle = profileRecord.profile.title ? profileRecord.profile.title.toLowerCase() : '';
 
-        // A search is a deliberate look for a specific profile by name, hidden
-        // ones included -- unlike the plain list, which still respects the
-        // isShowingHidden toggle. A hidden match renders in the same lighter
-        // text (and with the same unhide button) as the toggled-on list view,
-        // below, so it reads as distinct without needing the toggle first.
+        // Search follows the eye toggle like the plain list: hidden profiles
+        // only match while "All Profiles" is on, and then render in the same
+        // lighter text (with the unhide button) as that list view, below.
+        if (!isShowingHidden && profileRecord.visibility === 'hidden') return false;
         return profileTitle.includes(searchTerm);
     });
 
@@ -1279,6 +1454,7 @@ function filterProfiles(searchTerm) {
         console.log('filterProfiles: No profiles match the search term');
         container.textContent = 'No profiles found.';
         updateSelectedProfileView(null); // Clear right panel
+        syncProfileListScrollThumb();
         return;
     }
 
@@ -1293,7 +1469,7 @@ function filterProfiles(searchTerm) {
         const displayTitle = translateProfileTitle(profile.title) || 'Untitled Profile';
 
         const div = document.createElement('div');
-        div.className = 'p-3 text-[30px] cursor-pointer flex justify-between items-center no-select';
+        div.className = 'px-3 py-[15.75px] leading-[1.2] text-[30px] cursor-pointer flex justify-between items-center no-select';
         div.dataset.profileKey = key;
         div.dataset.profileTitle = displayTitle;
         div.setAttribute('role', 'option');
@@ -1317,12 +1493,12 @@ function filterProfiles(searchTerm) {
         div.appendChild(leftSide);
 
         if (isHidden) {
-            div.classList.add('text-[var(--low-contrast-white)]');
+            div.classList.add('text-[var(--text-primary-inactive)]');
             const unhideButton = document.createElement('button');
-            unhideButton.className = 'p-1 hover:bg-gray-200 rounded-full';
+            unhideButton.className = 'px-1 py-0 -my-[6.75px] hover:bg-[var(--button-grey)] rounded-full text-[var(--button-primary-bg)]';
             unhideButton.title = 'Show this profile';
             unhideButton.setAttribute('aria-label', `Show profile ${displayTitle}`);
-            unhideButton.innerHTML = `<svg class="w-6 h-6" aria-hidden="true" viewBox="0 0 66 66" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M5.5 33C5.5 33 13.75 13.75 33 13.75C52.25 13.75 60.5 33 60.5 33C60.5 33 52.25 52.25 33 52.25C13.75 52.25 5.5 33 5.5 33Z" stroke="#385A92" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/><path d="M33 41.25C37.5563 41.25 41.25 37.5563 41.25 33C41.25 28.4437 37.5563 24.75 33 24.75C28.4437 24.75 24.75 28.4437 24.75 33C24.75 37.5563 28.4437 41.25 33 41.25Z" stroke="#385A92" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+            unhideButton.innerHTML = getEyeIconSVG('currentColor');
 
             unhideButton.addEventListener('click', async (e) => {
                 e.stopPropagation();
@@ -1341,31 +1517,30 @@ function filterProfiles(searchTerm) {
 
             const allItems = clickedItem.parentElement.querySelectorAll('[data-profile-key]');
             for(const item of allItems) {
-                item.classList.remove('bg-[#385a92]', 'text-white', 'rounded-[8px]', 'bg-gray-200', 'text-black');
+                item.classList.remove('bg-[var(--button-primary-bg)]', 'text-[var(--button-primary-text)]', 'rounded-[7.5px]', 'bg-[var(--button-grey)]', 'text-black', 'text-[var(--text-primary-inactive)]', 'text-[var(--low-contrast-white)]');
                 item.setAttribute('aria-selected', 'false');
                 const itemKey = item.dataset.profileKey;
                 if (itemKey && availableProfiles[itemKey] && availableProfiles[itemKey].visibility === 'hidden') {
-                    item.classList.add('text-[var(--low-contrast-white)]');
+                    item.classList.add('text-[var(--text-primary-inactive)]');
                 } else {
                     item.classList.add('text-[var(--text-primary)]');
                 }
             }
 
             if (isHidden) {
-                clickedItem.classList.add('bg-gray-200', 'rounded-[8px]');
-                clickedItem.classList.remove('text-white');
+                clickedItem.classList.add('bg-[var(--button-grey)]', 'rounded-[7.5px]');
+                clickedItem.classList.remove('text-[var(--button-primary-text)]');
+                clickedItem.classList.add('text-[var(--low-contrast-white)]'); // Primary.Inactive vanishes on --button-grey
 
             } else {
-                clickedItem.classList.add('bg-[#385a92]', 'text-white', 'rounded-[8px]');
-                clickedItem.classList.remove('text-[#121212]');
+                clickedItem.classList.add('bg-[var(--button-primary-bg)]', 'text-[var(--button-primary-text)]', 'rounded-[7.5px]');
+                clickedItem.classList.remove('text-[var(--text-primary)]');
             }
 
             clickedItem.setAttribute('aria-selected', 'true');
-            // Update the selected profile view first
             updateSelectedProfileView(clickedItem);
-
-            // Then exit search mode to preserve the selection
-            exitSearchMode();
+            // Search stays open after picking a result: leave it with the
+            // search button, Escape, or a tap outside the list.
         });
 
         container.appendChild(div);
@@ -1375,11 +1550,19 @@ function filterProfiles(searchTerm) {
     selectedProfileKey = null;
 
     console.log('filterProfiles: Added', sortedProfiles.length, 'profiles to filtered list');
+    syncProfileListScrollThumb();
 }
 
 
 // Main initialization function that can be called externally
 export async function initializeProfileSelector() {
+    // Module state outlives the page: clear any search left over from a
+    // previous mount so its document listener can't fire against the new DOM.
+    if (searchOutsideHandler) {
+        document.removeEventListener('click', searchOutsideHandler);
+        searchOutsideHandler = null;
+    }
+    isSearching = false;
     console.log('initializeProfileSelector: Starting initialization');
 
     const pageRoot =
@@ -1394,6 +1577,7 @@ export async function initializeProfileSelector() {
 
     translatePage();
     console.log('initializeProfileSelector: i18n translated');
+    initQrShareModal();
 
     // Suppress browser-default selection/long-press/drag/callout across the whole
     // profile-selector page. Delegated listeners on the root also cover items
@@ -1459,12 +1643,6 @@ export async function initializeProfileSelector() {
             logger.warn('Could not resolve the loaded profile from the workflow:', e.message);
         }
     }
-
-    // Clear cached credentials so we always get fresh data
-    cachedVisualizerCredentials = null;
-
-    // Initialize modals
-    initModals();
 
     // Wire up add profile button
     const originalAddProfileButton = document.getElementById('add_profile');
@@ -1532,19 +1710,13 @@ export async function initializeProfileSelector() {
             };
             loadPage('src/profiles/profile_editor.html');
         });
-        // Also handle the file input to prevent duplicate listeners
-        const originalFileInput = document.getElementById('profile-upload-input');
-        if (originalFileInput) {
-            const newFileInput = originalFileInput.cloneNode(true);
-            originalFileInput.parentNode.replaceChild(newFileInput, originalFileInput);
-            newFileInput.addEventListener('change', handleProfileUpload);
-        }
     }
 
     ensureProfilesUpdatedListener();
 
     console.log('initializeProfileSelector: Initializing resizable panels');
     initResizablePanels('separator');
+    initProfileListScrollThumb();
     console.log('initializeProfileSelector: Setting up confirm button');
     const confirmBtn = document.getElementById('confirm-profile-btn');
     if (confirmBtn) {
@@ -1552,6 +1724,7 @@ export async function initializeProfileSelector() {
         const newConfirmBtn = confirmBtn.cloneNode(true);
         confirmBtn.parentNode.replaceChild(newConfirmBtn, confirmBtn);
         newConfirmBtn.addEventListener('click', handleConfirm);
+        applyConfirmButtonLabel(newConfirmBtn);
     }
 
     console.log('initializeProfileSelector: Setting up cancel button');
@@ -1566,43 +1739,43 @@ export async function initializeProfileSelector() {
     initDeleteButton();
     console.log('initializeProfileSelector: Initializing view button');
     initViewButton();
-    console.log('initializeProfileSelector: Initializing favorite buttons');
-    await initFavoriteButtons();
     console.log('initializeProfileSelector: Initializing search button');
     initSearchButton();
+    initIconFlash();
     console.log('initializeProfileSelector: Initializing fullscreen handler');
     initFullscreenHandler();
 
 
-    const editProfileBtnRaw = document.getElementById('edit_profile');
-    const editProfileBtn = editProfileBtnRaw ? (() => {
-        const clone = editProfileBtnRaw.cloneNode(true);
-        editProfileBtnRaw.parentNode.replaceChild(clone, editProfileBtnRaw);
-        return clone;
-    })() : null;
-    if (editProfileBtn) {
-        editProfileBtn.addEventListener('click', () => {
-            console.log('[EditBtn] clicked. selectedProfileKey=', selectedProfileKey);
+    const wireEditTrigger = (id) => {
+        const raw = document.getElementById(id);
+        if (!raw) {
+            console.warn(`[EditBtn] #${id} not found in DOM`);
+            return;
+        }
+        const clone = raw.cloneNode(true);
+        raw.parentNode.replaceChild(clone, raw);
+        clone.addEventListener('click', () => {
             if (!selectedProfileKey) {
                 showToast('Select a profile first', 3000, 'error');
                 return;
             }
             const profileRecord = availableProfiles[selectedProfileKey];
-            console.log('[EditBtn] profileRecord=', profileRecord);
-            if (!profileRecord) {
-                console.warn('[EditBtn] profileRecord is null/undefined, aborting');
-                return;
-            }
-            console.log('[EditBtn] Setting window.__pendingEditProfile and navigating...');
+            if (!profileRecord) return;
             window.__pendingEditProfile = profileRecord;
-            console.log('[EditBtn] window.__pendingEditProfile set:', window.__pendingEditProfile?.profile?.title);
             loadPage('src/profiles/profile_editor.html');
         });
-    } else {
-        console.warn('[EditBtn] #edit_profile button not found in DOM');
-    }
+    };
+    wireEditTrigger('edit_profile');
+    wireEditTrigger('edit-profile-name-btn');
 
     // Wire reset button
+    // Reset used to jump exactly one hop up profileRecord.parentId, no matter
+    // how many saves separated the current record from the one that hop
+    // landed on. Older saves are never actually deleted (see saveProfile's
+    // hide+replace overwrite) -- they sit hidden in the lineage, restorable --
+    // so ask which one first instead of guessing.
+    let pendingResetTarget = null;
+
     const resetBtnRaw = document.getElementById('reset_btn');
     const resetBtn = resetBtnRaw ? (() => {
         const clone = resetBtnRaw.cloneNode(true);
@@ -1610,7 +1783,7 @@ export async function initializeProfileSelector() {
         return clone;
     })() : null;
     if (resetBtn) {
-        resetBtn.addEventListener('click', () => {
+        resetBtn.addEventListener('click', async () => {
             if (!selectedProfileKey) {
                 showToast('Select a profile first', 3000, 'error');
                 return;
@@ -1623,9 +1796,35 @@ export async function initializeProfileSelector() {
                 return;
             }
 
+            let lineage;
+            try {
+                lineage = await getProfileLineage(selectedProfileKey);
+            } catch (e) {
+                showToast('Could not load version history', 3000, 'error');
+                return;
+            }
+            // /lineage returns the whole chain -- parents AND children -- so
+            // without this Reset could offer a *later* fork as something to
+            // "revert" to. Strictly older only: it's a revert, never a jump
+            // forward.
+            const currentCreatedAt = new Date(profileRecord.createdAt);
+            const versions = (lineage || [])
+                .filter(r => r.id !== selectedProfileKey && r.profile && new Date(r.createdAt) < currentCreatedAt)
+                .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+            if (!versions.length) {
+                showToast('No previous versions to reset to.', 2500, 'info');
+                return;
+            }
+
+            // Always shown, even with a single entry -- one consistent picker
+            // rather than two different popups depending on chain length.
+            const chosen = await promptVersionRestore(versions, profileRecord.profile);
+            if (!chosen) return;
+            pendingResetTarget = chosen;
+
             const title = translateProfileTitle(profileRecord.profile?.title) || 'this profile';
             const msgEl = document.getElementById('reset-profile-msg');
-            if (msgEl) msgEl.textContent = `"${title}" is a saved copy. Resetting will delete it and restore the original. This cannot be undone.`;
+            if (msgEl) msgEl.textContent = `"${title}" is a saved copy. Resetting will delete it and restore the selected version. This cannot be undone.`;
 
             const modal = document.getElementById('reset-profile-modal');
             if (modal) modal.showModal();
@@ -1640,6 +1839,7 @@ export async function initializeProfileSelector() {
     })() : null;
     if (resetCancelBtn) {
         resetCancelBtn.addEventListener('click', () => {
+            pendingResetTarget = null;
             document.getElementById('reset-profile-modal')?.close();
         });
     }
@@ -1653,23 +1853,28 @@ export async function initializeProfileSelector() {
     if (resetConfirmBtn) {
         resetConfirmBtn.addEventListener('click', async () => {
             document.getElementById('reset-profile-modal')?.close();
-            if (!selectedProfileKey) return;
-
-            const profileRecord = availableProfiles[selectedProfileKey];
-            const parentId = profileRecord?.parentId || null;
-            if (!parentId) return;
+            const target = pendingResetTarget;
+            pendingResetTarget = null;
+            if (!selectedProfileKey || !target) return;
 
             try {
                 await deleteProfile(selectedProfileKey);
                 delete availableProfiles[selectedProfileKey];
-                selectedProfileKey = availableProfiles[parentId] ? parentId : null;
+                // The chosen version may be an older, hidden save (saveProfile
+                // hides the predecessor on every overwrite) -- surface it again.
+                if (target.visibility !== 'visible') {
+                    await updateProfileVisibility(target.id, 'visible');
+                    target.visibility = 'visible';
+                }
+                availableProfiles[target.id] = target;
+                selectedProfileKey = availableProfiles[target.id] ? target.id : null;
                 renderProfiles();
                 // updateSelectedProfileView expects the rendered DOM element, not the record
                 const nextItem = selectedProfileKey
                     ? document.querySelector(`#profile-list [data-profile-key="${CSS.escape(selectedProfileKey)}"]`)
                     : null;
                 updateSelectedProfileView(nextItem);
-                showToast('Profile reset to original.', 2500, 'success');
+                showToast('Profile reset.', 2500, 'success');
             } catch (e) {
                 console.error('[ResetProfile] delete failed:', e);
                 showToast(`Failed to reset profile: ${e.message}`, 4000, 'error');
@@ -1677,76 +1882,7 @@ export async function initializeProfileSelector() {
         });
     }
 
-    await initAiGenerateButton();
     console.log('initializeProfileSelector: Initialization complete');
-}
-
-async function initAiGenerateButton() {
-    const link = document.getElementById('ai_generate_profile');
-    if (!link) return;
-
-    try {
-        const resp = await fetch(`${API_BASE_URL}/plugins`);
-        if (!resp.ok) throw new Error('plugins fetch failed');
-        const plugins = await resp.json();
-        const plugin = plugins.find(p => p.id === 'decent-profile.reaplugin');
-        if (!plugin?.loaded) { link.style.display = 'none'; return; }
-    } catch {
-        link.style.display = 'none';
-        return;
-    }
-
-    // No profileGenerated WS subscription here on purpose: a generated profile
-    // must never be auto-imported. The plugin's "upload to Decent" button is the
-    // only path — it uploads on explicit user action. Subscribing here re-imported
-    // the WS's retained last generation on every page open (spurious green toast).
-
-    // Point the link at the SAME reaprime the skin talks to (reaHostname), not a
-    // hardcoded localhost. Otherwise, when reaHostname is a remote/device IP, the
-    // plugin opens on localhost and its "Upload to Decent" POST /api/v1/profiles
-    // saves to a DIFFERENT server than the skin lists from — the profile persists
-    // but never shows up here. API_BASE_URL already encodes host:port.
-    link.href = `${API_BASE_URL}/plugins/decent-profile.reaplugin/ui?layout=baseline`;
-
-    // Set the output format once now (not on click) so the tap can navigate
-    // natively — the plain <a href> (no target) is a same-frame navigation, which
-    // the host intercepts to open the OS browser with the plugin URL (gh#384).
-    setPluginSettings('decent-profile.reaplugin', { profileFormat: 'json-v2' })
-        .catch((err) => logger.warn('Could not set profileFormat=json-v2:', err));
-
-    // The anchor's own same-frame navigation performs the tap; we only add a flag
-    // handler so we know the user left for the plugin. The plugin's "Upload to
-    // Decent" saves via POST /api/v1/profiles, so when the user returns we just
-    // re-pull the library and it appears. Same-frame nav guarantees the skin page
-    // is either hidden (webview -> OS browser) or unloaded (browser), so one of
-    // pageshow/visibilitychange always fires on return.
-    const fresh = link.cloneNode(true); // drop stale listeners
-    link.parentNode.replaceChild(fresh, link);
-    fresh.addEventListener('click', () => { window.__reaAwaitGeneratedProfile = true; });
-
-    // Register the return-listeners once — initAiGenerateButton re-runs on every
-    // dynamic-content-loaded, so guard against stacking duplicate handlers.
-    if (!window.__reaProfileRefreshWired) {
-        window.__reaProfileRefreshWired = true;
-        const refreshIfReturning = async () => {
-            if (!window.__reaAwaitGeneratedProfile) return;
-            if (document.visibilityState === 'hidden') return; // wait until actually shown
-            window.__reaAwaitGeneratedProfile = false;
-            await initProfileManager(); // re-fetch /api/v1/profiles into availableProfiles
-            renderProfiles();
-            // The plugin's "Upload to Decent" also does PUT /workflow, making the
-            // uploaded profile the active one. Re-pull the workflow so #profile-name
-            // (and the dose/grind/steam displays) reflect the new active profile.
-            try {
-                const workflow = await getWorkflow();
-                if (workflow) applyWorkflowToMainPageUI(workflow); // updateName defaults true
-            } catch (e) {
-                logger.warn('Workflow refresh after profile upload failed:', e);
-            }
-        };
-        document.addEventListener('visibilitychange', refreshIfReturning);
-        window.addEventListener('pageshow', refreshIfReturning); // bfcache restore (browser)
-    }
 }
 
 // Call initialization when DOM is ready for traditional page loads

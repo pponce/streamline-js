@@ -69,6 +69,20 @@ test('setting names and their descriptions are indexed', () => {
     assert.ok(kw.includes('visualiser password'));
 });
 
+test('hidden fields do not send search users to controls that are not on the page', () => {
+    const kw = pluginKeywords({
+        id: 'custom.reaplugin', name: 'Custom settings', description: 'Open the configuration page',
+        settings: {
+            internalReadings: { hidden: true, description: 'Serialized measurement shadow' },
+            AutoUpload: { hidden: false, description: 'Upload automatically' },
+        },
+    });
+    assert.ok(kw.includes('custom settings'));
+    assert.ok(kw.includes('open the configuration page'));
+    assert.ok(kw.includes('auto upload'));
+    assert.doesNotMatch(kw, /internal|readings|serialized|measurement|shadow/);
+});
+
 test('a PascalCase setting name is also indexed word by word', () => {
     // Without the split, searching "upload" would miss "AutoUpload".
     assert.ok(pluginKeywords(visualizer).includes('auto upload'));
@@ -101,14 +115,14 @@ test('a subcategory still matches on its own name and id', () => {
 });
 
 test('keywords make a plugin setting reachable from the page that hosts it', () => {
-    const subcat = { id: 'extention1', name: 'Visualizer', keywords: pluginKeywords(visualizer) };
+    const subcat = { id: 'plugin-visualizer', name: 'Visualizer', keywords: pluginKeywords(visualizer) };
     assert.equal(subcategoryMatches(subcat, 'upload'), true);
     assert.equal(subcategoryMatches(subcat, 'threshold'), true);
     assert.equal(subcategoryMatches(subcat, 'grinder'), false);
 });
 
 test('matching is case-insensitive and an empty term matches everything', () => {
-    const subcat = { id: 'extention1', name: 'Visualizer', keywords: pluginKeywords(visualizer) };
+    const subcat = { id: 'plugin-visualizer', name: 'Visualizer', keywords: pluginKeywords(visualizer) };
     assert.equal(subcategoryMatches(subcat, 'UPLOAD'), true);
     assert.equal(subcategoryMatches(subcat, ''), true);
 });

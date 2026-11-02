@@ -1,6 +1,9 @@
 import { readFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { decideResync } from '../src/modules/resync-policy.js';
+import { profileAtBrewTemp } from '../src/modules/brew-temp.js';
+import { selectedRecipeSteamTemp } from '../src/modules/dye-selection.js';
 
 // Persistence of the user's main-page settings: the shared KV record that
 // outranks a drifted workflow (milk stop, plus the resync rule every tile value
@@ -20,38 +23,53 @@ function lift(module, patterns) {
     }).join('\n');
 }
 
+// The own-push tracking resyncIfDrifted and the KV-first setters share.
+const TRACKING = [
+    /const lastOwnPush = new Map\(\);/,
+    /const pendingPushKey = .*;/,
+    /async function readPendingPush\(key\) \{[\s\S]*?\r?\n\}/,
+    /async function pushRemembered\(key, value, send\) \{[\s\S]*?\r?\n\}/,
+];
+
 // ── Milk stop + the shared KV resync rule (api.js) ───────────────────────────
 {
     const body = lift('api.js', [
         /export const MILK_STOP_LAST_VALUE_KEY = .*;/,
         /export async function readSharedValue\(key\) \{[\s\S]*?\r?\n\}/,
+        ...TRACKING,
         /export async function resyncIfDrifted\(key, fetchedValue, pushFn\) \{[\s\S]*?\r?\n\}/,
         /export async function resyncMilkStopIfDrifted\(stopAtTemperature\) \{[\s\S]*?\r?\n\}/,
         /export async function setStopAtTemperature\(celsius\) \{[\s\S]*?\r?\n\}/,
     ]);
 
-    const build = (remembered) => {
+    // `pending` is the per-device marker of a push of ours that never landed.
+    const build = (remembered, { pending = null } = {}) => {
         const kvWrites = [];
         const workflowWrites = [];
+        const pendingWrites = [];
         const api = new Function(
-            'logger', 'persistSharedValue', 'updateWorkflow', 'getValueFromStore', 'openDB', 'getSetting',
+            'logger', 'persistSharedValue', 'persistLastValue', 'updateWorkflow', 'getValueFromStore', 'openDB', 'getSetting', 'decideResync',
              `const isAutoSteamActive = () => false; ${body}\nreturn { setStopAtTemperature, resyncMilkStopIfDrifted, resyncIfDrifted };`,
         )(
             { warn() {}, error() {} },
             async (key, value) => { kvWrites.push([key, value]); },
+            async (key, value) => { pendingWrites.push([key, value]); },
             async (patch) => { workflowWrites.push(patch); },
             async () => remembered,
             async () => {},
-            async () => remembered,
+            async (key) => (key.startsWith('pending-') ? pending : remembered),
+            decideResync,
         );
-        return { api, kvWrites, workflowWrites };
+        return { api, kvWrites, workflowWrites, pendingWrites };
     };
 
     test('an armed milk stop is remembered in KV before it reaches the machine', async () => {
-        const { api, kvWrites, workflowWrites } = build(null);
+        const { api, kvWrites, workflowWrites, pendingWrites } = build(null);
         await api.setStopAtTemperature(60);
         assert.deepEqual(kvWrites, [['last-milk-stop', 60]]);
         assert.deepEqual(workflowWrites, [{ steamSettings: { stopAtTemperature: 60 } }]);
+        // Marked pending before the PUT, cleared once it landed.
+        assert.deepEqual(pendingWrites, [['pending-last-milk-stop', 60], ['pending-last-milk-stop', null]]);
     });
 
     test('turning the stop off writes the machine but never the KV record', async () => {
@@ -63,8 +81,15 @@ function lift(module, patterns) {
         assert.deepEqual(workflowWrites, [{ steamSettings: { stopAtTemperature: 0 } }]);
     });
 
-    test('a drifted armed stop is re-pushed from the KV record', async () => {
+    test('an armed stop changed by another writer is adopted, not pushed back (#105)', async () => {
         const { api, kvWrites, workflowWrites } = build(60);
+        assert.equal(await api.resyncMilkStopIfDrifted(55), null);
+        assert.deepEqual(workflowWrites, []);
+        assert.deepEqual(kvWrites, [['last-milk-stop', 55]]);
+    });
+
+    test('an armed stop whose own push never landed is re-pushed', async () => {
+        const { api, kvWrites, workflowWrites } = build(60, { pending: 60 });
         await api.resyncMilkStopIfDrifted(55);
         assert.deepEqual(workflowWrites, [{ steamSettings: { stopAtTemperature: 60 } }]);
         assert.deepEqual(kvWrites, [['last-milk-stop', 60]]);
@@ -86,7 +111,7 @@ function lift(module, patterns) {
     test('a stored value above the API ceiling is clamped on the way out', async () => {
         // rest_v1.yml SteamSettings.stopAtTemperature documents range 0..80; the tile
         // used to allow 85, so an older KV record can still hold one.
-        const { api, kvWrites, workflowWrites } = build(85);
+        const { api, kvWrites, workflowWrites } = build(85, { pending: 85 });
         await api.resyncMilkStopIfDrifted(60);
         assert.deepEqual(workflowWrites, [{ steamSettings: { stopAtTemperature: 80 } }]);
         assert.deepEqual(kvWrites, [['last-milk-stop', 80]]);
@@ -106,7 +131,7 @@ function lift(module, patterns) {
         // Pushing alone leaves the tile on the drifted workflow value. Steam flow,
         // the milk stop and the flush duration are in no websocket payload, so
         // nothing else would ever correct them.
-        const { api } = build(45);
+        const { api } = build(45, { pending: 45 });
         assert.equal(await api.resyncIfDrifted('last-anything', 30, async () => {}), 45);
         assert.equal(await api.resyncMilkStopIfDrifted(55), 45);
     });
@@ -119,6 +144,30 @@ function lift(module, patterns) {
         assert.equal(await api.resyncMilkStopIfDrifted(0), null);
     });
 
+    test('a value some other writer set is adopted and not repainted or pushed', async () => {
+        const pushed = [];
+        const { api, kvWrites } = build(45);
+        assert.equal(await api.resyncIfDrifted('last-anything', 30, async (v) => { pushed.push(v); }), null);
+        assert.deepEqual(pushed, []);
+        assert.deepEqual(kvWrites, [['last-anything', 30]]);
+    });
+
+    test('a push that fails stays pending so it can be retried after a reload', async () => {
+        const kvWrites = [];
+        const pendingWrites = [];
+        const failing = new Function(
+            'persistSharedValue', 'persistLastValue', 'openDB', 'getSetting', 'logger',
+            `${body}\nreturn pushRemembered;`,
+        )(
+            async (key, value) => { kvWrites.push([key, value]); },
+            async (key, value) => { pendingWrites.push([key, value]); },
+            async () => {}, async () => null, { warn() {} },
+        );
+        await assert.rejects(failing('last-milk-stop', 60, async () => { throw new Error('503'); }));
+        assert.deepEqual(kvWrites, [['last-milk-stop', 60]]);
+        assert.deepEqual(pendingWrites, [['pending-last-milk-stop', 60]]);
+    });
+
     test('with nothing remembered the machine value stands', async () => {
         const pushed = [];
         const { api } = build(null);
@@ -128,64 +177,115 @@ function lift(module, patterns) {
     });
 }
 
-// ── Steam duration 0 = steam off, heater included (api.js) ──────────────────
+// ── Steam duration 0 = no timer; the heater is a separate switch (api.js) ───
 {
     const body = lift('api.js', [
         /export const STEAM_DURATION_LAST_VALUE_KEY = .*;/,
         /export const STEAM_TEMP_LAST_VALUE_KEY = .*;/,
         /export async function readSharedValue\(key\) \{[\s\S]*?\r?\n\}/,
+        ...TRACKING,
         /export async function setTargetSteamTemp\(temp\) \{[\s\S]*?\r?\n\}/,
         /async function steamHeaterFor\(duration\) \{[\s\S]*?\r?\n\}/,
         /export async function setTargetSteamDuration\(duration\) \{[\s\S]*?\r?\n\}/,
+        /export async function setSteamHeaterEnabled\(enabled\) \{[\s\S]*?\r?\n\}/,
     ]);
 
     // `remembered` is the KV record of the last enabled temperature; `machineTemp`
     // is what the workflow currently holds.
-    const build = (remembered, machineTemp = 150) => {
+    const build = (remembered, machineTemp = 150, dye = {}) => {
         const kvWrites = [];
         const workflowWrites = [];
         const api = new Function(
-            'logger', 'persistSharedValue', 'updateWorkflow', 'getWorkflow', 'getValueFromStore', 'openDB', 'getSetting',
-            `const isAutoSteamActive = () => false; ${body}\nreturn { setTargetSteamDuration, setTargetSteamTemp };`,
+            'logger', 'persistSharedValue', 'persistLastValue', 'updateWorkflow', 'getWorkflow', 'getValueFromStore', 'openDB', 'getSetting',
+            'localStorage', 'getKVValue', 'getDye2KvArray', 'DYE2_KV_NAMESPACE', 'selectedRecipeSteamTemp',
+            `const isAutoSteamActive = () => false; ${body}\nreturn { setTargetSteamDuration, setSteamHeaterEnabled, setTargetSteamTemp };`,
         )(
             { warn() {}, error() {} },
             async (key, value) => { kvWrites.push([key, value]); },
+            async () => {},
             async (patch) => { workflowWrites.push(patch); },
             async () => ({ steamSettings: { targetTemperature: machineTemp } }),
             async () => remembered,
             async () => {},
             async () => remembered,
+            { getItem: () => (dye.enabled ? 'true' : null) },
+            async () => dye.selection ?? null,
+            async () => dye.recipes ?? null,
+            'dye2.reaplugin',
+            selectedRecipeSteamTemp,
         );
         return { api, kvWrites, workflowWrites };
     };
 
-    test('duration 0 switches the heater off too', async () => {
+    test('duration 0 means no timer and leaves the heater alone', async () => {
         // rest_v1.yml: SteamSettings.duration "does not control steam-heater
-        // preheating" -- only targetTemperature 0 does. Sending duration alone
-        // left the boiler heating for a user who asked for steam off.
+        // preheating". 0 is "no timer, run until stopped", so the patch carries
+        // the duration only -- the heater has its own switch.
         const { api, kvWrites, workflowWrites } = build(null, 150);
         await api.setTargetSteamDuration(0);
-        assert.deepEqual(workflowWrites, [{ steamSettings: { duration: 0, targetTemperature: 0 } }]);
-        // The temperature it was switched off from is remembered, not lost.
-        assert.deepEqual(kvWrites, [['last-steam-duration', 0], ['last-steam-temp', 150]]);
+        assert.deepEqual(workflowWrites, [{ steamSettings: { duration: 0 } }]);
+        assert.deepEqual(kvWrites, [['last-steam-duration', 0]]);
     });
 
-    test('re-arming steam restores the remembered temperature', async () => {
+    test('a duration write from a heater-off machine sends no temperature', async () => {
         const { api, workflowWrites } = build(150, 0);
-        await api.setTargetSteamDuration(30);
-        assert.deepEqual(workflowWrites, [{ steamSettings: { duration: 30, targetTemperature: 150 } }]);
-    });
-
-    test('with nothing remembered the machine keeps whatever temperature it has', async () => {
-        const { api, workflowWrites } = build(null, 150);
         await api.setTargetSteamDuration(30);
         assert.deepEqual(workflowWrites, [{ steamSettings: { duration: 30 } }]);
     });
 
+    test('switching the heater off remembers the temperature and sends 0', async () => {
+        const { api, kvWrites, workflowWrites } = build(null, 150);
+        await api.setSteamHeaterEnabled(false);
+        assert.deepEqual(workflowWrites, [{ steamSettings: { targetTemperature: 0 } }]);
+        assert.deepEqual(kvWrites, [['last-steam-temp', 150]]);
+    });
+
+    test('switching the heater on restores the remembered temperature', async () => {
+        const { api, workflowWrites } = build(150, 0);
+        await api.setSteamHeaterEnabled(true);
+        assert.deepEqual(workflowWrites, [{ steamSettings: { targetTemperature: 150 } }]);
+    });
+
+    test('a temperature set outside Streamline while steam is on is not overridden (#143)', async () => {
+        const { api, workflowWrites } = build(150, 140);
+        await api.setSteamHeaterEnabled(true);
+        assert.deepEqual(workflowWrites, [{ steamSettings: {} }]);
+    });
+
+    test('a selected recipe steam temperature beats the remembered one on re-arm', async () => {
+        const dye = { enabled: true, selection: { kind: 'recipe', id: '2' }, recipes: [{ id: '2', dashboardVariables: { steamTempC: 140 } }] };
+        const { api, workflowWrites } = build(150, 0, dye);
+        await api.setSteamHeaterEnabled(true);
+        assert.deepEqual(workflowWrites, [{ steamSettings: { targetTemperature: 140 } }]);
+    });
+
+    test('DYE2 disabled or nothing selected falls back to the remembered temperature', async () => {
+        const recipes = [{ id: '2', dashboardVariables: { steamTempC: 140 } }];
+        const off = build(150, 0, { enabled: false, selection: { kind: 'recipe', id: '2' }, recipes });
+        await off.api.setSteamHeaterEnabled(true);
+        assert.deepEqual(off.workflowWrites, [{ steamSettings: { targetTemperature: 150 } }]);
+        const none = build(150, 0, { enabled: true, recipes });
+        await none.api.setSteamHeaterEnabled(true);
+        assert.deepEqual(none.workflowWrites, [{ steamSettings: { targetTemperature: 150 } }]);
+    });
+
+    test('a recipe steam temperature does not override a heater already on (#143)', async () => {
+        const dye = { enabled: true, selection: { kind: 'recipe', id: '2' }, recipes: [{ id: '2', dashboardVariables: { steamTempC: 140 } }] };
+        const { api, workflowWrites } = build(150, 145, dye);
+        await api.setSteamHeaterEnabled(true);
+        assert.deepEqual(workflowWrites, [{ steamSettings: {} }]);
+    });
+
+    test('with nothing remembered the machine keeps whatever temperature it has', async () => {
+        const { api, workflowWrites } = build(null, 150);
+        await api.setSteamHeaterEnabled(true);
+        assert.deepEqual(workflowWrites, [{ steamSettings: {} }]);
+    });
+
     test('an already-off machine has no temperature worth remembering', async () => {
         const { api, kvWrites } = build(null, 0);
-        await api.setTargetSteamDuration(0);
-        assert.deepEqual(kvWrites, [['last-steam-duration', 0]]);
+        await api.setSteamHeaterEnabled(false);
+        assert.deepEqual(kvWrites, []);
     });
 
     test('only enabled steam temperatures are remembered', async () => {
@@ -206,6 +306,7 @@ function lift(module, patterns) {
     const body = lift('api.js', [
         /export const HOT_WATER_VOLUME_LAST_VALUE_KEY = .*;/,
         /export const HOT_WATER_TEMP_LAST_VALUE_KEY = .*;/,
+        ...TRACKING,
         /export async function setTargetHotWaterVolume\(volume\) \{[\s\S]*?\r?\n\}/,
         /export async function setTargetHotWaterTemp\(temp\) \{[\s\S]*?\r?\n\}/,
     ]);
@@ -214,11 +315,14 @@ function lift(module, patterns) {
     const build = ({ putFails = false } = {}) => {
         const order = [];
         const api = new Function(
-            'logger', 'persistSharedValue', 'updateWorkflow',
+            'logger', 'persistSharedValue', 'persistLastValue', 'openDB', 'getSetting', 'updateWorkflow',
             `${body}\nreturn { setTargetHotWaterVolume, setTargetHotWaterTemp };`,
         )(
             { warn() {}, error() {} },
             async (key, value) => { order.push(['kv', key, value]); },
+            async () => {},
+            async () => {},
+            async () => null,
             async (patch) => {
                 order.push(['workflow', patch]);
                 if (putFails) throw new Error('503 Workflow request queue timed out');
@@ -380,14 +484,15 @@ function lift(module, patterns) {
 // ── Per-profile brew-temp override (profileManager.js) ───────────────────────
 {
     const withSavedBrewTemp = new Function(
+        'profileAtBrewTemp',
         `${lift('profileManager.js', [/export function withSavedBrewTemp\(profile, metadata\) \{[\s\S]*?\r?\n\}/])}
-         return withSavedBrewTemp;`)();
+         return withSavedBrewTemp;`)(profileAtBrewTemp);
 
     const profile = { title: 'Classic', steps: [{ temperature: 92, name: 'infuse' }, { temperature: 88, name: 'decline' }] };
 
-    test('a saved brew temp is applied to every step', () => {
+    test('a saved brew temp moves the whole curve and keeps the profile shape', () => {
         const out = withSavedBrewTemp(profile, { brewTemperature: 94 });
-        assert.deepEqual(out.steps.map(s => s.temperature), [94, 94]);
+        assert.deepEqual(out.steps.map(s => s.temperature), [94, 90]); // 92 -> 88 shifted by +2
         assert.equal(out.title, 'Classic');
         assert.equal(out.steps[1].name, 'decline'); // other step fields survive
     });
@@ -418,3 +523,116 @@ test('the transient Auto steam session remains device-local', () => {
     assert.doesNotMatch(syncedKeys, /streamline\.autoSteamSession/);
 });
 
+// Main-page quick presets used to live in IndexedDB, which the WebView loses on
+// every Decaid app update -- a user's favourite 14:28 ratio had to be re-entered
+// each time. They now go through localStorage so the KV mirror carries them.
+test('every main-page preset key is mirrored to KV', () => {
+    const ui = readFileSync(new URL('../src/modules/ui.js', import.meta.url), 'utf8');
+    const sync = readFileSync(new URL('../src/modules/settingsSync.js', import.meta.url), 'utf8');
+    const syncedKeys = sync.match(/export const SYNCED_KEYS = \[[\s\S]*?\];/)?.[0];
+    assert.ok(syncedKeys, 'SYNCED_KEYS declaration not found');
+
+    const presetKeys = [...ui.matchAll(/^const [A-Z_]*PRESETS?[A-Z_]*_KEY = '([^']+)';$/gm)].map(m => m[1]);
+    assert.ok(presetKeys.length >= 9, `expected the preset keys, found ${presetKeys.length}`);
+    for (const key of presetKeys) {
+        assert.match(syncedKeys, new RegExp(`'${key}'`), `${key} is not mirrored to KV`);
+    }
+});
+
+test('preset writes do not go back to IndexedDB', () => {
+    const ui = readFileSync(new URL('../src/modules/ui.js', import.meta.url), 'utf8');
+    assert.doesNotMatch(ui, /\bsetSetting\(\s*[A-Z_]*PRESET/);
+});
+
+// A hydrate that lands after the page painted (Decaid answered on the retry
+// ladder) has to tell the UI, or the buttons keep showing pre-restore values.
+test('a late restore announces the keys it applied', () => {
+    const sync = readFileSync(new URL('../src/modules/settingsSync.js', import.meta.url), 'utf8');
+    const ui = readFileSync(new URL('../src/modules/ui.js', import.meta.url), 'utf8');
+
+    assert.match(sync, /export const SETTINGS_RESTORED_EVENT = '[^']+';/);
+    // Fired only when something actually changed, and carrying what changed.
+    assert.match(sync, /if \(Object\.keys\(applied\)\.length\) \{[\s\S]*?dispatchEvent\(new CustomEvent\(SETTINGS_RESTORED_EVENT, \{ detail: applied \}\)\)/);
+
+    // ui.js listens and re-runs a loader for every preset key it persists.
+    assert.match(ui, /addEventListener\(SETTINGS_RESTORED_EVENT/);
+    const handler = ui.match(/function initPresetRestoreListener\(\) \{[\s\S]*?\r?\n\}/)?.[0];
+    assert.ok(handler, 'initPresetRestoreListener not found');
+    for (const key of [...ui.matchAll(/^const ([A-Z_]*PRESETS?[A-Z_]*_KEY) = '[^']+';$/gm)].map(m => m[1])) {
+        // The selected-index and model keys are bookkeeping, not button labels.
+        if (/INDEX|MODEL/.test(key)) continue;
+        assert.match(handler, new RegExp(`\\[${key}\\]`), `${key} has no restore repaint`);
+    }
+    assert.match(ui, /initPresetRestoreListener\(\);/);
+});
+
+// ── Consumer-side ordering (#168) ───────────────────────────────────────────
+//
+// hydrate() being correct is not enough: a reader that runs before it finishes gets the
+// DEFAULT, and nothing repainted the surface afterwards. dyeStrip is the case that bit --
+// `streamline.dye2Enabled` is on SYNCED_KEYS, and index.html starts initDyeStrip from its
+// own DOMContentLoaded listener, separate from app.js's gated one, so on a second client (or
+// any client after an app update, which wipes WebView storage) the DYE button stayed missing
+// for the whole session while Settings showed the extension enabled.
+
+test('the DYE2 boot reader waits for hydration, and still listens for a late restore', () => {
+    const source = readFileSync(new URL('../src/modules/dyeStrip.js', import.meta.url), 'utf8');
+    const init = source.slice(source.indexOf('export async function initDyeStrip('));
+    const body = init.slice(0, init.indexOf('\n}\n'));
+
+    assert.ok(body.includes('await settingsReady'), 'the flag is read behind settingsReady');
+    assert.ok(body.indexOf('await settingsReady') < body.indexOf('const on = isDye2Enabled()'),
+        'and the await comes first, or the read answers with the pre-hydration default');
+    // settingsReady resolves even when Decaid never answered, so the gate alone is not
+    // enough: the real value then arrives through the retry ladder's restore event.
+    assert.ok(/addEventListener\(SETTINGS_RESTORED_EVENT/.test(body), 'a late restore is heard');
+    assert.ok(body.indexOf('addEventListener(SETTINGS_RESTORED_EVENT') < body.indexOf('await settingsReady'),
+        'registered before the await: the on-time hydrate dispatches while settingsReady is pending');
+    assert.ok(body.includes('ENABLED_KEY in (event.detail || {})'),
+        'and only reacts to its own key');
+});
+
+function buildDyeUi() {
+    const calls = [];
+    const body = lift('dyeStrip.js', [/async function applyDye2Ui\([\s\S]*?\r?\n\}/]);
+    const api = new Function('enableDye2Ui', 'disableDye2Ui',
+        `let dye2UiOn = null;\n${body}\nreturn { applyDye2Ui, shown: () => dye2UiOn };`
+    )(async () => { calls.push('enable'); }, () => { calls.push('disable'); });
+    return { api, calls };
+}
+
+// disableDye2Ui() bumps applySeq, clears the armed item, forgets the parked selection and
+// releases DYE2's selection, so running it on a restore that only confirms what the header
+// already shows would throw away live state.
+test('the surface is only touched when it actually changes', async () => {
+    const { api, calls } = buildDyeUi();
+    await api.applyDye2Ui(false);          // boot, flag off
+    await api.applyDye2Ui(false);          // a restore confirming off
+    assert.deepEqual(calls, ['disable'], 'the confirming restore is a no-op');
+    await api.applyDye2Ui(true);           // the late restore that fixes #168
+    assert.deepEqual(calls, ['disable', 'enable']);
+    assert.equal(api.shown(), true);
+    await api.applyDye2Ui(true);
+    assert.deepEqual(calls, ['disable', 'enable'], 'and so is a confirming restore when on');
+});
+
+test('an unhydrated boot that turns out to be enabled shows the surface once', async () => {
+    const { api, calls } = buildDyeUi();
+    await api.applyDye2Ui(true);
+    assert.deepEqual(calls, ['enable'], 'no spurious disable first');
+});
+
+// settingsSync cannot import ui.js, so RESTORE_HANDLED_KEYS is a copy of its
+// preset keys; a preset ui.js repaints but this list lacks would force a reload.
+test('the late-restore handled keys cover every preset ui.js repaints', () => {
+    const ui = readFileSync(new URL('../src/modules/ui.js', import.meta.url), 'utf8');
+    const sync = readFileSync(new URL('../src/modules/settingsSync.js', import.meta.url), 'utf8');
+    const handled = sync.match(/export const RESTORE_HANDLED_KEYS = \[[\s\S]*?\];/)?.[0];
+    assert.ok(handled, 'RESTORE_HANDLED_KEYS declaration not found');
+    const byKey = ui.match(/const byKey = \{([\s\S]*?)\n    \};/)?.[1];
+    assert.ok(byKey, 'byKey map not found');
+    const presetKeys = [...byKey.matchAll(/\[([A-Z_]+_KEY)\]/g)].map(m =>
+        ui.match(new RegExp(`const ${m[1]} = '([^']+)';`))?.[1]);
+    assert.ok(presetKeys.length >= 8 && presetKeys.every(Boolean));
+    for (const key of presetKeys) assert.match(handled, new RegExp(`'${key}'`), `${key} missing`);
+});

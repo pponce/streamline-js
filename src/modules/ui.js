@@ -1,14 +1,19 @@
-import { autoSteamDurationLabel, autoSteamPitcherLabel, shouldKeepAutoSteamMode, steamAdjustmentControls } from './auto-steam-flow.js';
+import { autoSteamPitcherLabel, compactAutoSteamTargetLabel, shouldKeepAutoSteamMode, steamAdjustmentControls } from './auto-steam-flow.js';
 import { manualSteamMode, steamModeCycle } from './auto-steam-capability.js';
-import { getProfile, getWorkflow, updateWorkflow, setMachineState, setTargetHotWaterVolume, setTargetHotWaterTemp, setTargetHotWaterDuration, setDe1Settings, setTargetSteamFlow, setTargetSteamDuration, setStopAtTemperature, resyncSteamFromStore, MachineState, persistSharedValue, FLUSH_DURATION_LAST_VALUE_KEY, isBlackScreenSaver } from './api.js';
-import { openDB, getSetting, setSetting } from './idb.js';
-import { deriveSleepButtonAction, isWakePending } from './screensaver-policy.js';
+import { getProfile, getWorkflow, updateWorkflow, setMachineState, setTargetHotWaterVolume, setTargetHotWaterTemp, setTargetHotWaterDuration, setDe1Settings, setTargetSteamFlow, setTargetSteamDuration, setStopAtTemperature, resyncSteamFromStore, MachineState, persistSharedValue, FLUSH_DURATION_LAST_VALUE_KEY, isBlackScreenSaver, getSaverBrightness } from './api.js';
+import { resolveStatusStateKey, isActionTailSubstate } from './machine-status-policy.js';
+import { openDB, getSetting } from './idb.js';
+import { SCREENSAVER_CLOCK_FORMATS, SCREENSAVER_CLOCK_POSITIONS, SCREENSAVER_DATE_FORMATS, formatScreensaverClockDate, formatScreensaverClockTime, screensaverClockPositionStyle } from './screensaver-clock.js';
+import { deriveSleepButtonAction, isWakePending, mayTapWakeMachine } from './screensaver-policy.js';
 import { isBengleMachine, isBengleModel } from './machine.js';
-import { STEAM_FLOW_PRESETS_BY_MODEL, MILK_STOP_PRESETS, resolveSteamFlowPresetsForModel, resolveSteamTileMode, milkTelemetryValue, steamFlowHighlightIndex, STEAM_SYNC_SYNCED, steamSyncField, foldSteamSyncState, shouldRetrySteamSync } from './steam-mode.js';
+import { STEAM_FLOW_PRESETS_BY_MODEL, MILK_STOP_PRESETS, resolveSteamFlowPresetsForModel, resolveSteamTileMode, steamSlotField as resolveSteamSlotField, milkTelemetryValue, steamFlowHighlightIndex, STEAM_SYNC_SYNCED, steamSyncField, foldSteamSyncState, shouldRetrySteamSync, steamSyncRetryDelay } from './steam-mode.js';
+import { API_DEBOUNCE_MS } from './workflow-watch.js';
 import { shouldUseNumpad } from './numpad-policy.js';
 import { openContextMenu } from './context-menu.js';
 import { initCalibratedSteam } from './calibrated-steam-ui.js';
 import { logger } from './logger.js';
+import { shouldWriteStatus } from './machine-status-render.js';
+import { SETTINGS_RESTORED_EVENT } from './settingsSync.js';
 import * as chart from './chart.js';
 
 function openNumpadModal(...args) {
@@ -20,6 +25,10 @@ function openNumpadModal(...args) {
 import { getSupportedLanguages, getCurrentLanguage, setLanguage, getTranslation, fitTextToWidth } from './i18n.js';
 import { getTotalTime as getShotTotalTime } from './shotData.js';
 import { formatTemp, fromDisplayTemp, displayStepToCelsius, boundToDisplay, getTempUnit } from './units.js';
+import { stepValue, formatRatio } from './value-format.js';
+import { targetWeightProfilePatch, brewTempProfilePatch } from './brew-temp.js';
+import { resolveStepSize, yieldForRatio, doseForRatio } from './plugin-surfaces.js';
+import { clampSetValue } from './plugin-surfaces.js';
 
 
 function initLanguageSwitcher() {
@@ -142,6 +151,16 @@ async function handleAutoSteamCalculationError(error) {
 }
 
 export function isAutoSteamMode() { return steamMode === 'auto' || calibratedSteamApplying; }
+
+// Plugin steam tile-modes are not offered while Auto is on (its -/+ are taken), so
+// tell them when that changes.
+let announcedAutoSteam = false;
+function announceAutoSteamChange() {
+    const auto = isAutoSteamMode();
+    if (auto === announcedAutoSteam) return;
+    announcedAutoSteam = auto;
+    document.dispatchEvent(new CustomEvent('streamline:steamautochange', { detail: { auto } }));
+}
 let currentMilkStop = 60; // milk auto-stop target °C (workflow.stopAtTemperature)
 let milkProbePresent = false; // live probe presence, fed by app.js (setMilkProbePresent)
 let milkStopArmed = false;    // workflow stopAtTemperature > 0, as last seen/written
@@ -152,6 +171,7 @@ let milkStopPresets = [...MILK_STOP_PRESETS]; // Milk-mode stop-target presets (
 const DEFAULT_STEAM_TIME_PRESETS = [15, 30, 45, 60];
 const STEAM_TIME_PRESETS_KEY = 'steam-time-presets-user';
 const DEFAULT_MILK_STOP_PRESETS = [...MILK_STOP_PRESETS];
+const MILK_STOP_PRESETS_KEY = 'milk-stop-presets-user';
 // Machine-model-specific steam-flow preset groups live in steam-mode.js
 // (pure, node-tested). Resolved at boot via setSteamFlowPresetsFromMachineModel().
 let DEFAULT_STEAM_FLOW_PRESETS = [...STEAM_FLOW_PRESETS_BY_MODEL.standard];
@@ -159,9 +179,10 @@ const STEAM_FLOW_PRESETS_KEY = 'steam-flow-presets-user';
 const STEAM_FLOW_PRESET_INDEX_KEY = 'steam-flow-preset-selected-index';
 const STEAM_FLOW_PRESETS_MODEL_KEY = 'steam-flow-presets-model';
 let selectedSteamFlowPresetIndex = 1; // default = second leftmost
+// Last model app.js resolved the flow presets for; replayed by a late KV restore.
+let lastSteamFlowModel = null;
 let steamApiDebounce = null;
 let hotWaterApiDebounce = null;
-const API_DEBOUNCE_MS = 1000;
 
 // When a tile last scheduled a write. The workflow watch reads this: repainting a
 // tile from the server between a debounced push and the next keypress would
@@ -172,11 +193,23 @@ function markTileInteraction() { lastTileInteractionAt = Date.now(); }
 export function msSinceTileInteraction() { return Date.now() - lastTileInteractionAt; }
 
 let grindStep = 0.1;
+// The -/+ step a connected grinder declares for its grind setting; null when none is connected.
+let grinderDeclaredStep = null;
+export function setGrinderGrindStep(step) { grinderDeclaredStep = Number.isFinite(step) && step > 0 ? step : null; }
 
 // How long the steam elapsed counter will pick up where it left off. Covers a
 // dropped/odd status frame; a genuine second steam session is always further
 // apart than this.
 const STEAM_RESUME_GRACE_MS = 2000;
+
+// Tap feedback for icon buttons: flashes the active blue (see .icon-flash in
+// main.css). Restarts cleanly on rapid taps.
+export function flashIconButton(button) {
+    button.classList.remove('icon-flash');
+    void button.offsetWidth;
+    button.classList.add('icon-flash');
+    setTimeout(() => button.classList.remove('icon-flash'), 350);
+}
 
 export function flashPlusMinusButton(button) {
     // Add the flash animation class
@@ -189,36 +222,88 @@ export function flashPlusMinusButton(button) {
     }, 280);
 }
 
+// Plugin `keepRatio` (a Drink hint or line that says so): a new dose carries the
+// yield with it. Set by the surface renderer, null when no such surface is shown.
+let keepRatio = null;
+let keepRatioMoves = 'both'; // 'both' | 'yield' | 'dose': which tile a change moves
+export function setDrawnKeepRatio(ratio, moves = 'both') { keepRatio = ratio || null; keepRatioMoves = moves; }
+const ratioMovesYield = () => keepRatio && keepRatioMoves !== 'dose';
+const ratioMovesDose = () => keepRatio && keepRatioMoves !== 'yield';
+
+// The profile fragment to send with a new stop-at-weight: only target_weight. Decaid
+// deep-merges it into the workflow's profile, so the temperatures the Brew tile (or a
+// plugin) wrote survive without reading the workflow back, which could be stale while
+// an earlier write is still going out to the machine.
+function profileWithTargetWeight(targetWeight) {
+    return Promise.resolve(targetWeightProfilePatch(targetWeight));
+}
+
 function updateDoseValue(type, newValue) {
     const doseInEl = document.getElementById('dose-in-value');
     const drinkOutEl = document.getElementById('drink-out-value');
     const currentDoseIn = doseInEl ? parseFloat(doseInEl.textContent) : 0;
     const currentDoseOut = drinkOutEl ? parseFloat(drinkOutEl.textContent) : 0;
 
-    const targetYield = type === 'out' ? parseFloat(newValue) : currentDoseOut;
+    let targetYield = type === 'out' ? parseFloat(newValue) : currentDoseOut;
+    // The yield is worked out here, not by the plugin afterwards, so dose and yield
+    // reach Decaid together and the ratio on screen never shows the new dose over the
+    // old yield. The callers repaint the ratio label from what is on screen.
+    let ratioYield = null;
+    let targetDose = type === 'in' ? parseFloat(newValue) : currentDoseIn;
+    let ratioDose = null;
+    if (type === 'in' && ratioMovesYield()) {
+        ratioYield = yieldForRatio(parseFloat(newValue), keepRatio);
+        if (ratioYield !== null) {
+            targetYield = ratioYield;
+            updateDrinkOut(ratioYield);
+        }
+    } else if (type === 'out' && ratioMovesDose()) {
+        ratioDose = doseForRatio(parseFloat(newValue), keepRatio);
+        if (ratioDose !== null) {
+            targetDose = ratioDose;
+            updateDoseInDisplay(ratioDose);
+        }
+    }
+    // Paint both tiles from the pair that is about to be sent. A dose tap and a drink
+    // tap inside one debounce each fire later with their own number; without this the
+    // later write left the other tile showing the earlier tap's value.
+    if (ratioYield !== null || ratioDose !== null) {
+        updateDoseInDisplay(targetDose);
+        updateDrinkOut(targetYield);
+    }
     const payload = {
         context: {
-            targetDoseWeight: type === 'in' ? parseFloat(newValue) : currentDoseIn,
+            targetDoseWeight: targetDose,
             targetYield
         }
     };
     // Non-autonomous machines stop on profile.target_weight, not context.targetYield —
     // fold the yield into the sent profile so the stop matches the UI number.
-    const activeProfile = window.app?.getActiveProfileRecord?.()?.profile;
-    if (activeProfile && Number.isFinite(targetYield) && targetYield > 0) {
-        payload.profile = { ...activeProfile, target_weight: targetYield };
-    }
-
-    updateWorkflow(payload).then(() => {
+    return profileWithTargetWeight(targetYield).then(profile => {
+        if (profile) payload.profile = profile;
+        return updateWorkflow(payload, 'tiles.doseYield');
+    }).then(() => {
         logger.debug(`Dose ${type} value updated via workflow:`, newValue);
         if (type === 'in') {
-            window.app?.saveContextToActiveProfile?.({ targetDoseWeight: parseFloat(newValue) });
+            window.app?.saveContextToActiveProfile?.({ targetDoseWeight: parseFloat(newValue),
+                ...(ratioYield !== null && { targetYield: ratioYield }) });
         } else {
-            window.app?.saveContextToActiveProfile?.({ targetYield: parseFloat(newValue) });
+            window.app?.saveContextToActiveProfile?.({ targetYield: parseFloat(newValue),
+                ...(ratioDose !== null && { targetDoseWeight: ratioDose }) });
         }
     }).catch(error => {
-        logger.error(`Failed to update dose ${type} value via workflow:`, error);
+        tileWriteFailed(`dose ${type} value`, error);
     });
+}
+
+// A tile write Decaid refused (503 machine unavailable, 409 superseded, ...). The
+// tile was painted optimistically, so put the workflow's value back at once
+// instead of leaving the failed number up until the next poll: the forced
+// workflow-refresh event repaints the tiles through app.js's normal path.
+function tileWriteFailed(what, error) {
+    logger.error(`Failed to update ${what} via workflow:`, error);
+    showToast(getTranslation('Change did not reach the machine. Restoring the previous value.'), 4000, 'error');
+    document.dispatchEvent(new Event('streamline:workflow-refresh'));
 }
 
 export function updateDoseAndDrinkOutValue(newDoseIn, newDrinkOut) {
@@ -229,18 +314,16 @@ export function updateDoseAndDrinkOutValue(newDoseIn, newDrinkOut) {
         }
     };
     // Keep the machine stop-at-weight (profile.target_weight) in sync with the yield.
-    const activeProfile = window.app?.getActiveProfileRecord?.()?.profile;
-    if (activeProfile && Number.isFinite(newDrinkOut) && newDrinkOut > 0) {
-        payload.profile = { ...activeProfile, target_weight: newDrinkOut };
-    }
-
-    updateWorkflow(payload).then(() => {
+    profileWithTargetWeight(newDrinkOut).then(profile => {
+        if (profile) payload.profile = profile;
+        return updateWorkflow(payload, 'tiles.doseYield');
+    }).then(() => {
         logger.debug(`Dose In and Drink Out values updated via workflow: ${newDoseIn}g : ${newDrinkOut}g`);
         // Same per-profile save the +/- buttons and the numpad do — without it a
         // ratio preset was the one way to set dose/yield that did not stick.
         window.app?.saveContextToActiveProfile?.({ targetDoseWeight: newDoseIn, targetYield: newDrinkOut });
     }).catch(error => {
-        logger.error(`Failed to update dose in and drink out values via workflow:`, error);
+        tileWriteFailed('dose in and drink out values', error);
     });
 }
 
@@ -259,7 +342,7 @@ export function updateDrinkOutPresetsDisplay(doseIn, drinkOut) {
     if (doseInEl && drinkOutEl && ratioEl) {
         if (!isNaN(doseIn) && !isNaN(drinkOut) && doseIn > 0) {
             const ratio = drinkOut / doseIn;
-            ratioEl.textContent = `(1:${ratio.toFixed(1)})`;
+            ratioEl.textContent = `(1:${formatRatio(ratio)})`;
         } else {
             ratioEl.textContent = '(1:--)';
         }
@@ -269,16 +352,18 @@ export function updateDrinkOutPresetsDisplay(doseIn, drinkOut) {
     syncPresetHighlight(document.getElementById('drink-out-presets'), t => t === target);
 }
 
+// Moves the whole curve so the first step sits at `newValue` and every other step
+// keeps its distance from it (brew-temp.js). The distances come from the saved
+// profile when it is the one running, so a copy that was already flattened gets
+// its shape back; otherwise from the live steps.
 export function updateTemperatureValue(newValue) {
-    getWorkflow().then(workflow => {
-        if (workflow && workflow.profile && workflow.profile.steps) {
-            // Update temperature on ALL steps as number (not string)
-            workflow.profile.steps.forEach(step => {
-                step.temperature = parseFloat(newValue);
-            });
-            
-            // Partial update via workflow - only send profile field
-            updateWorkflow({ profile: workflow.profile }).then(() => {
+    return getWorkflow().then(workflow => {
+        const saved = window.app?.getActiveProfileRecord?.()?.profile;
+        const patch = brewTempProfilePatch(workflow?.profile, saved, newValue);
+        if (patch) {
+            // Only the steps go out: Decaid merges the rest of the profile, so a stale
+            // target_weight or title from this read cannot revert a concurrent write.
+            return updateWorkflow({ profile: patch }, 'tiles.brewTemp').then(() => {
                 logger.debug('Temperature updated via workflow:', newValue);
                 // Save it as a per-profile override, same as dose/yield/grind.
                 // The live workflow alone survives an app restart but NOT a
@@ -286,10 +371,101 @@ export function updateTemperatureValue(newValue) {
                 // silently restore the profile's baked-in temperature.
                 window.app?.saveContextToActiveProfile?.({ brewTemperature: parseFloat(newValue) });
             }).catch(error => {
-                logger.error('Failed to update temperature via workflow:', error);
+                tileWriteFailed('temperature', error);
             });
         }
     });
+}
+
+// A plugin's `set` action (see docs/plugin-surfaces.md). Goes through the same
+// setters a tile edit uses, so it also becomes the active profile's override.
+// Dose and yield are refused (false) until both tiles show numbers: the dose
+// setter reads the other tile's value from the DOM and would send NaN.
+function runPluginSet(field, value) {
+    const none = { ok: false, done: Promise.resolve() };
+    const n = clampSetValue(field, value);
+    if (n === null) return none;
+    const dose = parseFloat(document.getElementById('dose-in-value')?.textContent);
+    const drink = parseFloat(document.getElementById('drink-out-value')?.textContent);
+    if (field === 'grinderSetting') {
+        markTileInteraction();
+        const done = updateGrindValue(n);
+        updateGrindDisplay({ grinderSetting: String(n) });
+        flashElement(document.getElementById('grind-value'));
+        return { ok: true, done };
+    }
+    if (field === 'brewTemperature') {
+        // Celsius, like the workflow. Same setter as the tile: the first step goes
+        // here and the other steps keep their distance from it.
+        markTileInteraction();
+        const done = updateTemperatureValue(n);
+        updateTemperatureDisplay(n);
+        flashElement(document.getElementById('temp-value'));
+        return { ok: true, done };
+    }
+    if (isNaN(dose) || isNaN(drink)) return none;
+    markTileInteraction();
+    if (field === 'targetDoseWeight') {
+        const done = updateDoseValue('in', n);
+        // A Drink keepRatio may have moved the yield with it.
+        updateDrinkOutPresetsDisplay(n, parseFloat(document.getElementById('drink-out-value')?.textContent) || drink);
+        flashElement(document.getElementById('dose-in-value'));
+        return { ok: true, done };
+    }
+    if (field === 'targetYield') {
+        const done = updateDoseValue('out', n);
+        // A Drink keepRatio may have moved the dose with it.
+        updateDrinkOutPresetsDisplay(parseFloat(document.getElementById('dose-in-value')?.textContent) || dose, n);
+        flashElement(document.getElementById('drink-out-value'));
+        return { ok: true, done };
+    }
+    return none;
+}
+
+export function applyPluginSet(field, value) {
+    return runPluginSet(field, value).ok;
+}
+
+// Same as applyPluginSet, but resolves once the workflow write has settled, so a
+// caller can re-read plugin surfaces after the value has really been stored.
+export async function applyPluginSetAsync(field, value) {
+    const { ok, done } = runPluginSet(field, value);
+    if (ok) await Promise.resolve(done).catch(() => {});
+    return ok;
+}
+
+// A plugin `step`: the tile's value now, moved by `by`, through the same path as
+// `set` (so it is clamped and becomes the profile's override). False when the
+// tile is not showing a number yet.
+const STEP_VALUE_IDS = { targetDoseWeight: 'dose-in-value', targetYield: 'drink-out-value', grinderSetting: 'grind-value' };
+
+// Plugin `stepsize`: the dose / yield / grind -/+ step, kept per field on this device
+// (plain localStorage, not the synchronized KV). It applies only while a
+// stepsize surface for the field is drawn; otherwise the step is 1.
+const STEPSIZE_KEY = field => `plugin-stepsize:${field}`;
+let drawnStepSizes = {}; // field -> offered sizes, set by the surface renderer
+let drawnStepCustom = {}; // field -> true when the user may type a step of their own
+export function setDrawnStepSizes(map, custom = {}) { drawnStepSizes = map || {}; drawnStepCustom = custom || {}; }
+export function getStoredStepSize(field) {
+    try {
+        const n = parseFloat(localStorage.getItem(STEPSIZE_KEY(field)));
+        return Number.isFinite(n) ? n : null;
+    } catch (e) { return null; }
+}
+export function storeStepSize(field, size) {
+    try { localStorage.setItem(STEPSIZE_KEY(field), String(size)); } catch (e) { /* non-fatal */ }
+}
+export function activeStepSize(field) {
+    const sizes = drawnStepSizes[field];
+    if (!sizes) return 1;
+    return resolveStepSize(sizes, getStoredStepSize(field), drawnStepCustom[field] === true);
+}
+
+// A plugin `step` resolving true once the stored write has settled.
+export async function applyPluginStepAsync(field, by) {
+    const current = parseFloat(document.getElementById(STEP_VALUE_IDS[field])?.textContent);
+    if (isNaN(current) || !Number.isFinite(by)) return false;
+    return applyPluginSetAsync(field, current + by);
 }
 
 export function updateGrindValue(newValue) {
@@ -298,12 +474,15 @@ export function updateGrindValue(newValue) {
             grinderSetting: parseFloat(newValue).toFixed(2)
         }
     };
-    updateWorkflow(workflowUpdate).then(() => {
+    // Override saved only once Decaid accepted the value: a refused write must
+    // not become the profile's remembered grind.
+    const done = updateWorkflow(workflowUpdate, 'tiles.grind').then(() => {
         logger.debug('Grind value updated successfully:', newValue);
+        window.app?.saveGrindToActiveProfile?.(parseFloat(newValue).toFixed(2));
     }).catch(error => {
-        logger.error('Failed to update grind value:', error);
+        tileWriteFailed('grind value', error);
     });
-    window.app?.saveGrindToActiveProfile?.(parseFloat(newValue).toFixed(2));
+    return done;
 }
 
 export function updateFlushValue(newValue) {
@@ -325,7 +504,7 @@ export function updateFlushValue(newValue) {
         }
     };
 
-    updateWorkflow(workflowUpdate).then(() => {
+    updateWorkflow(workflowUpdate, 'tiles.flush').then(() => {
         logger.debug('Rinse value updated successfully:', workflowUpdate.rinseData);
         persistSharedValue(FLUSH_DURATION_LAST_VALUE_KEY, workflowUpdate.rinseData.duration);
     }).catch(error => {
@@ -344,7 +523,7 @@ export function updateDrinkRatio() {
 
         if (!isNaN(doseIn) && !isNaN(drinkOut) && doseIn > 0) {
             const ratio = drinkOut / doseIn;
-            ratioEl.textContent = `(1:${ratio.toFixed(1)})`;
+            ratioEl.textContent = `(1:${formatRatio(ratio)})`;
         } else {
             ratioEl.textContent = '(1:--)';
         }
@@ -365,7 +544,7 @@ function makeEditable(element, onCommit) {
         input.type = 'number';
         input.value = currentValue;
         // Increased text size and made the input area bigger
-        input.className = 'text-[19px] font-bold text-center w-18 bg-transparent absolute border-2 border-[var(--mimoja-blue)] rounded-lg';
+        input.className = 'text-[19px] font-bold text-center w-18 bg-transparent absolute border-2 border-[var(--mimoja-blue-v2)] rounded-lg';
         input.name = element.id; // Recommended for accessibility and autofill
         input.setAttribute('aria-label', element.getAttribute('data-i18n-key') || element.id);
 
@@ -540,6 +719,20 @@ function toggleHotWaterMode() {
     updateHotWaterPresetDisplay();
 }
 
+// Set the hot-water tile's displayed unit (volume vs temperature) directly,
+// rather than cycling like toggleHotWaterMode. Used after applying a DYE2
+// recipe so the tile's bold sub-value matches the unit the recipe actually
+// wrote, instead of whatever unit happened to be showing before. Purely a
+// display/interaction mode -- no hardware call either way.
+export function setHotWaterTileMode(mode) {
+    if (mode !== 'volume' && mode !== 'temperature') return;
+    if (hotWaterMode === mode) return;
+    hotWaterMode = mode;
+    logger.info(`Hot water tile mode set to: ${hotWaterMode}`);
+    updateHotWaterDisplay({ targetHotWaterVolume: currentHotWaterVolume, targetHotWaterTemp: currentHotWaterTemp });
+    updateHotWaterPresetDisplay();
+}
+
 function setupValueAdjuster(minusBtnId, plusBtnId, valueElId, step, min, formatter, onUpdate, afterUpdate) {
     const minusBtn = document.getElementById(minusBtnId);
     const plusBtn = document.getElementById(plusBtnId);
@@ -562,7 +755,7 @@ function setupValueAdjuster(minusBtnId, plusBtnId, valueElId, step, min, formatt
         if (!valueEl) return;
         let currentValue = parseFloat(valueEl.textContent);
         if (currentValue > min) {
-            currentValue -= getStep();
+            currentValue = stepValue(currentValue, getStep(), -1, min);
             valueEl.textContent = format(currentValue);
             scheduleUpdate(currentValue);
             if (afterUpdate) afterUpdate(format(currentValue));
@@ -574,7 +767,7 @@ function setupValueAdjuster(minusBtnId, plusBtnId, valueElId, step, min, formatt
         const valueEl = document.getElementById(valueElId);
         if (!valueEl) return;
         let currentValue = parseFloat(valueEl.textContent);
-        currentValue += getStep();
+        currentValue = stepValue(currentValue, getStep(), 1);
         valueEl.textContent = format(currentValue);
         scheduleUpdate(currentValue);
         if (afterUpdate) afterUpdate(format(currentValue));
@@ -661,8 +854,10 @@ export function setupPressAndHold(element, clickCallback, longPressCallback, opt
     element.addEventListener('pointercancel', endPress);
     element.addEventListener('pointerleave', endPress);
 
+    // The event lets a caller that owns a whole card tell a tap on a sub-region
+    // from a tap on one of its buttons, without a second press tracker.
     element.addEventListener('click', (event) => {
-        if (!suppressClick) return clickCallback();
+        if (!suppressClick) return clickCallback(event);
         suppressClick = false;
         clearTimeout(suppressClickReset);
         event.preventDefault();
@@ -738,12 +933,15 @@ export function setMilkProbePresent(present) {
     }
     if (present && milkStopLostToProbe) {
         // Probe back → restore the Milk stop its loss displaced, exactly as a
-        // tap on the tile would: re-arm on the machine and re-record the mode.
-        // The resolver then pins 'temperature' and the shared display update
-        // below repaints the VALUE in the same breath — the tile must never
-        // sit on Milk while still showing the fallback's seconds.
+        // tap on the tile would: re-arm on the machine, re-select Milk and
+        // re-record the mode. Milk is pinned here rather than left to the
+        // resolver, which keeps an armed stop in Flow mode now; the shared
+        // display update below repaints the VALUE in the same breath — the
+        // tile must never sit on Milk while still showing the fallback's
+        // seconds.
         milkStopLostToProbe = false;
         milkStopArmed = true;
+        steamMode = 'temperature';
         setStopAtTemperature(currentMilkStop).catch(e => logger.error(e));
         recordSteamStopMode('temperature');
     }
@@ -753,15 +951,12 @@ export function setMilkProbePresent(present) {
     updateSteamPresetDisplay();
 }
 
-// 0s reads as "Off" -- duration 0 already sends the steam-off command
-// (steamHeaterFor in api.js zeroes targetTemperature alongside it), so the
-// tile should say so rather than show a number that looks like a very short
-// steam time.
+// 0s means no steam timer: steam runs until the user stops it (subject to the
+// machine safety timeout). The heater is a separate setting, so "off" would be
+// wrong here -- show the open-ended symbol rather than a number that looks like
+// a very short steam time.
 export function formatSteamDuration(v) {
-    // Lowercase 'off' (not 'OFF') is the exact CSV key: the translation sheet
-    // carries both, and case-insensitive lookup would resolve to whichever one
-    // parses last (see i18n-parser.js keyIndex), which is not this one.
-    return v === 0 ? getTranslation('off') : `${v}s`;
+    return v === 0 ? '∞' : `${v}s`;
 }
 
 export function updateSteamDisplay(data) {
@@ -790,13 +985,13 @@ export function updateSteamDisplay(data) {
             steamMode, isBengleMachine() && milkProbePresent, milkStopArmed, readSteamStopFallback());
     }
 
+    const milkAvailable = isBengleMachine() && milkProbePresent;
     document.querySelectorAll('[data-steam-mode]').forEach(label => {
         const selected = label.dataset.steamMode === steamMode || (label.dataset.steamMode === 'time' && steamMode === 'temperature');
         label.style.color = selected ? 'var(--mimoja-blue-v2)' : '';
         if (label.dataset.steamMode === 'time') {
-            const milk = isBengleMachine() && milkProbePresent;
-            label.textContent = milk ? 'M' : 'T';
-            label.title = getTranslation(milk ? 'Milk' : 'Time');
+            label.textContent = milkAvailable ? 'M' : 'T';
+            label.title = getTranslation(milkAvailable ? 'Milk' : 'Time');
         }
     });
     flowEl.textContent = `${currentSteamFlow.toFixed(1)}`;
@@ -819,7 +1014,7 @@ export function updateSteamDisplay(data) {
     } else if (steamMode === 'time' || steamMode === 'auto') {
         const showingTarget = steamMode === 'auto' && autoSteamTargetLabel;
         durationEl.textContent = steamMode === 'auto'
-            ? autoSteamDurationLabel(currentSteamDuration, autoSteamTargetLabel)
+            ? (compactAutoSteamTargetLabel(autoSteamTargetLabel) || formatSteamDuration(currentSteamDuration))
             : formatSteamDuration(currentSteamDuration);
         durationEl.style.fontSize = showingTarget ? '20px' : '';
         durationEl.style.fontWeight = showingTarget ? '400' : '';
@@ -831,7 +1026,14 @@ export function updateSteamDisplay(data) {
         modeTimeEl.className = ACTIVE;
         modeFlowEl.className = INACTIVE;
     } else { // flow mode
-        durationEl.textContent = formatSteamDuration(currentSteamDuration);
+        // The small slot belongs to the OTHER half of the pair, so it follows
+        // the label: the milk target while the pair is Milk|Flow and the stop
+        // is armed (the toggle keeps it armed in Flow), the steam time
+        // otherwise -- including a Bengle whose stop was turned off in
+        // Settings, where the seconds are what actually ends the steam.
+        durationEl.textContent = milkAvailable && milkStopArmed
+            ? formatTemp(currentMilkStop, 0)
+            : formatSteamDuration(currentSteamDuration);
         flowEl.classList.remove('text-[20px]');
         flowEl.classList.add('text-[26px]', 'font-bold', 'text-[var(--text-primary)]');
         durationEl.classList.remove('text-[26px]', 'font-bold');
@@ -851,7 +1053,6 @@ export function updateSteamDisplay(data) {
 // BEFORE the push precisely so the user's intent survives a failed one.
 const STEAM_UNSYNCED_CLASS = 'text-[var(--status-red-color)]';
 const STEAM_PRIMARY_CLASS = 'text-[var(--text-primary)]';
-const STEAM_SYNC_RETRY_MS = 8000;
 let steamSync = { ...STEAM_SYNC_SYNCED };
 let steamSyncRetryTimer = null;
 
@@ -893,7 +1094,7 @@ export function pushSteamSetting(field, promise) {
         applySteamSyncEvent({ type: 'push-failed', field });
         showToast(getTranslation('Steam setting did not reach the machine. Retrying...'), 3000, 'error');
         clearTimeout(steamSyncRetryTimer);
-        steamSyncRetryTimer = setTimeout(runSteamSyncRetry, STEAM_SYNC_RETRY_MS);
+        steamSyncRetryTimer = setTimeout(runSteamSyncRetry, steamSyncRetryDelay(steamSync));
     });
 }
 
@@ -906,7 +1107,7 @@ async function runSteamSyncRetry() {
         logger.warn('Steam resync retry failed:', e);
         applySteamSyncEvent({ type: 'retry-failed' });
         if (shouldRetrySteamSync(steamSync)) {
-            steamSyncRetryTimer = setTimeout(runSteamSyncRetry, STEAM_SYNC_RETRY_MS);
+            steamSyncRetryTimer = setTimeout(runSteamSyncRetry, steamSyncRetryDelay(steamSync));
         } else {
             showToast(getTranslation('Steam setting still not applied — check the machine connection.'), 4000, 'error');
         }
@@ -998,6 +1199,7 @@ async function adjustAutoSteamSelection(delta) {
 }
 
 function updateSteamPresetDisplay() {
+    announceAutoSteamChange();
     const timePresetContainer = document.getElementById('steam-presets');
     const flowPresetContainer = document.getElementById('steam-flow-presets');
     const milkPresetContainer = document.getElementById('steam-milk-presets');
@@ -1086,42 +1288,106 @@ function updateSteamPresetDisplay() {
     }
 }
 
-async function persistSteamFlowPresets() {
+// Preset edits are user intent, not machine state, and they used to live in
+// IndexedDB — which belongs to the WebView's origin and is wiped by every
+// Decaid app update, so a hand-dialed 14:28 had to be re-entered each time.
+// localStorage is the store settingsSync mirrors into Decaid's KV box (see
+// SYNCED_KEYS), so writing here is what makes a preset survive an update.
+function savePresetSetting(key, value) {
     try {
-        await setSetting(STEAM_FLOW_PRESETS_KEY, [...steamFlowPresets]);
+        localStorage.setItem(key, JSON.stringify(value));
     } catch (e) {
-        logger.warn('Failed to persist steam flow presets:', e);
+        logger.warn(`Failed to persist ${key}:`, e);
     }
 }
 
-async function persistSteamFlowSelectedIndex(index) {
+// Reads the durable copy, falling back once to the pre-mirror IndexedDB home so
+// an install that still has its edits there keeps them (and promotes them).
+async function readPresetSetting(key) {
     try {
-        await setSetting(STEAM_FLOW_PRESET_INDEX_KEY, index);
+        const raw = localStorage.getItem(key);
+        if (raw !== null) return JSON.parse(raw);
     } catch (e) {
-        logger.warn('Failed to persist steam flow preset index:', e);
+        logger.warn(`Failed to read ${key}:`, e);
+    }
+    try {
+        await openDB();
+        const legacy = await getSetting(key);
+        if (legacy !== undefined) savePresetSetting(key, legacy);
+        return legacy;
+    } catch (e) {
+        logger.warn(`Failed to migrate ${key}:`, e);
+        return undefined;
     }
 }
 
-async function persistSteamTimePresets() {
-    try {
-        await setSetting(STEAM_TIME_PRESETS_KEY, [...steamTimePresets]);
-    } catch (e) {
-        logger.warn('Failed to persist steam time presets:', e);
+function persistSteamFlowPresets() {
+    savePresetSetting(STEAM_FLOW_PRESETS_KEY, [...steamFlowPresets]);
+}
+
+function persistSteamFlowSelectedIndex(index) {
+    savePresetSetting(STEAM_FLOW_PRESET_INDEX_KEY, index);
+}
+
+function persistSteamTimePresets() {
+    savePresetSetting(STEAM_TIME_PRESETS_KEY, [...steamTimePresets]);
+}
+
+function persistMilkStopPresets() {
+    savePresetSetting(MILK_STOP_PRESETS_KEY, [...milkStopPresets]);
+}
+
+// A hydrate that lands AFTER the page painted (Decaid answered on the retry
+// ladder, not at boot) has written the restored presets to localStorage, but
+// the buttons already rendered from what was there before. Re-run the loaders
+// for exactly the keys that changed — they read localStorage, so this is the
+// same path as boot, not a second source of truth.
+function initPresetRestoreListener() {
+    if (initPresetRestoreListener.attached) return;
+    initPresetRestoreListener.attached = true;
+    const byKey = {
+        [DRINK_OUT_PRESETS_KEY]: () => withEl('drink-out-presets', loadDrinkOutPresets),
+        [TEMP_PRESETS_KEY]: loadTempPresets,
+        [FLUSH_PRESETS_KEY]: () => withEl('flush-presets', loadFlushPresets),
+        [HOT_WATER_TEMP_PRESETS_KEY]: loadHotWaterPresets,
+        [HOT_WATER_VOL_PRESETS_KEY]: loadHotWaterPresets,
+        [STEAM_TIME_PRESETS_KEY]: loadSteamTimePresets,
+        [MILK_STOP_PRESETS_KEY]: loadMilkStopPresets,
+        // Steam flow is model-gated, so it re-runs the whole resolve with the
+        // model app.js last reported rather than reading the array directly.
+        [STEAM_FLOW_PRESETS_KEY]: () => setSteamFlowPresetsFromMachineModel(lastSteamFlowModel),
+    };
+    window.addEventListener(SETTINGS_RESTORED_EVENT, (event) => {
+        const keys = Object.keys(event.detail || {}).filter(key => byKey[key]);
+        // One run per loader: the two hot-water keys share one.
+        new Set(keys.map(key => byKey[key])).forEach(load => {
+            Promise.resolve().then(load).catch(e => logger.warn('Preset restore repaint failed:', e));
+        });
+    });
+}
+
+function withEl(id, load) {
+    const el = document.getElementById(id);
+    return el ? load(el) : undefined;
+}
+
+// Milk-stop presets were never persisted at all — edits died on the next
+// reload, not just on an app update.
+async function loadMilkStopPresets() {
+    const stored = await readPresetSetting(MILK_STOP_PRESETS_KEY);
+    if (Array.isArray(stored) && stored.length === milkStopPresets.length) {
+        milkStopPresets = stored.map(Number);
+        updateSteamPresetDisplay();
     }
 }
 
 // Restore user-edited steam time presets at boot. No machine-model dependency,
 // unlike steam flow, so this just loads once — no per-model reset logic needed.
 async function loadSteamTimePresets() {
-    try {
-        await openDB();
-        const stored = await getSetting(STEAM_TIME_PRESETS_KEY);
-        if (Array.isArray(stored) && stored.length === 4) {
-            steamTimePresets = stored.map(Number);
-            updateSteamPresetDisplay();
-        }
-    } catch (e) {
-        logger.warn('Failed to load steam time presets:', e);
+    const stored = await readPresetSetting(STEAM_TIME_PRESETS_KEY);
+    if (Array.isArray(stored) && stored.length === 4) {
+        steamTimePresets = stored.map(Number);
+        updateSteamPresetDisplay();
     }
 }
 
@@ -1129,27 +1395,18 @@ async function loadSteamTimePresets() {
 // button's textContent — so persist/restore work off the DOM instead.
 const FLUSH_PRESETS_KEY = 'flush-presets-user';
 
-async function persistFlushPresets(flushPresetsEl) {
-    try {
-        const values = Array.from(flushPresetsEl.children).map(b => parseFloat(b.textContent));
-        await setSetting(FLUSH_PRESETS_KEY, values);
-    } catch (e) {
-        logger.warn('Failed to persist flush presets:', e);
-    }
+function persistFlushPresets(flushPresetsEl) {
+    const values = Array.from(flushPresetsEl.children).map(b => parseFloat(b.textContent));
+    savePresetSetting(FLUSH_PRESETS_KEY, values);
 }
 
 async function loadFlushPresets(flushPresetsEl) {
-    try {
-        await openDB();
-        const stored = await getSetting(FLUSH_PRESETS_KEY);
-        const buttons = Array.from(flushPresetsEl.children);
-        if (Array.isArray(stored) && stored.length === buttons.length) {
-            buttons.forEach((btn, i) => {
-                if (typeof stored[i] === 'number' && !isNaN(stored[i])) btn.textContent = `${stored[i]}s`;
-            });
-        }
-    } catch (e) {
-        logger.warn('Failed to load flush presets:', e);
+    const stored = await readPresetSetting(FLUSH_PRESETS_KEY);
+    const buttons = Array.from(flushPresetsEl.children);
+    if (Array.isArray(stored) && stored.length === buttons.length) {
+        buttons.forEach((btn, i) => {
+            if (typeof stored[i] === 'number' && !isNaN(stored[i])) btn.textContent = `${stored[i]}s`;
+        });
     }
 }
 
@@ -1169,78 +1426,51 @@ function updateTempPresetDisplay() {
     });
 }
 
-async function persistTempPresets() {
-    try {
-        await setSetting(TEMP_PRESETS_KEY, [...brewTempPresets]);
-    } catch (e) {
-        logger.warn('Failed to persist brew temp presets:', e);
-    }
+function persistTempPresets() {
+    savePresetSetting(TEMP_PRESETS_KEY, [...brewTempPresets]);
 }
 
 async function loadTempPresets() {
-    try {
-        await openDB();
-        const stored = await getSetting(TEMP_PRESETS_KEY);
-        if (Array.isArray(stored) && stored.length === brewTempPresets.length) {
-            brewTempPresets = stored.map(Number);
-        }
-        updateTempPresetDisplay();
-    } catch (e) {
-        logger.warn('Failed to load brew temp presets:', e);
+    const stored = await readPresetSetting(TEMP_PRESETS_KEY);
+    if (Array.isArray(stored) && stored.length === brewTempPresets.length) {
+        brewTempPresets = stored.map(Number);
     }
+    updateTempPresetDisplay();
 }
 
 // Drink-out presets store a "dose:out" pair, not a single number — persist
 // the raw label text rather than parsing it.
 const DRINK_OUT_PRESETS_KEY = 'drink-out-presets-user';
 
-async function persistDrinkOutPresets(drinkOutPresetsEl) {
-    try {
-        const values = Array.from(drinkOutPresetsEl.children).map(b => b.textContent.trim());
-        await setSetting(DRINK_OUT_PRESETS_KEY, values);
-    } catch (e) {
-        logger.warn('Failed to persist drink-out presets:', e);
-    }
+function persistDrinkOutPresets(drinkOutPresetsEl) {
+    const values = Array.from(drinkOutPresetsEl.children).map(b => b.textContent.trim());
+    savePresetSetting(DRINK_OUT_PRESETS_KEY, values);
 }
 
 async function loadDrinkOutPresets(drinkOutPresetsEl) {
-    try {
-        await openDB();
-        const stored = await getSetting(DRINK_OUT_PRESETS_KEY);
-        const buttons = Array.from(drinkOutPresetsEl.children);
-        if (Array.isArray(stored) && stored.length === buttons.length) {
-            buttons.forEach((btn, i) => {
-                if (typeof stored[i] === 'string' && /^\d+(\.\d+)?:\d+(\.\d+)?$/.test(stored[i])) btn.textContent = stored[i];
-            });
-        }
-    } catch (e) {
-        logger.warn('Failed to load drink-out presets:', e);
+    const stored = await readPresetSetting(DRINK_OUT_PRESETS_KEY);
+    const buttons = Array.from(drinkOutPresetsEl.children);
+    if (Array.isArray(stored) && stored.length === buttons.length) {
+        buttons.forEach((btn, i) => {
+            if (typeof stored[i] === 'string' && /^\d+(\.\d+)?:\d+(\.\d+)?$/.test(stored[i])) btn.textContent = stored[i];
+        });
     }
 }
 
 const HOT_WATER_TEMP_PRESETS_KEY = 'hot-water-temp-presets-user';
 const HOT_WATER_VOL_PRESETS_KEY = 'hot-water-vol-presets-user';
 
-async function persistHotWaterPresets() {
-    try {
-        await setSetting(HOT_WATER_TEMP_PRESETS_KEY, [...hotWaterTempPresets]);
-        await setSetting(HOT_WATER_VOL_PRESETS_KEY, [...hotWaterVolPresets]);
-    } catch (e) {
-        logger.warn('Failed to persist hot water presets:', e);
-    }
+function persistHotWaterPresets() {
+    savePresetSetting(HOT_WATER_TEMP_PRESETS_KEY, [...hotWaterTempPresets]);
+    savePresetSetting(HOT_WATER_VOL_PRESETS_KEY, [...hotWaterVolPresets]);
 }
 
 async function loadHotWaterPresets() {
-    try {
-        await openDB();
-        const storedTemp = await getSetting(HOT_WATER_TEMP_PRESETS_KEY);
-        const storedVol = await getSetting(HOT_WATER_VOL_PRESETS_KEY);
-        if (Array.isArray(storedTemp) && storedTemp.length === 4) hotWaterTempPresets = storedTemp.map(Number);
-        if (Array.isArray(storedVol) && storedVol.length === 4) hotWaterVolPresets = storedVol.map(Number);
-        if (storedTemp || storedVol) updateHotWaterPresetDisplay();
-    } catch (e) {
-        logger.warn('Failed to load hot water presets:', e);
-    }
+    const storedTemp = await readPresetSetting(HOT_WATER_TEMP_PRESETS_KEY);
+    const storedVol = await readPresetSetting(HOT_WATER_VOL_PRESETS_KEY);
+    if (Array.isArray(storedTemp) && storedTemp.length === 4) hotWaterTempPresets = storedTemp.map(Number);
+    if (Array.isArray(storedVol) && storedVol.length === 4) hotWaterVolPresets = storedVol.map(Number);
+    if (storedTemp || storedVol) updateHotWaterPresetDisplay();
 }
 
 function syncPresetHighlight(container, matchFn) {
@@ -1259,6 +1489,57 @@ function syncDrinkOutPresets() {
     syncPresetHighlight(document.getElementById('drink-out-presets'), t => t === `${dose}:${drink}`);
 }
 
+// Numpad entry (app.js initMobileValueInputs) bypasses the inline editors that
+// resync presets themselves, so it calls this after writing the value.
+// What the tile's big/small duration slot currently HOLDS, which is not always
+// a steam duration: with the milk stop armed on a Bengle it shows the milk
+// target in both halves of the Milk|Flow pair (see updateSteamDisplay). Both
+// editors for that slot -- the tablet numpad wired in app.js and the desktop
+// inline editor below -- ask at interaction time, so a tap no longer offers
+// "STEAM DURATION" over a value in °C.
+export function steamSlotField() {
+    return resolveSteamSlotField(isBengleMachine() && milkProbePresent, milkStopArmed);
+}
+
+// Milk-stop writes are clamped to 30-80 °C everywhere (tile +/-, the settings
+// page, preset edits): 80 is the API ceiling, rest_v1.yml SteamSettings
+// .stopAtTemperature documents range 0..80.
+export function clampMilkStop(celsius) {
+    return Math.max(30, Math.min(80, Math.round(celsius)));
+}
+
+// Numpad presentation for a milk-stop entry. Shared by the preset editor and
+// the tile-slot editor so the two can't drift on unit or range.
+export function milkStopNumpadConfig() {
+    return {
+        title: 'MILK STOP',
+        unit: getTempUnit() === 'F' ? '°F' : '°c',
+        defaultValue: '60',
+        min: boundToDisplay(30),
+        max: boundToDisplay(80),
+    };
+}
+
+/** Commit a milk auto-stop target (°C) typed into the tile slot or a numpad. */
+export function applyMilkStopTarget(celsius) {
+    if (!isFinite(celsius)) return;
+    currentMilkStop = clampMilkStop(celsius);
+    updateSteamDisplay({ stopAtTemperature: currentMilkStop });
+    pushSteamSetting('duration', setStopAtTemperature(currentMilkStop));
+    syncSteamPresets();
+}
+
+export function syncPresetsAfterManualEntry(type) {
+    if (type === 'temperature') {
+        const shown = document.getElementById('temp-value')?.textContent.trim();
+        syncPresetHighlight(document.getElementById('temp-presets'), t => t === shown);
+    } else if (type === 'dose-in' || type === 'drink-out') {
+        syncDrinkOutPresets();
+    } else if (type === 'steam-duration' || type === 'steam-flow' || type === 'milk-stop') {
+        syncSteamPresets();
+    }
+}
+
 function highlightSteamFlowPreset(index) {
     const container = document.getElementById('steam-flow-presets');
     if (!container) return;
@@ -1269,6 +1550,7 @@ function highlightSteamFlowPreset(index) {
 }
 
 export async function setSteamFlowPresetsFromMachineModel(model) {
+    lastSteamFlowModel = model ?? null;
     // On a Bengle WITH the milk probe the main-screen steam-stop is by milk
     // temperature: replace the "Time" toggle label with "Milk". (Duration stays
     // settable in Settings.) Probe presence usually reports a beat after this
@@ -1282,13 +1564,12 @@ export async function setSteamFlowPresetsFromMachineModel(model) {
     updateSteamModeOptions(milkAvailable);
     if (steamMode !== 'auto') steamMode = resolveSteamTileMode(steamMode, milkAvailable, milkStopArmed, readSteamStopFallback());
     try {
-        await openDB();
         const baseline = resolveSteamFlowPresetsForModel(model);
         DEFAULT_STEAM_FLOW_PRESETS = [...baseline];
 
-        const storedModel = await getSetting(STEAM_FLOW_PRESETS_MODEL_KEY);
-        const userPresets = await getSetting(STEAM_FLOW_PRESETS_KEY);
-        const storedIndex = await getSetting(STEAM_FLOW_PRESET_INDEX_KEY);
+        const storedModel = await readPresetSetting(STEAM_FLOW_PRESETS_MODEL_KEY);
+        const userPresets = await readPresetSetting(STEAM_FLOW_PRESETS_KEY);
+        const storedIndex = await readPresetSetting(STEAM_FLOW_PRESET_INDEX_KEY);
 
         // If model changed since last save, drop the old user array — its values
         // are tuned for a different group head and would be misleading.
@@ -1297,9 +1578,9 @@ export async function setSteamFlowPresetsFromMachineModel(model) {
             steamFlowPresets = userPresets.map(Number);
         } else {
             steamFlowPresets = [...baseline];
-            await setSetting(STEAM_FLOW_PRESETS_KEY, [...steamFlowPresets]);
+            savePresetSetting(STEAM_FLOW_PRESETS_KEY, [...steamFlowPresets]);
         }
-        await setSetting(STEAM_FLOW_PRESETS_MODEL_KEY, String(model || ''));
+        savePresetSetting(STEAM_FLOW_PRESETS_MODEL_KEY, String(model || ''));
 
         selectedSteamFlowPresetIndex = (Number.isInteger(storedIndex) && storedIndex >= 0 && storedIndex < 4)
             ? storedIndex
@@ -1341,9 +1622,10 @@ export async function setSteamFlowPresetsFromMachineModel(model) {
 
 async function toggleSteamMode() {
     if (calibratedSteamApplying) return;
+    const milkAvailable = isBengleMachine() && milkProbePresent;
     const modes = steamModeCycle({
         autoAvailable: calibratedSteamAvailable,
-        milkAvailable: isBengleMachine() && milkProbePresent,
+        milkAvailable,
     });
     const currentIndex = modes.indexOf(steamMode);
     const next = modes[(currentIndex + 1 + modes.length) % modes.length];
@@ -1360,8 +1642,16 @@ async function toggleSteamMode() {
             if (steamMode === 'auto') await calibratedSteam.leave();
             steamMode = next;
             milkStopLostToProbe = false;
-            milkStopArmed = next === 'temperature';
-            await setStopAtTemperature(milkStopArmed ? currentMilkStop : 0);
+            // With milk available the pair is Milk|Flow and the tile shows the
+            // milk target in both, so the stop stays armed across the toggle --
+            // Flow only changes which number +/- edits. Disarming it there used
+            // to drop the steam back onto the Time/Off fallback, which is why
+            // Flow mode painted the fallback's seconds under a "Milk" label.
+            const nextArmed = milkAvailable || next === 'temperature';
+            if (nextArmed !== milkStopArmed) {
+                milkStopArmed = nextArmed;
+                await setStopAtTemperature(nextArmed ? currentMilkStop : 0);
+            }
             recordSteamStopMode(milkStopArmed ? 'temperature' : (readSteamStopFallback() === 'off' ? 'off' : 'time'));
         }
     } catch (error) {
@@ -1370,6 +1660,25 @@ async function toggleSteamMode() {
     }
 
     logger.info(`Steam mode switched to: ${steamMode}`);
+    updateSteamDisplay({ targetSteamDuration: currentSteamDuration, targetSteamFlow: currentSteamFlow });
+    updateSteamPresetDisplay();
+}
+
+// Set the steam tile's displayed unit (time vs flow) directly, WITHOUT going
+// through toggleSteamMode's mode-cycle logic. A DYE2 recipe's steamMode is
+// only ever 'time' or 'flow' (recipe-edit.ts's UI offers no other choice), so
+// this only ever moves between those two plain manual modes and deliberately
+// refuses to touch 'auto' (calibrated steam) or 'temperature' (milk
+// auto-stop) -- both drive real hardware/firmware calls (calibratedSteam
+// .enter/.leave, setStopAtTemperature) that applying a recipe has no
+// business triggering. No-ops unless the tile is already in a plain manual
+// mode, so a calibrated or milk-stop session is left alone.
+export function setSteamTileModeIfSafe(mode) {
+    if (mode !== 'time' && mode !== 'flow') return;
+    if (steamMode !== 'time' && steamMode !== 'flow') return;
+    if (steamMode === mode) return;
+    steamMode = mode;
+    logger.info(`Steam tile mode set to: ${steamMode}`);
     updateSteamDisplay({ targetSteamDuration: currentSteamDuration, targetSteamFlow: currentSteamFlow });
     updateSteamPresetDisplay();
 }
@@ -1427,10 +1736,15 @@ let currentMachineState = null;
 // Screensaver functionality
 let screensaverActive = false;
 let screensaverElement = null;
+let screensaverButtonSlot = null;
 let screensaverDimOverlay = null;
 let screensaverImages = [];
 let screensaverCurrentIndex = 0;
 let screensaverCycleInterval = null;
+let screensaverClockEl = null;
+let screensaverClockTimeEl = null;
+let screensaverClockDateEl = null;
+let screensaverClockTimer = null;
 
 // When we last sent a wake ('idle') the machine has not yet confirmed. 0 = none.
 //
@@ -1470,6 +1784,18 @@ function isInWebView() {
     return isAndroidWebView || isIOSWebView || isDecentWebView;
 }
 
+/** The element a plugin's screensaver button is drawn into; null before init. */
+export function getScreensaverButtonSlot() {
+    return screensaverButtonSlot;
+}
+
+// Shown on every saver, image or black: the plugin's button is how a plugin page
+// is reached without waking the machine, so it does not depend on the saver mode.
+function _syncSaverButtonSlot() {
+    if (!screensaverButtonSlot) return;
+    screensaverButtonSlot.style.display = 'flex';
+}
+
 export async function initScreensaver() {
     // Idempotent. This used to be called twice — once from initUI() and again
     // straight from app.js's DOMContentLoaded — and each call built ANOTHER
@@ -1507,13 +1833,39 @@ export async function initScreensaver() {
     screensaverDimOverlay.style.display = 'none';
     screensaverElement.appendChild(screensaverDimOverlay);
 
+    // Date/time block, shown only while the saver is up and the setting is on.
+    screensaverClockEl = document.createElement('div');
+    screensaverClockEl.id = 'screensaver-clock';
+    screensaverClockEl.style.cssText = 'position:absolute;left:0;right:0;bottom:8%;display:none;'
+        + 'flex-direction:column;align-items:center;gap:8px;color:#fff;pointer-events:none;'
+        + 'text-shadow:0 2px 12px rgba(0,0,0,0.7);font-family:Inter,sans-serif;';
+    screensaverClockTimeEl = document.createElement('div');
+    screensaverClockTimeEl.style.cssText = 'font-size:120px;font-weight:700;line-height:1;';
+    screensaverClockDateEl = document.createElement('div');
+    screensaverClockDateEl.style.cssText = 'font-size:36px;font-weight:500;';
+    screensaverClockEl.append(screensaverClockTimeEl, screensaverClockDateEl);
+    screensaverElement.appendChild(screensaverClockEl);
+
     // Tapping the overlay is the one place a screensaver interaction may wake the
     // machine. Bind ONCE: a WebView synthesises `click` from a tap, so binding
     // `touchstart` as well (as this did) sent 'idle' twice per tap. The
     // !screensaverActive guard inside wakeFromScreensaver() is the backstop.
-    screensaverElement.addEventListener('click', wakeFromScreensaver);
+    // A plugin's screensaver button is drawn into this slot. Its own handler stops
+    // the click; mayTapWakeMachine() is the second guard, so a tap there never wakes.
+    screensaverButtonSlot = document.createElement('div');
+    screensaverButtonSlot.id = 'screensaver-plugin-slot';
+    screensaverButtonSlot.dataset.pluginSaverSlot = '1';
+    screensaverButtonSlot.style.cssText = 'position:absolute;left:0;right:0;top:6%;display:none;'
+        + 'justify-content:flex-end;padding-right:5%;box-sizing:border-box;pointer-events:none;';
+    screensaverElement.appendChild(screensaverButtonSlot);
+
+    screensaverElement.addEventListener('click', event => {
+        const onPluginControl = !!event.target?.closest?.('[data-plugin-saver-slot]');
+        if (mayTapWakeMachine({ screensaverActive, onPluginControl })) wakeFromScreensaver();
+    });
 
     document.body.appendChild(screensaverElement);
+    document.dispatchEvent(new Event('streamline:screensaverready'));
 
     try {
         await openDB();
@@ -1557,6 +1909,59 @@ export function setScreensaverCycleSeconds(seconds) {
     return clamped;
 }
 
+function _updateScreensaverClock() {
+    if (!screensaverClockEl) return;
+    const now = new Date();
+    Object.assign(screensaverClockEl.style, screensaverClockPositionStyle(localStorage.getItem('screensaverClockPosition')));
+    screensaverClockTimeEl.textContent = formatScreensaverClockTime(now, localStorage.getItem('screensaverClockFormat'));
+    screensaverClockDateEl.textContent = formatScreensaverClockDate(now, localStorage.getItem('screensaverDateFormat'));
+}
+
+// Show/hide the clock to match (active && enabled) and run its ticker only then.
+// Default on: only an explicit 'false' turns it off.
+function _syncScreensaverClock() {
+    if (screensaverClockTimer) {
+        clearInterval(screensaverClockTimer);
+        screensaverClockTimer = null;
+    }
+    if (!screensaverClockEl) return;
+    const show = screensaverActive && localStorage.getItem('screensaverShowClock') !== 'false';
+    screensaverClockEl.style.display = show ? 'flex' : 'none';
+    if (!show) return;
+    _updateScreensaverClock();
+    screensaverClockTimer = setInterval(_updateScreensaverClock, 5000);
+}
+
+// Called by settings UI; applies immediately if the saver is currently up.
+export function setScreensaverClockEnabled(enabled) {
+    localStorage.setItem('screensaverShowClock', enabled ? 'true' : 'false');
+    _syncScreensaverClock();
+}
+
+export function setScreensaverClockFormat(format) {
+    if (!SCREENSAVER_CLOCK_FORMATS.some(option => option.value === format)) {
+        throw new RangeError('Invalid screensaver clock format');
+    }
+    localStorage.setItem('screensaverClockFormat', format);
+    _syncScreensaverClock();
+}
+
+export function setScreensaverDateFormat(format) {
+    if (!SCREENSAVER_DATE_FORMATS.some(option => option.value === format)) {
+        throw new RangeError('Invalid screensaver date format');
+    }
+    localStorage.setItem('screensaverDateFormat', format);
+    _syncScreensaverClock();
+}
+
+export function setScreensaverClockPosition(position) {
+    if (!SCREENSAVER_CLOCK_POSITIONS.some(option => option.value === position)) {
+        throw new RangeError('Invalid screensaver clock position');
+    }
+    localStorage.setItem('screensaverClockPosition', position);
+    _syncScreensaverClock();
+}
+
 export function activateScreensaver() {
     if (!screensaverElement) {
         console.error('Screensaver element not initialized');
@@ -1573,6 +1978,8 @@ export function activateScreensaver() {
         if (screensaverDimOverlay) screensaverDimOverlay.style.display = 'none';
         screensaverElement.style.display = 'flex';
         screensaverActive = true;
+        _syncSaverButtonSlot();
+        _syncScreensaverClock();
         return;
     }
 
@@ -1584,6 +1991,8 @@ export function activateScreensaver() {
     }
     screensaverElement.style.display = 'flex';
     screensaverActive = true;
+    _syncSaverButtonSlot();
+    _syncScreensaverClock();
 
     if (screensaverImages.length > 1) {
         screensaverCycleInterval = setInterval(() => {
@@ -1615,6 +2024,7 @@ export function hideScreensaver() {
         screensaverElement.style.display = 'none';
     }
     screensaverActive = false;
+    _syncScreensaverClock();
 }
 
 /**
@@ -1663,6 +2073,7 @@ export function initUI(callbacks) {
     initLanguageSwitcher();
     initScaleClick(callbacks.onWeightClick);
     initScreensaver(); // Initialize screensaver functionality
+    initPresetRestoreListener();
     const drinkOutValueEl = document.getElementById('drink-out-value');
     const tempValueEl = document.getElementById('temp-value');
     const doseInValueEl = document.getElementById('dose-in-value');
@@ -2010,6 +2421,7 @@ export function initUI(callbacks) {
 
     if (steamMilkPresetsEl) {
         updateSteamPresetDisplay();
+        loadMilkStopPresets(); // async restore of user edits, re-renders once loaded
 
         Array.from(steamMilkPresetsEl.children).forEach((button, index) => {
             button.classList.add('no-select', 'has-context-menu');
@@ -2034,21 +2446,17 @@ export function initUI(callbacks) {
                 const currentValueC = fromDisplayTemp(parseFloat(valueEl.textContent));
                 const presetValue = milkStopPresets[index];
                 const defaultValue = DEFAULT_MILK_STOP_PRESETS[index];
-                // Milk-stop writes are clamped to 30–80 °C everywhere (tile
-                // +/- and the settings page) — preset edits follow the same rule.
-                // 80 is the API ceiling: rest_v1.yml SteamSettings.stopAtTemperature
-                // documents range 0..80.
-                const clampMilkStop = (num) => Math.max(30, Math.min(80, Math.round(num)));
                 openContextMenu(button, [
                     { label: getTranslation('Apply {value}').replace('{value}', formatTemp(presetValue, 0)), onSelect: clickCallback },
                     { label: getTranslation('Enter value'), onSelect: () => {
                         openNumpadModal(makeNumpadMockInput(boundToDisplay(presetValue)), {
                             fieldType: 'milk-stop',
-                            config: { title: 'MILK STOP', unit: getTempUnit() === 'F' ? '°F' : '°c', defaultValue: '60', min: boundToDisplay(30), max: boundToDisplay(80) },
+                            config: milkStopNumpadConfig(),
                             onConfirm: (newVal) => {
                                 const num = fromDisplayTemp(parseFloat(newVal));
                                 if (isNaN(num)) return;
                                 milkStopPresets[index] = clampMilkStop(num);
+                                persistMilkStopPresets();
                                 updateSteamPresetDisplay();
                                 flashElement(button);
                                 showToast(`Preset saved as ${formatTemp(milkStopPresets[index], 0)}`, 2000, 'success');
@@ -2057,12 +2465,14 @@ export function initUI(callbacks) {
                     } },
                     { label: getTranslation('Save current ({value}) here').replace('{value}', valueEl.textContent), disabled: isNaN(currentValueC), onSelect: () => {
                         milkStopPresets[index] = clampMilkStop(currentValueC);
+                        persistMilkStopPresets();
                         updateSteamPresetDisplay();
                         flashElement(button);
                         flashElement(valueEl);
                     } },
                     { label: getTranslation('Revert to {value}').replace('{value}', formatTemp(defaultValue, 0)), danger: true, onSelect: () => {
                         milkStopPresets[index] = defaultValue;
+                        persistMilkStopPresets();
                         updateSteamPresetDisplay();
                         flashElement(button);
                         showToast(`Preset reverted to ${formatTemp(defaultValue, 0)}`, 2000, 'info');
@@ -2218,8 +2628,10 @@ export function initUI(callbacks) {
                 value = minDisplay;
             }
             currentBrewTempC = fromDisplayTemp(value);
-            tempValueEl.textContent = formatTemp(currentBrewTempC, 0);
+            const target = formatTemp(currentBrewTempC, 0);
+            tempValueEl.textContent = target;
             updateTemperatureValue(currentBrewTempC);
+            syncPresetHighlight(document.getElementById('temp-presets'), t => t === target);
         });
     }
 
@@ -2237,6 +2649,7 @@ export function initUI(callbacks) {
             drinkOutValueEl.textContent = `${value}g`;
             updateDoseValue('out', value);
             updateDrinkRatio();
+            syncDrinkOutPresets();
         });
     }
 
@@ -2312,6 +2725,12 @@ export function initUI(callbacks) {
     const steamDurationValueEl = document.getElementById('steam-duration-value');
     if (steamDurationValueEl) {
         makeEditable(steamDurationValueEl, (newValue) => {
+            // The slot holds the milk target whenever the stop is armed, and the
+            // inline input was seeded from it in the display unit.
+            if (steamSlotField() === 'milk-stop') {
+                applyMilkStopTarget(fromDisplayTemp(newValue));
+                return;
+            }
             let value = newValue;
             if (value > 255) {
                 alert('Steam time is limited to 255s.');
@@ -2325,6 +2744,7 @@ export function initUI(callbacks) {
             pushSteamSetting('duration', setTargetSteamDuration(currentSteamDuration));
             window.app?.saveContextToActiveProfile?.({ targetSteamDuration: currentSteamDuration });
             updateSteamDisplay({ targetSteamDuration: currentSteamDuration });
+            syncSteamPresets();
         });
     }
 
@@ -2344,10 +2764,16 @@ export function initUI(callbacks) {
             setTargetSteamFlow(currentSteamFlow).catch(e => logger.error(e));
             window.app?.saveContextToActiveProfile?.({ targetSteamFlow: currentSteamFlow });
             updateSteamDisplay({ targetSteamFlow: currentSteamFlow });
+            syncSteamPresets();
         });
     }
 
-    setupValueAdjuster('drink-out-minus', 'drink-out-plus', 'drink-out-value', 1, 0, (val) => `${val}g`, (val) => { updateDoseValue('out', val); updateDrinkRatio(); }, syncDrinkOutPresets);
+    setupValueAdjuster('drink-out-minus', 'drink-out-plus', 'drink-out-value', () => activeStepSize('targetYield'), 0, (val) => `${val}g`, (val) => { updateDoseValue('out', val); updateDrinkRatio(); }, (fmt) => {
+        // With the ratio locked both ways each tap moves the dose on screen at once too.
+        const ratioDose = ratioMovesDose() ? doseForRatio(parseFloat(fmt), keepRatio) : null;
+        if (ratioDose !== null) { updateDoseInDisplay(ratioDose); updateDrinkRatio(); }
+        syncDrinkOutPresets(fmt);
+    });
     {
         const tempMinusBtn = document.getElementById('temp-minus');
         const tempPlusBtn = document.getElementById('temp-plus');
@@ -2356,8 +2782,16 @@ export function initUI(callbacks) {
             tempPlusBtn.addEventListener('click', incrementBrewTemp);
         }
     }
-    setupValueAdjuster('dose-in-minus', 'dose-in-plus', 'dose-in-value', 1, 0, (val) => `${val}g`, (val) => { updateDoseValue('in', val); updateDrinkRatio(); }, syncDrinkOutPresets);
-    setupValueAdjuster('grind-minus', 'grind-plus', 'grind-value', () => grindStep, 0, (val) => grindStep === 1 ? String(Math.round(val)) : val.toFixed(1), updateGrindValue);
+    setupValueAdjuster('dose-in-minus', 'dose-in-plus', 'dose-in-value', () => activeStepSize('targetDoseWeight'), 0, (val) => `${val}g`, (val) => { updateDoseValue('in', val); updateDrinkRatio(); }, (fmt) => {
+        // Each tap moves the yield on screen at once (the write itself waits for the debounce).
+        const ratioYield = ratioMovesYield() ? yieldForRatio(parseFloat(fmt), keepRatio) : null;
+        if (ratioYield !== null) { updateDrinkOut(ratioYield); updateDrinkRatio(); }
+        syncDrinkOutPresets(fmt);
+    });
+    // A plugin `stepsize` on grind wins, then the step the connected grinder declares, then
+    // the built-in whole-number/0.1 rule.
+    const grindStepNow = () => drawnStepSizes.grinderSetting ? activeStepSize('grinderSetting') : (grinderDeclaredStep ?? grindStep);
+    setupValueAdjuster('grind-minus', 'grind-plus', 'grind-value', grindStepNow, 0, (val) => Number.isInteger(grindStepNow()) ? String(Math.round(val)) : val.toFixed(1), updateGrindValue);
     setupValueAdjuster('flush-minus', 'flush-plus', 'flush-value', 1, 0, (val) => `${val}s`, (val) => {
         updateFlushValue(val);
         updateFlushDisplay(val);
@@ -2461,10 +2895,12 @@ export function updateSleepButton(state) {
     if (sleepButton) {
         if (state === 'sleeping') {
             const awake = getTranslation('awake');
-            sleepButton.textContent = awake.charAt(0).toUpperCase() + awake.slice(1);
+            const label = awake.charAt(0).toUpperCase() + awake.slice(1);
+            if (sleepButton.textContent !== label) sleepButton.textContent = label;
             sleepButton.setAttribute('data-i18n-key', 'awake');
         } else {
-            sleepButton.textContent = getTranslation('Sleep');
+            const label = getTranslation('Sleep');
+            if (sleepButton.textContent !== label) sleepButton.textContent = label;
             sleepButton.setAttribute('data-i18n-key', 'Sleep');
         }
     }
@@ -2482,11 +2918,75 @@ function heatingStatusParts(raw) {
         : { label: getTranslation('Heating'), remaining: '' };
 }
 
+// Skip-step affordance in the machine-status line. Replaces the old ">>" text
+// glyph; kept as one constant because the live counter interval re-renders the
+// same line every second and must not fall back to the text arrows. The arrow
+// itself is a CSS mask (.skip-step-glyph in main.css) rather than an <img> so
+// it can be recoloured with a fixed token (var(--mimoja-blue-v2), matching the
+// Figma icon's #385A92 exactly in light mode) instead of the fixed fill baked
+// into the exported SVG. Boxed in the same bordered 72x45 frame as
+// #profile-select-btn / #profile-edit-btn (Figma node 2662:781, "Frame 311",
+// border #C9C9C9) instead of a bare glyph.
+// id + cursor-pointer live on the glyph itself (not wrapped separately at each
+// call site) because a 1s setInterval re-render (below) replaces this markup
+// wholesale — wrapping it externally only at one call site meant the click
+// target vanished a second after every render.
+const SKIP_STEP_GLYPH = '<span id="skip-step-indicator" class="skip-step-icon-box header-icon-btn cursor-pointer"><span class="pe-icon-mask skip-step-glyph" aria-hidden="true"></span></span>';
+
+function bindSkipStepHandler() {
+    const skipIndicator = document.getElementById('skip-step-indicator');
+    if (!skipIndicator) return;
+    skipIndicator.onclick = (e) => {
+        e.stopPropagation(); // Prevent event bubbling
+        logger.info('Skip step indicator clicked');
+        setMachineState('skipStep').catch(error => {
+            logger.error('Failed to skip step:', error);
+        });
+    };
+}
+
+// updateMachineStatus fires at the shot snapshot-stream cadence (~10Hz) during
+// a shot, so the puck-visibility DOM write below is guarded on actual change
+// rather than re-set every call, matching the "don't repeat per-frame work"
+// idiom app.js already applies to machine-state transitions.
+let lastPuckVisible = null;
+
+// One cache per element, shared by snapshot renders and the 1s counters.
+// Compare the original strings rather than browser-normalized innerHTML.
+const lastMachineStatusContent = new WeakMap();
+let lastMachineStatusData = null;
+
+function setMachineStatusContent(element, content, type = 'html') {
+    const next = { type, content };
+    if (!shouldWriteStatus(lastMachineStatusContent.get(element), next)) return;
+    // Dynamic status owns translation; page-wide translation must not restore
+    // the static "Connecting" placeholder during navigation.
+    element.removeAttribute('data-i18n-key');
+    if (type === 'text') element.textContent = content;
+    else element.innerHTML = content;
+    lastMachineStatusContent.set(element, next);
+}
+
+// Rebuild translated output immediately, including active counter labels.
+document.addEventListener('streamline:languagechange', () => {
+    if (lastMachineStatusData) updateMachineStatus(lastMachineStatusData);
+});
+
 export function updateMachineStatus(data) {
-    const { status, state, substate, stepName, timeValue, isClickable,  isHeating, isHeatingFromTimeToReady, steamTemperature } = data;
-    // Steam boiler is considered ready at/above 130°C. Below that it still needs
+    lastMachineStatusData = data;
+    const { status, state, substate, stepName, profileStepName, timeValue, isClickable,  isHeating, isHeatingFromTimeToReady, steamTemperature } = data;
+    // Puck (group-head) temperature only means anything while a shot is pulling,
+    // so it joins the telemetry row for espresso and leaves again afterwards.
+    const puckVisible = state === MachineState.ESPRESSO;
+    if (puckVisible !== lastPuckVisible) {
+        lastPuckVisible = puckVisible;
+        const puckInfoEl = document.getElementById('puck-info-container');
+        if (puckInfoEl) puckInfoEl.style.display = puckVisible ? '' : 'none';
+    }
+    // Steam boiler is considered ready at/above 135°C, matching the enabled
+    // range floor in rest_v1.yml SteamSettings. Below that it still needs
     // warming, which is the only time we surface a steam "Heating" message.
-    const STEAM_HEATER_READY_C = 130;
+    const STEAM_HEATER_READY_C = 135;
     const steamHeaterCold = typeof steamTemperature === 'number' && steamTemperature < STEAM_HEATER_READY_C;
     // logger.debug(`Updating machine status to: ${status}, substate: ${substate}, stepName: ${stepName}, time: ${timeValue}, clickable: ${isClickable}`);
     const machineStatusEl = document.getElementById('machine-status');
@@ -2534,10 +3034,10 @@ export function updateMachineStatus(data) {
     // and `includes('need')` caught anything with "need" in it, so the skin could
     // sit on "Out of water" while decaid reported another state entirely.
     const isNeedsWaterState = state === 'needsWater';
-    // pouringDone is the post-action tail (e.g. steam auto-purge). DE1 keeps
+    // pouringDone / puffing are the post-action tail (e.g. steam auto-purge). DE1 keeps
     // state='steam' during this window but the user-visible action is over —
     // exit the steam counter immediately rather than counting through the purge.
-    const isPouringDone = substate === 'pouringDone';
+    const isPouringDone = isActionTailSubstate(substate);
 
     // Flush should take priority over preinfusion/pouring when both match,
     // e.g. "Flush (Pouring)" should be treated as a flush state, not a shot pour.
@@ -2583,7 +3083,7 @@ export function updateMachineStatus(data) {
         delete machineStatusEl.flushIntervalId;
     }
 
-    // Steam/flush/hotwater pouringDone is the post-action tail (e.g. auto-purge).
+    // Steam/flush/hotwater pouringDone/puffing is the post-action tail (e.g. auto-purge).
     // Freeze the last counter value so the UI doesn't keep ticking through the
     // purge, and don't fall into the espresso pouring branch. Once state leaves
     // steam/flush/hotwater, the normal path renders Ready.
@@ -2593,19 +3093,19 @@ export function updateMachineStatus(data) {
             const frozenValue = typeof machineStatusEl.currentSteamValue === 'number'
                 ? machineStatusEl.currentSteamValue
                 : 0;
-            machineStatusEl.innerHTML = `<span class="text-[var(--status-ready-green)]">${steamText}:</span> <span class="text-[var(--status-clickable-color)]">${frozenValue}s</span>`;
+            setMachineStatusContent(machineStatusEl, `<span class="text-[var(--status-ready-green)]">${steamText}:</span> <span class="text-[var(--status-clickable-color)]">${frozenValue}s</span>`);
         } else if (isFlushState) {
             const flushText = getTranslation('Flush');
             const frozenValue = typeof machineStatusEl.currentFlushValue === 'number'
                 ? machineStatusEl.currentFlushValue
                 : 0;
-            machineStatusEl.innerHTML = `<span class="text-[var(--status-ready-green)]">${flushText}:</span> <span class="text-[var(--status-clickable-color)]">${frozenValue}s</span>`;
+            setMachineStatusContent(machineStatusEl, `<span class="text-[var(--status-ready-green)]">${flushText}:</span> <span class="text-[var(--status-clickable-color)]">${frozenValue}s</span>`);
         } else {
             const pouringText = getTranslation('Pouring');
             const mlText = (hotWaterVolValueEl && hotWaterVolValueEl.textContent)
                 ? hotWaterVolValueEl.textContent.trim()
                 : '';
-            machineStatusEl.innerHTML = `<span class="text-[var(--status-green-color)]">${pouringText}:</span> <span class="text-[var(--status-clickable-color)]">${mlText}</span>`;
+            setMachineStatusContent(machineStatusEl, `<span class="text-[var(--status-green-color)]">${pouringText}:</span> <span class="text-[var(--status-clickable-color)]">${mlText}</span>`);
         }
         return;
     }
@@ -2617,18 +3117,18 @@ export function updateMachineStatus(data) {
     // Handle Needs Water state - takes priority
     if (isNeedsWaterState) {
         const outOfWaterText = getTranslation('Out of water') || 'Out of water';
-        machineStatusEl.innerHTML = `<span class="text-[var(--status-red-color)]">${outOfWaterText}</span>`;
+        setMachineStatusContent(machineStatusEl, `<span class="text-[var(--status-red-color)]">${outOfWaterText}</span>`);
         logger.debug('DEBUG: Out of water state - Set machine status with red styling');
     } else if (isEspressoPreparingForShot) {
         logger.debug('Entering isEspressoPreparingForShot condition');
         const espressoHeatingWaitText = getTranslation('Heating');
-        machineStatusEl.innerHTML = `<span class="text-[var(--status-red-color)]">${espressoHeatingWaitText}</span>`;
+        setMachineStatusContent(machineStatusEl, `<span class="text-[var(--status-red-color)]">${espressoHeatingWaitText}</span>`);
     } else if (isHeatingWithTimeRemaining) {
         // Apply different colors to the "Heating:" label and the "Xs remaining" countdown
         const { label: heatingPart, remaining: timeRemainingPart } = heatingStatusParts(status);
 
         // Apply --status-red-color to "Heating" and --heatingstatus to "Xs remaining" <span class="text-[var(--heatingstatus)]">${timeRemainingPart}</span>
-        machineStatusEl.innerHTML = `<span class="text-[var(--status-red-color)]">${heatingPart}</span><span class="text-[var(--heatingstatus)]">${timeRemainingPart}</span>`;
+        setMachineStatusContent(machineStatusEl, `<span class="text-[var(--status-red-color)]">${heatingPart}</span><span class="text-[var(--heatingstatus)]">${timeRemainingPart}</span>`);
         // logger.info(`DEBUG: Heating with time remaining - Set machine status to: ${machineStatusEl.innerHTML}`);
     } else {
         // Check if this is a preinfusion or pouring state and apply special formatting
@@ -2640,7 +3140,10 @@ export function updateMachineStatus(data) {
             // Special handling for preinfusion/pouring state to show time counting up
             // NOTE: We want the label to be able to change from "Preinfusion" to "Pouring"
             // without resetting the timer when the state transitions.
-            const stageText = isPreinfusionState ? getTranslation('Preinfusion') : getTranslation('Pouring');
+            // The profile's own step name when known; profile text is untrusted and lands in innerHTML.
+            const stageText = profileStepName
+                ? Object.assign(document.createElement('div'), { textContent: profileStepName }).innerHTML
+                : isPreinfusionState ? getTranslation('Preinfusion') : getTranslation('Pouring');
 
             // Always store the latest stage text so the running interval can pick it up
             machineStatusEl.currentPreinfusionOrPouringStageText = stageText;
@@ -2655,8 +3158,9 @@ export function updateMachineStatus(data) {
                     machineStatusEl.currentPreinfusionOrPouringValue = Math.floor(getShotTotalTime());
 
                     const currentStageText = machineStatusEl.currentPreinfusionOrPouringStageText || stageText;
-                    machineStatusEl.innerHTML = `<span class="text-[var(--status-green-color)]">${currentStageText}</span> <span class="text-[var(--status-clickable-color)]">| ${machineStatusEl.currentPreinfusionOrPouringValue}s >></span>`;
-                    logger.info(`DEBUG: Preinfusion/Pouring live counter update: ${machineStatusEl.innerHTML}`); // Keep log
+                    setMachineStatusContent(machineStatusEl, `<span class="text-[var(--status-green-color)]">${currentStageText}</span> <span class="text-[var(--status-clickable-color)]">| ${machineStatusEl.currentPreinfusionOrPouringValue}s ${SKIP_STEP_GLYPH}</span>`);
+                    bindSkipStepHandler();
+                    logger.debug(`DEBUG: Preinfusion/Pouring live counter update: ${machineStatusEl.innerHTML}`); // Keep log
                 }, 1000);
             }
 
@@ -2664,19 +3168,8 @@ export function updateMachineStatus(data) {
             // make sure the label and value reflect the *current* stage.
             const displayValue = Math.floor(getShotTotalTime());
             machineStatusEl.currentPreinfusionOrPouringValue = displayValue;
-            machineStatusEl.innerHTML = `<span class="text-[var(--status-green-color)]">${stageText}</span> <span class="text-[var(--status-clickable-color)]">| ${displayValue}s <span id="skip-step-indicator" class="cursor-pointer">>></span></span>`;
-            
-            // Add click handler to the skip indicator
-            const skipIndicator = document.getElementById('skip-step-indicator');
-            if (skipIndicator) {
-                skipIndicator.onclick = (e) => {
-                    e.stopPropagation(); // Prevent event bubbling
-                    logger.info('Skip step indicator clicked');
-                    setMachineState('skipStep').catch(error => {
-                        logger.error('Failed to skip step:', error);
-                    });
-                };
-            }
+            setMachineStatusContent(machineStatusEl, `<span class="text-[var(--status-green-color)]">${stageText}</span> <span class="text-[var(--status-clickable-color)]">| ${displayValue}s ${SKIP_STEP_GLYPH}</span>`);
+            bindSkipStepHandler();
         } else {
             // Check if this is a flush state and apply special formatting
 
@@ -2693,12 +3186,12 @@ export function updateMachineStatus(data) {
                     machineStatusEl.flushIntervalId = setInterval(() => {
                         machineStatusEl.currentFlushValue += 1;
 
-                        machineStatusEl.innerHTML = `<span class="text-[var(--status-ready-green)]">${flushText}:</span> <span class="text-[var(--status-clickable-color)]">${machineStatusEl.currentFlushValue}s</span>`;
-                        logger.info(`DEBUG: Flush live counter update: ${machineStatusEl.innerHTML}`);
+                        setMachineStatusContent(machineStatusEl, `<span class="text-[var(--status-ready-green)]">${getTranslation('Flush')}:</span> <span class="text-[var(--status-clickable-color)]">${machineStatusEl.currentFlushValue}s</span>`);
+                        logger.debug(`DEBUG: Flush live counter update: ${machineStatusEl.innerHTML}`);
                     }, 1000);
-                    // Manually set the initial state immediately after starting the interval
-                    machineStatusEl.innerHTML = `<span class="text-[var(--status-ready-green)]">${flushText}:</span> <span class="text-[var(--status-clickable-color)]">${machineStatusEl.currentFlushValue}s</span>`;
                 }
+                // Also refresh the label on language changes while the counter runs.
+                setMachineStatusContent(machineStatusEl, `<span class="text-[var(--status-ready-green)]">${flushText}:</span> <span class="text-[var(--status-clickable-color)]">${machineStatusEl.currentFlushValue}s</span>`);
             } else if (isCurrentlySteamState) {
                 // Special handling for steam "pouring" state to show a live time counter.
                 const steamText = getTranslation('Steaming');
@@ -2715,7 +3208,7 @@ export function updateMachineStatus(data) {
                     substate?.toLowerCase().includes('preparing for shot') ||
                     isreadystate;
                 if (isSteamHeatingPhase && steamHeaterCold) {
-                    machineStatusEl.innerHTML = `<span class="text-[var(--status-red-color)]">${steamonlytext}${steamheatingtext}:</span><span class="text-[var(--status-clickable-color)]">${steamwaitingText}</span>`;
+                    setMachineStatusContent(machineStatusEl, `<span class="text-[var(--status-red-color)]">${steamonlytext}${steamheatingtext}:</span><span class="text-[var(--status-clickable-color)]">${steamwaitingText}</span>`);
                 } else {
                     // Original steam counter logic for active steaming
                     if (!machineStatusEl.steamIntervalId) {
@@ -2730,18 +3223,18 @@ export function updateMachineStatus(data) {
                         machineStatusEl.steamIntervalId = setInterval(() => {
                             machineStatusEl.currentSteamValue += 1;
 
-                            machineStatusEl.innerHTML = `<span class="text-[var(--status-ready-green)]">${steamText}:</span> <span class="text-[var(--status-clickable-color)]">${machineStatusEl.currentSteamValue}s</span>`;
-                            logger.info(`DEBUG: Steam live counter update: ${machineStatusEl.innerHTML}`);
+                            setMachineStatusContent(machineStatusEl, `<span class="text-[var(--status-ready-green)]">${getTranslation('Steaming')}:</span> <span class="text-[var(--status-clickable-color)]">${machineStatusEl.currentSteamValue}s</span>`);
+                            logger.debug(`DEBUG: Steam live counter update: ${machineStatusEl.innerHTML}`);
                         }, 1000);
 
                         // Initial render at 0s
-                        machineStatusEl.innerHTML = `<span class="text-[var(--status-ready-green)]">${steamText}:</span> <span class="text-[var(--status-clickable-color)]">${machineStatusEl.currentSteamValue}s</span>`;
+                        setMachineStatusContent(machineStatusEl, `<span class="text-[var(--status-ready-green)]">${steamText}:</span> <span class="text-[var(--status-clickable-color)]">${machineStatusEl.currentSteamValue}s</span>`);
                     } else {
                         // If already running, just ensure we render the latest value with correct label.
                         const currentValue = typeof machineStatusEl.currentSteamValue === 'number'
                             ? machineStatusEl.currentSteamValue
                             : 0;
-                        machineStatusEl.innerHTML = `<span class="text-[var(--status-ready-green)]">${steamText}:</span> <span class="text-[var(--status-clickable-color)]">${currentValue}s</span>`;
+                        setMachineStatusContent(machineStatusEl, `<span class="text-[var(--status-ready-green)]">${steamText}:</span> <span class="text-[var(--status-clickable-color)]">${currentValue}s</span>`);
                     }
                 }
             } else {
@@ -2754,7 +3247,7 @@ export function updateMachineStatus(data) {
                         ? hotWaterVolValueEl.textContent.trim()
                         : '';
 
-                    machineStatusEl.innerHTML = `<span class="text-[var(--status-green-color)]">${pouringText}:</span> <span class="text-[var(--status-clickable-color)]">${mlText}</span>`;
+                    setMachineStatusContent(machineStatusEl, `<span class="text-[var(--status-green-color)]">${pouringText}:</span> <span class="text-[var(--status-clickable-color)]">${mlText}</span>`);
                     logger.info(`DEBUG: Hot Water state - Set machine status to: ${machineStatusEl.innerHTML}`);
                 } else {
                     // Determine message and class based on status and substate using a mapping approach
@@ -2762,10 +3255,10 @@ export function updateMachineStatus(data) {
 
                     // Handle plain "Heating" message (without time remaining)
                     if (isHeating && status === "Heating") {
-                        machineStatusEl.innerHTML = `<span class="text-[var(--status-red-color)]">${getTranslation('Heating')}</span>`;
+                        setMachineStatusContent(machineStatusEl, `<span class="text-[var(--status-red-color)]">${getTranslation('Heating')}</span>`);
                         logger.info(`DEBUG: Generic Heating state - Set machine status to: ${machineStatusEl.innerHTML}`);
                     } else {
-                        machineStatusEl.textContent = statusConfig.message;
+                        setMachineStatusContent(machineStatusEl, statusConfig.message, 'text');
                         // logger.info(`DEBUG: Generic state from getStatusConfiguration - Set machine status to: ${machineStatusEl.textContent}`);
                         
                     }
@@ -2825,35 +3318,9 @@ function getStatusConfiguration(status, substate, stepName, timeValue, isClickab
             message: `${getTranslation('Steaming')}: ${formatTimeAbbreviated(timeValue)}`,
             messageClass: 'status-msg-red'
         },
-        'hotwater': {
-            message: `${getTranslation('Pouring')}: ${0}ml`,
-            messageClass: 'status-msg-green'
-        }
     };
 
-    const lowerStatus = status?.toLowerCase() || '';
-    const lowerSubstate = substate?.toLowerCase() || '';
-
-    // Prioritized list of states to check against `status` and `substate`
-    const statePriority = [
-        'disconnected', 'sleeping', 'error', 'heating', 'idle',
-        'flushing', 'steaming', 'hotwater',
-        'preinfusion', 'pouring'
-    ];
-
-    let effectiveState = '';
-
-    // Determine the effective state based on inclusion and priority
-    for (const stateKey of statePriority) {
-        if (lowerStatus.includes(stateKey)) {
-            effectiveState = stateKey;
-            break;
-        }
-        if (lowerSubstate.includes(stateKey)) {
-            effectiveState = stateKey;
-            break;
-        }
-    }
+    const effectiveState = resolveStatusStateKey(status, substate);
 
     if (effectiveState && configMap[effectiveState]) {
         const config = configMap[effectiveState];
@@ -2861,13 +3328,7 @@ function getStatusConfiguration(status, substate, stepName, timeValue, isClickab
             return config(status); // Pass original status for 'heating' as it expects it
         } else {
             // Apply custom formatting for specific states based on requirements
-            if (effectiveState === 'hotwater') {
-                // For hotwater, show "Pouring(green): x ml(blue)" with different colors for different parts
-                return {
-                    message: `${getTranslation('Pouring')}: ${hotWaterVolValueEl.textContent || 0}ml`,
-                    messageClass: 'status-msg-green-blue'  // Custom class to handle green "Pouring" and blue value
-                };
-            } else if (effectiveState === 'steaming') {
+            if (effectiveState === 'steaming') {
                 // For steaming, show "Steaming: x s" with seconds counting up
                 return {
                     message: `${getTranslation('Steaming')}: ${formatTimeAbbreviated(timeValue)}`,
@@ -2911,15 +3372,12 @@ export function updateTemperatures({ mix, group, steam }) {
     const groupTempEl = document.getElementById('data-group-temp');
     const steamTempEl = document.getElementById('data-steam-temp');
 
-    if (mixTempEl) {
-        mixTempEl.textContent = formatTemp(mix, 1);
-    }
-    if (groupTempEl) {
-        groupTempEl.textContent = formatTemp(group, 1);
-    }
-    if (steamTempEl) {
-        steamTempEl.textContent = formatTemp(steam, 0);
-    }
+    // Compare against the element, not a cache: a language or unit re-render
+    // and a re-injected page both stay correct.
+    const setIfChanged = (el, text) => { if (el && el.textContent !== text) el.textContent = text; };
+    setIfChanged(mixTempEl, formatTemp(mix, 1));
+    setIfChanged(groupTempEl, formatTemp(group, 1));
+    setIfChanged(steamTempEl, formatTemp(steam, 0));
 }
 
 // Live milk-probe temperature in the top telemetry row (right after Weight).
@@ -3064,7 +3522,10 @@ export function updateGrindDisplay(grinderData) {
 
 export function updateDoseInDisplay(doseInValue) {
     const doseInValueEl = document.getElementById('dose-in-value');
-    if (doseInValueEl && doseInValue) {
+    // != null, not truthiness: a profile whose own dose really is 0 must read 0.
+    // Dropping the write left the previous profile's number on the tile while the
+    // machine was set to zero.
+    if (doseInValueEl && doseInValue != null && doseInValue !== '') {
         doseInValueEl.textContent = `${doseInValue}g`;
     }
 }
@@ -3232,13 +3693,15 @@ export function initResizablePanels(separatorId) {
     let initialX = 0;
     let initialLeftWidth = 0;
 
+    // Color-only drag feedback -- the separator stays the same 1px width as
+    // every other panel border; only its color changes while dragging (a
+    // stray mouseup outside the window used to leave a widened 'w-2' bar
+    // stuck on screen since stopDrag never ran to restore it).
     const thicken = () => {
-        separator.classList.remove('w-px');
-        separator.classList.add('w-2');
+        separator.classList.add('bg-blue-500');
     };
     const restore = () => {
-        separator.classList.remove('w-2');
-        separator.classList.add('w-px');
+        separator.classList.remove('bg-blue-500');
     };
 
     const startDrag = (e) => {
@@ -3258,6 +3721,10 @@ export function initResizablePanels(separatorId) {
 
         document.addEventListener('touchmove', drag, { passive: false });
         document.addEventListener('touchend', stopDrag);
+        // A touch interrupted by the system (e.g. a webview reinterpreting it as a
+        // scroll) fires touchcancel instead of touchend -- without this, stopDrag
+        // never runs and the separator is stuck highlighted (bg-blue-500) forever.
+        document.addEventListener('touchcancel', stopDrag);
     };
 
     const drag = (e) => {
@@ -3297,6 +3764,7 @@ export function initResizablePanels(separatorId) {
 
         document.removeEventListener('touchmove', drag);
         document.removeEventListener('touchend', stopDrag);
+        document.removeEventListener('touchcancel', stopDrag);
     };
 
     separator.addEventListener('mousedown', startDrag);
@@ -3384,22 +3852,32 @@ const STATE_DIM_MAP = {
     'flush':      ALL_GROUPS.filter(g => g !== 'flush'),
 };
 
+let lastSidebarState = null;
+let lastGhcActive = null;
+
 export function updateSidebarOverlay(state) {
+    if (state === lastSidebarState) return;
     const groupsToDim = STATE_DIM_MAP[state] || [];
+    let painted = false;
     for (const groupName of ALL_GROUPS) {
         const shouldDim = groupsToDim.includes(groupName);
         for (const id of SIDEBAR_GROUPS[groupName]) {
             const el = document.getElementById(id);
             if (!el) continue;
+            painted = true;
             el.style.opacity = shouldDim ? '0.25' : '';
             el.style.pointerEvents = shouldDim ? 'none' : '';
             el.style.transition = 'opacity 0.3s ease';
         }
     }
+    if (painted) lastSidebarState = state; // retry until the elements exist
 }
 
 export function updateGhcStopButton(isActive) {
     const stopBtn = document.getElementById('ghc-stop-btn');
+    if (!stopBtn) return;
+    if (isActive === lastGhcActive) return;
+    lastGhcActive = isActive;
     const actionIds = ['ghc-coffee-btn', 'ghc-water-btn', 'ghc-steam-btn', 'ghc-flush-btn'];
 
     if (isActive) {

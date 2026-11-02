@@ -26,8 +26,13 @@ test('EasyMDE toolbar icon font is bundled for its first render', () => {
 test('font faces use WOFF2 with swap and no browser TTF references', () => {
     const css = read('src/css/main.css');
     assert.doesNotMatch(css, /url\([^)]*\.ttf/);
-    assert.equal((css.match(/font-display: swap/g) || []).length, 11);
-    for (const name of ['Inter-Regular', 'Inter-SemiBold', 'Inter-Bold', 'NotoSansMono-SemiBold']) {
+    // Every declared face, however many there are, has to carry swap -- counting
+    // against the faces themselves rather than a fixed number so that adding a
+    // weight fails this only when it actually forgets swap.
+    const faces = (css.match(/@font-face/g) || []).length;
+    assert.ok(faces > 0);
+    assert.equal((css.match(/font-display: swap/g) || []).length, faces);
+    for (const name of ['Inter-Regular', 'Inter-SemiBold', 'Inter-Bold', 'NotoSansMono-SemiBold', 'NotoSansMono-Medium']) {
         assert.equal(existsSync(new URL(`src/ui/${name}.woff2`, root)), true);
     }
 });
@@ -95,18 +100,18 @@ test('ECharts loads after first paint only on chart-bearing routes', () => {
     assert.match(loader, /catch\(error => \{\s*echartsPromise = null;/);
 });
 
-test('core startup does not wait for Visualizer verification', () => {
+test('core startup does not wait for the legacy Visualizer credential purge', () => {
     const app = read('src/modules/app.js');
-    assert.doesNotMatch(app, /await initVisualizer\(\)/);
-    assert.match(app, /connectShotSettingsWebSocket\(handleShotSettingsData\);\s*void initVisualizer\(\)/);
+    assert.doesNotMatch(app, /await purgeLegacyVisualizerCredentials\(\)/);
+    assert.match(app, /connectShotSettingsWebSocket\(handleShotSettingsData\);\s*void purgeLegacyVisualizerCredentials\(\)\.catch\(\(\) => \{\}\)/);
     assert.match(app, /Promise\.all\(\[historyInit, profileManager\.init\(\)\]\)/);
 });
 
-test('expanded chart closes only from explicit controls', () => {
+test('zoomed chart closes by tapping it or Escape, never from a stray pointerdown', () => {
     const app = read('src/modules/app.js');
-    assert.match(app, /backBtn\.addEventListener\('click', close\)/);
+    assert.match(app, /zoomedEl\.addEventListener\('click', close\)/);
     assert.match(app, /e\.key === 'Escape'/);
-    assert.doesNotMatch(app, /expanded-chart-overlay[\s\S]*?addEventListener\('(click|pointerdown)'/);
+    assert.doesNotMatch(app, /expanded-chart[\s\S]{0,200}addEventListener\('pointerdown'/);
     assert.doesNotMatch(app, /closest\?\.\('\.legend'\)/);
 });
 
@@ -124,7 +129,13 @@ test('startup scales and reveals before asynchronous preference reconciliation',
     const scaling = read('src/modules/scaling.js');
     const css = read('src/css/main.css');
     assert.ok(app.indexOf('initScaling();') < app.indexOf('await Promise.all([i18nReady, unitsReady])'));
-    assert.match(scaling, /updateScale\(\);[\s\S]*requestAnimationFrame\(\(\) => content\.classList\.add\('scaled'\)\)/);
+    // The reveal is driven by requestAnimationFrame, not by awaiting anything:
+    // it scales first, then adds 'scaled' once the viewport size has settled
+    // (or the 600ms ceiling fires), so a stale WebView innerWidth at boot can
+    // not freeze the UI at the wrong scale.
+    assert.match(scaling, /updateScale\(\);[\s\S]*requestAnimationFrame\(reveal\)/);
+    assert.match(scaling, /content\.classList\.add\('scaled'\)/);
+    assert.doesNotMatch(scaling, /await[^\n]*\bclassList\.add\('scaled'\)/);
     assert.match(scaling, /setTimeout\(updateScale, 250\)/);
     assert.doesNotMatch(scaling, /\}, 300\);\s*\}, 100\);/);
     assert.doesNotMatch(css.match(/#scaled-content \{[\s\S]*?\}/)?.[0] || '', /opacity|transition/);

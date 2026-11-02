@@ -1,5 +1,20 @@
 const pageCache = new Map();
 let cleanupCurrentPage = null;
+// Where the user currently is and where they came from, so a subpage can send
+// them back instead of to a fixed destination (the profile editor's save and
+// cancel). null is the main page.
+let currentPageUrl = null;
+let previousPageUrl = null;
+
+export function getPreviousPageUrl() {
+    return previousPageUrl;
+}
+
+function markCurrentPage(pageUrl) {
+    if (pageUrl === currentPageUrl) return;
+    previousPageUrl = currentPageUrl;
+    currentPageUrl = pageUrl;
+}
 
 function getCleanUrl(pageUrl) {
     const filename = pageUrl.split('/').pop().replace('.html', '');
@@ -104,6 +119,7 @@ async function showMainPage({ history = 'push' } = {}) {
     // Force rescale — keyboard use on the previous page may have left a stale transform
     window.dispatchEvent(new Event('resize'));
 
+    markCurrentPage(null);
     updateHistory(history, { pageUrl: null }, 'Streamline', '?page=index');
 
     // The profile selector shares the `plotly-chart` id and leaves its last
@@ -119,7 +135,7 @@ async function showMainPage({ history = 'push' } = {}) {
     // Ensure main-page data init has run — booting on a sub-page URL skips it,
     // so without this the main page would render static HTML with no data.
     // Don't gate the chart repaint on this whole thing finishing though: it
-    // also connects DE1/scale/visualizer and six-plus websockets, none of
+    // also connects DE1/scale and six-plus websockets, none of
     // which the chart needs, and blocking on all of it is what made the
     // repaint (and the stale profile curve before it) take 1-2s on first
     // return to the main page.
@@ -151,6 +167,7 @@ export async function loadPage(pageUrl, { history = 'push' } = {}) {
 
     const mainPage = document.getElementById('main-page');
     const subpageHost = document.getElementById('subpage-host');
+    let hidMainPage = false;
 
     try {
         const pageHtml = await fetchPage(pageUrl);
@@ -175,13 +192,19 @@ export async function loadPage(pageUrl, { history = 'push' } = {}) {
 
         const mainPageWasVisible = mainPage && mainPage.style.display !== 'none';
         if (mainPage) mainPage.style.display = 'none';
-        if (mainPageWasVisible) document.dispatchEvent(new Event('streamline:mainpagehidden'));
+        if (mainPageWasVisible) {
+            hidMainPage = true;
+            document.dispatchEvent(new Event('streamline:mainpagehidden'));
+        }
         subpageHost.style.display = '';
 
         // Apply current language to freshly injected HTML before page init runs
         import('./i18n.js').then(m => m.translatePage()).catch(() => {});
 
         const cleanUrl = getCleanUrl(pageUrl);
+        // Before the page's own init runs below -- the profile editor reads
+        // getPreviousPageUrl() there to decide where Save/Cancel return to.
+        markCurrentPage(pageUrl);
         updateHistory(history, { pageUrl }, cleanUrl.split('/').pop() || 'Streamline', cleanUrl);
 
         await new Promise(resolve => requestAnimationFrame(resolve));
@@ -200,8 +223,12 @@ export async function loadPage(pageUrl, { history = 'push' } = {}) {
             }
         } else if (pageUrl.includes('profile_editor.html')) {
             try {
-                const { initializeProfileEditor } = await import('./profile_editor.js');
+                const { initializeProfileEditor, cleanupProfileEditor } = await import('./profile_editor.js');
                 if (initializeProfileEditor) await initializeProfileEditor();
+                // The CARDS tab's outside-click collapse handler is bound to
+                // `document`, so it outlives the innerHTML swap above and has
+                // to be torn down explicitly before the next page loads.
+                cleanupCurrentPage = cleanupProfileEditor;
             } catch (e) {
                 console.error('Router: Error initializing profile editor:', e);
             }
@@ -210,6 +237,8 @@ export async function loadPage(pageUrl, { history = 'push' } = {}) {
         console.error('Error loading page:', error);
         if (mainPage) mainPage.style.display = '';
         if (subpageHost) subpageHost.style.display = 'none';
+        // Paint writers are gated on this event; without it they stay frozen
+        // after a failed subpage load restores the main page.
+        if (hidMainPage) document.dispatchEvent(new Event('streamline:mainpagevisible'));
     }
 }
-

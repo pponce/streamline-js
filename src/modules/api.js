@@ -1,13 +1,22 @@
 import * as ui from './ui.js';
 import { logger ,setDebug} from './logger.js';
-import { createSocketSlot } from './socket-slot.js';
-import { CALIBRATED_STEAM_PLUGIN, createScaleSampleBuffer } from './calibrated-steam.js';
+import { createSocketSlot, RECONNECT_POLICY } from './socket-slot.js';
+import { decideResync } from './resync-policy.js';
+import { createScaleSampleBuffer } from './calibrated-steam.js';
 import { clampAutoSteamSettings } from './auto-steam-safety.js';
 import { AUTO_STEAM_SESSION_KEY, readAutoSteamSession } from './auto-steam-session.js';
 import { openDB, getSetting, setSetting } from './idb.js';
 import { buildCalibrateBody, classifyCalState } from './loadcell-cal.js';
 import { deriveDisplayAction, isScreensaverSuppressed } from './screensaver-policy.js';
 import { splitNdjson, advanceFirmwareState, initialFirmwareState } from './firmware-progress.js';
+import { parseSse } from './derek-stream.js';
+import { assertDeclaredFields } from './workflow-fields.js';
+import { selectedRecipeSteamTemp } from './dye-selection.js';
+import {
+    SAVER_BRIGHTNESS_KEY, SAVER_BRIGHTNESS_CUSTOM_KEY,
+    resolveSaverBrightness, parseSaverBrightnessSetting,
+} from './saver-brightness.js';
+export { SAVER_BRIGHTNESS_DEFAULT } from './saver-brightness.js';
 
 export let reaHostname = localStorage.getItem('reaHostname') || window.location.hostname;
 export const REA_PORT = 8080;
@@ -41,7 +50,7 @@ export const MachineState = {
 export let reconnectingWebSocket = null; // Exporting for app.js access
 export let currentMachineState = null;
 let previousMachineState = null;
-let scaleWebSocket = null;
+const scaleSocketSlot = createSocketSlot('scale');
 const calibratedSteamSamples = createScaleSampleBuffer();
 let calibratedSteamSamplingEnabled = false;
 
@@ -56,22 +65,13 @@ export function getCalibratedSteamSamples() {
     return calibratedSteamSamples.read();
 }
 
-// Compatibility entry point for this fork's dedicated Auto Steam settings
-// category. Keep all plugin HTTP traffic on the shared API transport.
-export function calibratedSteamRequest(endpoint, body) {
-    return callPluginEndpoint(
-        CALIBRATED_STEAM_PLUGIN,
-        endpoint,
-        body,
-        body === undefined ? 'GET' : 'POST',
-    );
-}
-
 let sensorSnapshotWebSocket = null;
 let sensorSnapshotWebSocketId = null; // sensor `id` the open socket is bound to
 let displayWebSocket = null;
 let displayWebSocketReady = false;
 let pendingDisplayCommand = null;
+// setBrightness is held apart so a later wake-lock/other command cannot displace it.
+let pendingBrightnessCommand = null;
 // Latest DisplayState frame from ws/v1/display. Null until the socket delivers
 // its first snapshot.
 let lastDisplayState = null;
@@ -82,6 +82,9 @@ export function getLastDisplayState() {
 }
 // Brightness to return to on wake, captured just before we dim.
 let brightnessBeforeDim = null;
+// The level the last restoreDisplay() sent. A dim that follows before the display
+// socket reports it back would otherwise find only the saver level in lastDisplayState.
+let lastRestoredBrightness = null;
 let updateWebSocket = null;
 let updateWebSocketReady = false;
 
@@ -160,6 +163,73 @@ export async function getDevices() {
         throw new Error('Failed to get devices');
     }
     return response.json();
+}
+
+export async function getScaleInfo() {
+    const response = await fetch(`${API_BASE_URL}/scale/info`);
+    if (!response.ok) {
+        const error = new Error(`Failed to get scale info (${response.status})`);
+        error.status = response.status;
+        throw error;
+    }
+    return response.json();
+}
+
+/** Connected scale inventory, including the host-owned connection role. */
+export async function getScaleDevices() {
+    const devices = await getDevices();
+    return Array.isArray(devices) ? devices.filter(device => device?.type === 'scale') : [];
+}
+
+// ── Connected grinder ───────────────────────────────────────────────────────
+// Runtime device, separate from the persisted /grinders catalogue. 503 means none is
+// connected, which is a normal answer here, not an error.
+
+/** Grinder devices Decaid knows about (connected or found by a scan). */
+export async function getGrinderDevices() {
+    const devices = await getDevices();
+    return Array.isArray(devices) ? devices.filter(device => device?.type === 'grinder') : [];
+}
+
+/** GET /grinder/info -> { deviceId, capabilities, observations?, controls?, surfaces? }, or null. */
+export async function getGrinderInfo() {
+    try {
+        const response = await fetch(`${API_BASE_URL}/grinder/info`);
+        return response.ok ? await response.json() : null;
+    } catch (error) {
+        logger.debug('Grinder info unavailable:', error);
+        return null;
+    }
+}
+
+/** PUT /devices/disconnect. Throws when Decaid refuses. */
+export async function disconnectDevice(deviceId) {
+    const response = await fetch(`${API_BASE_URL}/devices/disconnect?deviceId=${encodeURIComponent(deviceId)}`, { method: 'PUT' });
+    if (!response.ok) throw new Error(`Failed to disconnect device ${deviceId}`);
+}
+
+/** PUT /grinder/setting. The grinder's own setting string; throws when it is refused. */
+export async function setGrinderSetting(setting) {
+    const response = await fetch(`${API_BASE_URL}/grinder/setting`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ setting: String(setting) }),
+    });
+    if (!response.ok) throw new Error(`Grinder refused the setting (${response.status})`);
+}
+
+/**
+ * ws/v1/grinder/snapshot. The socket stays open and silent while no grinder is
+ * connected and sends the current snapshot on every (re)connect, so `onOpen` is the
+ * moment to forget what was last seen. Returns { close }.
+ */
+export function connectGrinderSnapshot(onSnapshot, onOpen = null) {
+    const socket = new ReconnectingWebSocket(`${WS_PROTOCOL}//${reaHostname}:${REA_PORT}/ws/v1/grinder/snapshot`, [], { ...RECONNECT_POLICY.background });
+    socket.onopen = () => { if (onOpen) onOpen(); };
+    socket.onmessage = (event) => {
+        try { onSnapshot(JSON.parse(event.data)); } catch (error) { logger.warn('Bad grinder snapshot:', error); }
+    };
+    return { close: () => socket.close() };
 }
 
 // ── Sensors (Bengle milk probe et al.) ──────────────────────────────────────
@@ -460,9 +530,7 @@ export function ensureMachineSnapshotSocket() {
 }
 
 export function connectWebSocket(onData, onReconnect) {
-    reconnectingWebSocket = snapshotSocketSlot.replace(() => new ReconnectingWebSocket(`${WS_PROTOCOL}//${reaHostname}:${REA_PORT}/ws/v1/machine/snapshot`, [], {
-        reconnectInterval: 3000,
-    }));
+    reconnectingWebSocket = snapshotSocketSlot.replace(() => new ReconnectingWebSocket(`${WS_PROTOCOL}//${reaHostname}:${REA_PORT}/ws/v1/machine/snapshot`, [], { ...RECONNECT_POLICY.critical }));
 
     reconnectingWebSocket.onopen = () => {
         logger.info('WebSocket (re)connected.');
@@ -484,6 +552,14 @@ export function connectWebSocket(onData, onReconnect) {
             
             previousMachineState = currentMachineState;
             currentMachineState = stateValue;
+            if (previousMachineState === 'espresso' && stateValue !== 'espresso') {
+                espressoEndedAt = Date.now();
+                // A profile switch asked for during the shot was held rather than
+                // written into the frames the machine was running. It can go out now.
+                document.dispatchEvent(new Event('streamline:espresso-end'));
+            }
+            // Plugin overlays that asked for it close when a shot starts (see `closeOnShot`).
+            if (stateValue === 'espresso' && previousMachineState !== 'espresso') document.dispatchEvent(new Event('streamline:espresso-start'));
             // Keep the last frame so pages that need a live reading (the
             // sensor calibration capture) can take one without opening a
             // second socket -- this one is a process-wide singleton.
@@ -512,11 +588,6 @@ export function connectWebSocket(onData, onReconnect) {
     reconnectingWebSocket.onclose = () => {
         logger.info('WebSocket disconnected. Attempting to reconnect...');
         ui.updateMachineStatus({ status: "Disconnected" });
-        setTimeout(() => {
-            logger.info('reloading now');
-            // location.reload();
-
-        }, 6000);
     };
 
     reconnectingWebSocket.onerror = (error) => {
@@ -527,16 +598,43 @@ export function connectWebSocket(onData, onReconnect) {
     reconnectingWebSocket.onreconnect = null;
 }
 
+const addressedScaleSocketSlot = createSocketSlot('addressed scale snapshot');
+
+/** Stream raw snapshots for one explicitly selected scale (primary or auxiliary). */
+export function connectAddressedScaleWebSocket(deviceId, onData, onReconnect, onDisconnect) {
+    if (!String(deviceId || '').trim()) throw new Error('Invalid scale selection');
+    const socket = addressedScaleSocketSlot.replace(() => new ReconnectingWebSocket(
+        `${WS_PROTOCOL}//${reaHostname}:${REA_PORT}/ws/v1/scales/${encodeURIComponent(String(deviceId))}/snapshot`,
+        [],
+        { ...RECONNECT_POLICY.standard },
+    ));
+    socket.onopen = () => onReconnect?.();
+    socket.onmessage = event => {
+        try {
+            const data = JSON.parse(event.data);
+            if (data?.status === 'connected') onReconnect?.();
+            else if (data?.status === 'disconnected') onDisconnect?.();
+            else if (!data?.error) onData?.(data);
+        } catch (error) {
+            logger.warn('Error parsing addressed scale snapshot:', error);
+        }
+    };
+    socket.onerror = error => logger.warn('Addressed scale snapshot error:', error);
+    socket.onclose = () => onDisconnect?.();
+    socket.onreconnect = null;
+    return socket;
+}
+
+export function closeAddressedScaleWebSocket() {
+    addressedScaleSocketSlot.close();
+}
+
 export function connectScaleWebSocket(onData, onReconnect, onDisconnect) {
     calibratedSteamSamples.clear();
-    if (scaleWebSocket) {
-        logger.info('Closing existing scale WebSocket before creating a new one.');
-        scaleWebSocket.close();
-    }
-
-    scaleWebSocket = new ReconnectingWebSocket(`${WS_PROTOCOL}//${reaHostname}:${REA_PORT}/ws/v1/scale/snapshot`, [], {
-        reconnectInterval: 3000,
-    });
+    // The slot silences the previous socket before closing it, so a deliberate
+    // replace (settings wizard takeover/release, post-scan reopen) never fires the
+    // old owner's onDisconnect. Genuine drops still reach onclose below.
+    const scaleWebSocket = scaleSocketSlot.replace(() => new ReconnectingWebSocket(`${WS_PROTOCOL}//${reaHostname}:${REA_PORT}/ws/v1/scale/snapshot`, [], { ...RECONNECT_POLICY.standard }));
 
     scaleWebSocket.onopen = () => {
         calibratedSteamSamples.clear();
@@ -599,9 +697,7 @@ export function connectSensorSnapshotWebSocket(sensorId, onData) {
     }
 
     sensorSnapshotWebSocketId = sensorId;
-    sensorSnapshotWebSocket = new ReconnectingWebSocket(`${WS_PROTOCOL}//${reaHostname}:${REA_PORT}/ws/v1/sensors/${sensorId}/snapshot`, [], {
-        reconnectInterval: 3000,
-    });
+    sensorSnapshotWebSocket = new ReconnectingWebSocket(`${WS_PROTOCOL}//${reaHostname}:${REA_PORT}/ws/v1/sensors/${sensorId}/snapshot`, [], { ...RECONNECT_POLICY.background });
 
     sensorSnapshotWebSocket.onmessage = (event) => {
         try {
@@ -628,9 +724,7 @@ export function closeSensorSnapshotWebSocket() {
 }
 
 export function connectShotSettingsWebSocket(onData) {
-    const shotSettingsWebSocket = shotSettingsSocketSlot.replace(() => new ReconnectingWebSocket(`${WS_PROTOCOL}//${reaHostname}:${REA_PORT}/ws/v1/machine/shotSettings`, [], {
-        reconnectInterval: 3000,
-    }));
+    const shotSettingsWebSocket = shotSettingsSocketSlot.replace(() => new ReconnectingWebSocket(`${WS_PROTOCOL}//${reaHostname}:${REA_PORT}/ws/v1/machine/shotSettings`, [], { ...RECONNECT_POLICY.standard }));
 
     shotSettingsWebSocket.onopen = () => {
         logger.info('Shot Settings WebSocket connected');
@@ -655,13 +749,49 @@ export function connectShotSettingsWebSocket(onData) {
     };
 }
 
+// Water tank feed (ws/v1/machine/waterLevels). Bound to a De1 *instance* on the
+// server (de1handler.dart `_withDe1Ws`), so app.js re-opens it after a machine
+// power-cycle; the slot closes and silences the previous socket first.
+const waterLevelSocketSlot = createSocketSlot('water level');
+
+export function connectWaterLevelsWebSocket(onData) {
+    const socket = waterLevelSocketSlot.replace(() => new ReconnectingWebSocket(`${WS_PROTOCOL}//${reaHostname}:${REA_PORT}/ws/v1/machine/waterLevels`, [], { ...RECONNECT_POLICY.standard }));
+
+    socket.onopen = () => {
+        logger.info('Water tank WebSocket connection established.');
+    };
+
+    socket.onmessage = (event) => {
+        let data;
+        try {
+            data = JSON.parse(event.data);
+        } catch (error) {
+            logger.error('Error parsing water level data:', error);
+            return;
+        }
+        try {
+            onData(data);
+        } catch (error) {
+            logger.error('Error handling water level data:', error);
+        }
+    };
+
+    socket.onclose = (event) => {
+        logger.info('Water tank WebSocket connection closed.', event && event.reason);
+    };
+
+    socket.onerror = () => {
+        logger.error('Water tank WebSocket error. See library logs for details.');
+    };
+
+    return socket;
+}
+
 // ShotState feed (ws/v1/machine/shotState): shot phase + decision frames from
 // Rea's shot sequencer. The server replays the latest frame on connect and the
 // socket is not gated on a connected machine — attach once and keep it open.
 export function connectShotStateWebSocket(onData) {
-    const shotStateWebSocket = new ReconnectingWebSocket(`${WS_PROTOCOL}//${reaHostname}:${REA_PORT}/ws/v1/machine/shotState`, [], {
-        reconnectInterval: 3000,
-    });
+    const shotStateWebSocket = new ReconnectingWebSocket(`${WS_PROTOCOL}//${reaHostname}:${REA_PORT}/ws/v1/machine/shotState`, [], { ...RECONNECT_POLICY.standard });
 
     shotStateWebSocket.onopen = () => {
         logger.info('Shot State WebSocket connected');
@@ -684,10 +814,45 @@ export function connectShotStateWebSocket(onData) {
     };
 }
 
-export function connectTimeToReadyWebSocket(onData) {
-    const timeToReadyWebSocket = new ReconnectingWebSocket(`${WS_PROTOCOL}//${reaHostname}:${REA_PORT}/ws/v1/plugins/time-to-ready.reaplugin/timeToReady`, [], {
-        reconnectInterval: 3000,
+// A plugin's own websocket used only as "something changed": `onPush` runs for
+// every message, whatever its body. One socket per plugin, closed before it is
+// replaced, and reconnecting with a growing wait while the plugin is away.
+const pluginPushSlots = new Map();
+
+// `onOpen(firstOpen)` fires on every open, so a caller can catch up on what was
+// pushed while the socket was down -- Decaid pushes only to the sockets open at
+// the time. The cap is 5 s, not a minute: the plugin runs on the same tablet and
+// a reload takes seconds, so a long wait only hides its changes (issue #174).
+export function connectPluginPush(pluginId, endpoint, onPush, onOpen) {
+    let slot = pluginPushSlots.get(pluginId);
+    if (!slot) {
+        slot = createSocketSlot(`plugin ${pluginId} push`);
+        pluginPushSlots.set(pluginId, slot);
+    }
+    return slot.replace(() => {
+        const socket = new ReconnectingWebSocket(
+            `${WS_PROTOCOL}//${reaHostname}:${REA_PORT}/ws/v1/plugins/${encodeURIComponent(pluginId)}/${encodeURIComponent(endpoint)}`,
+            [], { ...RECONNECT_POLICY.background, maxReconnectInterval: 5000 });
+        let opened = false;
+        socket.onopen = () => {
+            const firstOpen = !opened;
+            opened = true;
+            try { onOpen?.(firstOpen); } catch (error) { logger.warn('Plugin push open handler failed:', error); }
+        };
+        socket.onmessage = (event) => { try { onPush(event?.data); } catch (error) { logger.warn('Plugin push handler failed:', error); } };
+        return socket;
     });
+}
+
+export function closePluginPush(pluginId) {
+    const slot = pluginPushSlots.get(pluginId);
+    if (!slot) return;
+    slot.close();
+    pluginPushSlots.delete(pluginId);
+}
+
+export function connectTimeToReadyWebSocket(onData) {
+    const timeToReadyWebSocket = new ReconnectingWebSocket(`${WS_PROTOCOL}//${reaHostname}:${REA_PORT}/ws/v1/plugins/time-to-ready.reaplugin/timeToReady`, [], { ...RECONNECT_POLICY.standard });
 
     timeToReadyWebSocket.onopen = () => {
         logger.info('Time-to-ready WebSocket connected');
@@ -718,7 +883,7 @@ export function connectProfileGeneratedWebSocket(onData) {
     profileGeneratedWebSocket = new ReconnectingWebSocket(
         `${WS_PROTOCOL}//${reaHostname}:${REA_PORT}/ws/v1/plugins/decent-profile.reaplugin/profileGenerated`,
         [],
-        { debug: false, reconnectInterval: 3000 }
+        { ...RECONNECT_POLICY.background, debug: false }
     );
 
     profileGeneratedWebSocket.onopen = () => {
@@ -756,7 +921,16 @@ const deviceDisconnectListeners = new Set();
 const deviceErrorListeners = new Set();
 
 export function subscribeMachineConnectionChanges(listener) {
-    const identity = data => JSON.stringify((data?.devices || []).filter(device => device.type === 'machine' && device.state === 'connected').map(device => device.id).sort());
+    return subscribeConnectionChanges('machine', listener);
+}
+
+/** Fires when the set of connected grinders changes (a connect, a disconnect, a swap). */
+export function subscribeGrinderConnectionChanges(listener) {
+    return subscribeConnectionChanges('grinder', listener);
+}
+
+function subscribeConnectionChanges(type, listener) {
+    const identity = data => JSON.stringify((data?.devices || []).filter(device => device.type === type && device.state === 'connected').map(device => device.id).sort());
     let previous = identity(lastDeviceData);
     const onData = data => {
         const next = identity(data);
@@ -788,9 +962,7 @@ export function connectDeviceWebSocket(onData, onReconnect, onDisconnect, onErro
         return;
     }
 
-    deviceWebSocket = new ReconnectingWebSocket(`${WS_PROTOCOL}//${reaHostname}:${REA_PORT}/ws/v1/devices`, [], {
-        reconnectInterval: 3000,
-    });
+    deviceWebSocket = new ReconnectingWebSocket(`${WS_PROTOCOL}//${reaHostname}:${REA_PORT}/ws/v1/devices`, [], { ...RECONNECT_POLICY.critical });
 
     deviceWebSocket.onopen = () => {
         logger.info('Device WebSocket (re)connected.');
@@ -932,9 +1104,7 @@ export function connectDisplayWebSocket(onData) {
         return;
     }
 
-    displayWebSocket = new ReconnectingWebSocket(`${WS_PROTOCOL}//${reaHostname}:${REA_PORT}/ws/v1/display`, [], {
-        reconnectInterval: 3000,
-    });
+    displayWebSocket = new ReconnectingWebSocket(`${WS_PROTOCOL}//${reaHostname}:${REA_PORT}/ws/v1/display`, [], { ...RECONNECT_POLICY.standard });
 
     displayWebSocket.onopen = () => {
         logger.info('Display WebSocket connected');
@@ -945,10 +1115,10 @@ export function connectDisplayWebSocket(onData) {
         if (isWakeLockEnabled()) {
             enableWakeLock().catch((e) => logger.warn('Failed to re-arm wake-lock on connect:', e));
         }
-        if (pendingDisplayCommand) {
-            sendDisplayCommand(pendingDisplayCommand);
-            pendingDisplayCommand = null;
-        }
+        const queuedCommands = [pendingDisplayCommand, pendingBrightnessCommand].filter(Boolean);
+        pendingDisplayCommand = null;
+        pendingBrightnessCommand = null;
+        for (const queued of queuedCommands) sendDisplayCommand(queued);
     };
 
     displayWebSocket.onmessage = (event) => {
@@ -984,17 +1154,21 @@ export function connectDisplayWebSocket(onData) {
  * @param {Object} command - The command payload
  * @param {string} command.command - The command type: 'setBrightness', 'requestWakeLock', or 'releaseWakeLock'
  * @param {number} [command.brightness] - Brightness value 0-100 (required for setBrightness)
+ * @returns {'sent'|'queued'} 'queued' = the socket was not ready; only the latest setBrightness and the latest other command are kept
+ *   and go out when the socket opens.
  */
 export function sendDisplayCommand(command) {
     if (!displayWebSocket || !displayWebSocketReady || displayWebSocket.readyState !== WebSocket.OPEN) {
         logger.warn('Display WebSocket not ready. Queuing command:', command);
-        pendingDisplayCommand = command;
-        return;
+        if (command?.command === 'setBrightness') pendingBrightnessCommand = command;
+        else pendingDisplayCommand = command;
+        return 'queued';
     }
 
     try {
         displayWebSocket.send(JSON.stringify(command));
         logger.info('Display command sent:', command);
+        return 'sent';
     } catch (error) {
         logger.error('Error sending display command:', error);
         throw error;
@@ -1021,9 +1195,7 @@ export function connectUpdateWebSocket(onData, onOpen) {
         return;
     }
 
-    updateWebSocket = new ReconnectingWebSocket(`${WS_PROTOCOL}//${reaHostname}:${REA_PORT}/ws/v1/update`, [], {
-        reconnectInterval: 3000,
-    });
+    updateWebSocket = new ReconnectingWebSocket(`${WS_PROTOCOL}//${reaHostname}:${REA_PORT}/ws/v1/update`, [], { ...RECONNECT_POLICY.background });
 
     updateWebSocket.onopen = () => {
         logger.info('Update WebSocket connected');
@@ -1150,10 +1322,16 @@ export async function getKVValue(namespace, key) {
 }
 
 export async function setKVValue(namespace, key, value) {
+    // keepalive: settingsSync's mirror fires this right after a localStorage
+    // write and never awaits it before the page can navigate (e.g. switching
+    // skins). Without keepalive that in-flight POST is cancelled on unload,
+    // the durable copy stays stale, and the next hydrate() overwrites the
+    // fresh local value back to the old one ("KV wins on conflict").
     const response = await fetch(`${API_BASE_URL}/store/${encodeURIComponent(namespace)}/${encodeURIComponent(key)}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(value),
+        keepalive: true,
     });
     if (!response.ok) {
         const errorBody = await response.text();
@@ -1163,30 +1341,49 @@ export async function setKVValue(namespace, key, value) {
 }
 
 export async function deleteKVValue(namespace, key) {
+    // keepalive: see setKVValue -- same drop-on-unload race for a removeItem.
     const response = await fetch(`${API_BASE_URL}/store/${encodeURIComponent(namespace)}/${encodeURIComponent(key)}`, {
         method: 'DELETE',
+        keepalive: true,
     });
     if (!response.ok) throw new Error(`KV deleteValue failed: ${response.status}`);
 }
 
-// ─── DYE2 KV bridge (read-only) ──────────────────────────────────────────────
+// ─── DYE2 KV bridge ──────────────────────────────────────────────────────────
 // DYE2 (a separate flutter_js plugin) persists auto-favourites and recipes as a
 // single JSON array per key under this namespace. Streamline is a read-only
-// consumer — never write these keys (see dye2-plugin/KV_CONTRACT.md).
+// consumer of it (see dye2-plugin/KV_CONTRACT.md). The one write left is
+// dyeStrip.js's recipe/favourite auto-save, and it is a FALLBACK: a DYE2 that
+// declares a `selection` endpoint records dial-in edits itself and the skin then
+// writes nothing. Against an older DYE2 the auto-save patches a single item's
+// dashboardVariables/snapshot fields onto a freshly re-read array. There is no
+// field-level API (DYE2's own pages mutate the same way — read the whole array,
+// edit one item client-side, POST the whole array back), and no version/ETag on
+// this endpoint, so a write here races any concurrent DYE2 write the same way
+// DYE2's own pages would race each other.
 export const DYE2_KV_NAMESPACE = 'dye2.reaplugin';
 
 // Read one DYE2 collection key as an array. A never-written key makes the bridge
 // return 200 with a non-array body (a known quirk), so coerce anything that
-// isn't an array — and any transport error — to [] so the header degrades to
-// "no DYE2 data" rather than throwing.
+// isn't an array (Decaid answers a missing key with 200 `null`) to [] so the
+// header degrades to "no DYE2 data". A transport/HTTP error returns null, NOT [],
+// so callers can tell "the read failed" from "genuinely empty" and keep what
+// they already have instead of wiping it. Never throws.
 export async function getDye2KvArray(key) {
     try {
         const val = await getKVValue(DYE2_KV_NAMESPACE, key);
         return Array.isArray(val) ? val : [];
     } catch (e) {
-        logger.info(`getDye2KvArray(${key}) → [] (${e.message})`);
-        return [];
+        logger.info(`getDye2KvArray(${key}) → null (${e.message})`);
+        return null;
     }
+}
+
+// Write a whole DYE2 collection array back — see the module note above: this
+// is only ever called with an array freshly read moments earlier and patched
+// in place, never a stale cached copy.
+export async function setDye2KvArray(key, items) {
+    await setKVValue(DYE2_KV_NAMESPACE, key, items);
 }
 
 // ─── Profile API ─────────────────────────────────────────────────────────────
@@ -1353,7 +1550,7 @@ export async function sendProfile(profileJson) {
     if (!isValidProfile(profileJson)) {
         throw new Error('Profile validation failed. Not sending to REA.');
     }
-    return updateWorkflow({ profile: profileJson });
+    return updateWorkflow({ profile: profileJson }, 'api.sendProfile');
 }
 
 export async function getWorkflow() {
@@ -1367,7 +1564,36 @@ export async function getWorkflow() {
 
 }
 
-export async function updateWorkflow(data) {
+// PUT /workflow requests on the wire. The dashboard's read-back waits for zero so
+// it never paints a value older than a write that has not landed yet.
+let workflowWritesInFlight = 0;
+export function hasWorkflowWriteInFlight() { return workflowWritesInFlight > 0; }
+
+// The scale's latest weight, kept here so a plugin's "use the scale as the dose" tap can
+// read it without reaching into app.js. The caller judges how old it may be.
+let scaleReading = { weight: null, at: 0 };
+export function setLatestScaleReading(weight) { scaleReading = { weight, at: Date.now() }; }
+export function clearLatestScaleReading() { scaleReading = { weight: null, at: 0 }; }
+export function getScaleReading() { return scaleReading; }
+// When the last espresso ended, so the cup left on the scale is not taken for a dose.
+let espressoEndedAt = null;
+export function getEspressoEndedAt() { return espressoEndedAt; }
+
+// Every write to the live workflow goes through here, and every caller says
+// which writer it is. The workflow deep-merges whatever it is given and has no
+// revision, so a writer that sends a field it does not own silently overwrites
+// a newer value -- see workflow-fields.js for the ownership table.
+export async function updateWorkflow(data, writer) {
+    assertDeclaredFields(writer, data);
+    workflowWritesInFlight += 1;
+    try {
+        return await putWorkflow(data);
+    } finally {
+        workflowWritesInFlight -= 1;
+    }
+}
+
+async function putWorkflow(data) {
     // Deep copy to avoid side effects on the original object.
     const dataToSend = JSON.parse(JSON.stringify(data));
 
@@ -1422,7 +1648,23 @@ export async function updateWorkflow(data) {
         logger.error('updateWorkflow payload was', JSON.stringify(dataToSend));
         throw new Error(`Failed to update workflow: ${response.status} ${body}`);
     }
-    return response.json();
+    const result = await response.json();
+    for (const listener of workflowUpdateListeners) {
+        try { listener(result, dataToSend); } catch (e) { logger.error('workflow update listener failed', e); }
+    }
+    return result;
+}
+
+// Fires after every successful PUT /workflow with the merged workflow and the
+// exact partial payload that was sent — dyeStrip.js's recipe auto-save uses
+// the payload to tell which single field a dashboard edit touched, so it
+// patches only that field rather than resyncing everything. Returns an
+// unsubscribe function; listener errors are caught so one bad subscriber
+// can't break a tile write.
+const workflowUpdateListeners = new Set();
+export function onWorkflowUpdated(listener) {
+    workflowUpdateListeners.add(listener);
+    return () => workflowUpdateListeners.delete(listener);
 }
 
 export async function setMachineState(newState) {
@@ -1542,68 +1784,84 @@ export async function readSharedValue(key) {
     }
 }
 
-// Resync for a main-page control: make Rea's workflow record agree with what
-// the user last set.
+// Reconcile a main-page control with Rea's workflow record. See resync-policy.js
+// for the rules; in short:
+//   - our own push that has not landed (pending) is retried;
+//   - a field the workflow does not have is filled from the remembered value;
+//   - anything else that differs was written by something other than Streamline
+//     (another skin, a plugin, a script) and is ADOPTED as the new remembered
+//     value instead of being pushed back over;
+//   - a stale echo of our own recent push is ignored (decaid gh-678).
 //
 // NOT about repairing the DE1 -- decaid re-applies the whole workflow (steam,
 // hot water, rinse) to the machine on every connect, so a BLE reconnect does
 // not leave the device holding stale targets (de1_controller.defaults.dart,
-// _setDe1DefaultsFor). What DOES drift is the workflow record itself: a value
-// set from another device, a push that never landed (PUT /workflow can 503,
-// see setTargetSteamDuration), or a workflow replaced wholesale. The KV store
-// is the record of intent that survives all three.
+// _setDe1DefaultsFor). The KV store (not per-device IndexedDB) is the shared
+// record so a phone and a tablet agree on the target; IndexedDB is only
+// consulted if the store can't be reached.
 //
-// Re-pushing unconditionally every boot would work but is wasteful and, if the
-// remembered value were the stale one, would clobber a legitimate reading --
-// so push only on actual disagreement. The KV store (not per-device IndexedDB)
-// is the source of truth so a phone and a tablet agree on the target;
-// IndexedDB is only consulted if the store can't be reached.
+// Returns the value pushed (so the caller can repaint its tile), else null.
+// Adopting returns null: the tile already shows the workflow's value.
 export async function resyncIfDrifted(key, fetchedValue, pushFn) {
     if (isAutoSteamActive() && [STEAM_DURATION_LAST_VALUE_KEY, STEAM_FLOW_LAST_VALUE_KEY, MILK_STOP_LAST_VALUE_KEY].includes(key)) return null;
     const remembered = await readSharedValue(key);
+    const pending = await readPendingPush(key);
     // Auto can become active while the shared value is being read. Re-check
     // before an old manual target can be pushed over Auto's owned settings.
     if (isAutoSteamActive() && [STEAM_DURATION_LAST_VALUE_KEY, STEAM_FLOW_LAST_VALUE_KEY, MILK_STOP_LAST_VALUE_KEY].includes(key)) return null;
-    // No record of the user ever setting this -> whatever the machine holds
-    // stands. Otherwise the remembered value wins, INCLUDING when the workflow
-    // has no value at all (fetchedValue null/undefined): a missing field is not
-    // a reason to drop what the user asked for, it is the strongest reason to
-    // push it. Milk stop keeps its own extra guard -- see
-    // resyncMilkStopIfDrifted, where 0 is a real choice rather than an absence.
-    if (remembered == null) return null;
-    if (remembered === fetchedValue) return null;
-    await pushFn(remembered);
-    // Returns what was pushed so the caller can repaint its tile. Pushing alone
-    // leaves the display on the value the workflow arrived with -- the machine
-    // takes the remembered number and the tile keeps showing the drifted one.
-    // Hot water and steam duration are echoed back by a shot-settings frame and
-    // self-heal; steam flow, the milk stop and the flush duration are in no
-    // websocket payload, so nothing else ever corrects them.
-    return remembered;
+    const decision = decideResync({
+        remembered, observed: fetchedValue, pending, lastPush: lastOwnPush.get(key), now: Date.now(),
+    });
+    if (decision.action === 'adopt') {
+        await persistSharedValue(key, decision.value);
+        return null;
+    }
+    if (decision.action !== 'push') return null;
+    await pushFn(decision.value);
+    return decision.value;
 }
 
-// KV first, machine second, for the same reason as setTargetSteamDuration: the
-// store is the record of intent, and everything else compares against it.
-//
-// Storing after the PUT resolved (and without awaiting the store write) left a
-// window in which the workflow and the machine already held the NEW value while
-// the store still held the OLD one. Hot water is echoed straight back by a
-// shotSettings frame, so resyncDriftedShotSettings runs inside that window,
-// reads the stale store, and treats the user's own change as drift -- pushing
-// the OLD value back over the machine and the workflow. The tile flashed the
-// new number, the echo of the re-pushed old one repainted it, and the setting
-// was gone. Intermittent rather than constant only because RESYNC_COOLDOWN_MS
-// suppresses the check for 30s after it fires.
+// Our own pushes, so resyncIfDrifted can tell them from outside writes.
+//   lastOwnPush: in-memory, per key -- bounds the stale-echo window.
+//   pending marker: per device (IndexedDB), set before the PUT and cleared once
+//   it lands, so a push that 503s still gets retried after a reload.
+const lastOwnPush = new Map();
+const pendingPushKey = (key) => `pending-${key}`;
+
+async function readPendingPush(key) {
+    try {
+        await openDB();
+        return (await getSetting(pendingPushKey(key))) ?? null;
+    } catch (e) {
+        logger.warn(`readPendingPush failed for ${key}:`, e);
+        return null;
+    }
+}
+
+// Remember `value` as the user's choice, then send it. KV first, machine second:
+// PUT /workflow can sit in Rea's request queue for 30s and come back 503
+// (decaid#634), and the store must still hold what the user asked for. Storing
+// after the PUT resolved left a window in which the workflow already held the
+// NEW value while the store held the OLD one, and the echoing shotSettings frame
+// read it as drift (see the stale-echo note in resync-policy.js).
+async function pushRemembered(key, value, send) {
+    await persistSharedValue(key, value);
+    lastOwnPush.set(key, { value, at: Date.now() });
+    await persistLastValue(pendingPushKey(key), value);
+    const result = await send();
+    lastOwnPush.set(key, { value, at: Date.now() });
+    persistLastValue(pendingPushKey(key), null);
+    return result;
+}
+
 export async function setTargetHotWaterVolume(volume) {
     const value = parseFloat(volume);
-    await persistSharedValue(HOT_WATER_VOLUME_LAST_VALUE_KEY, value);
-    return updateWorkflow({ hotWaterData: { volume: value } });
+    return pushRemembered(HOT_WATER_VOLUME_LAST_VALUE_KEY, value, () => updateWorkflow({ hotWaterData: { volume: value } }, 'api.hotWater'));
 }
 
 export async function setTargetHotWaterTemp(temp) {
     const value = parseFloat(temp);
-    await persistSharedValue(HOT_WATER_TEMP_LAST_VALUE_KEY, value);
-    return updateWorkflow({ hotWaterData: { targetTemperature: value } });
+    return pushRemembered(HOT_WATER_TEMP_LAST_VALUE_KEY, value, () => updateWorkflow({ hotWaterData: { targetTemperature: value } }, 'api.hotWater'));
 }
 
 export async function setTargetHotWaterDuration(duration) {
@@ -1611,7 +1869,7 @@ export async function setTargetHotWaterDuration(duration) {
         hotWaterData: {
             duration: parseFloat(duration)
         }
-    });
+    }, 'api.hotWater');
 }
 
 export async function setTargetSteamTemp(temp) {
@@ -1619,17 +1877,18 @@ export async function setTargetSteamTemp(temp) {
     // (Bengle); Decaid also reads anything below that range as off.
     const value = Math.round(parseFloat(temp));
     if (value > 0) await persistSharedValue(STEAM_TEMP_LAST_VALUE_KEY, value);
-    return updateWorkflow({ steamSettings: { targetTemperature: value } });
+    return updateWorkflow({ steamSettings: { targetTemperature: value } }, 'api.steamTemp');
 }
 
-// The heater half of a steam-duration change.
+// The steam-heater switch behind setSteamHeaterEnabled.
 //
-// Duration 0 is the dashboard's "steam off", but duration alone does not touch
-// the heater -- rest_v1.yml, SteamSettings.duration: "This does not control
-// steam-heater preheating." Only targetTemperature 0 does (same rule the DE1
+// The heater is switched off only by targetTemperature 0 (same rule the DE1
 // firmware path has always had: de1app binary.tcl zeroes the target below
-// 135C). So the duration setter carries the heater with it: off at 0, and back
-// to the last enabled temperature when the user re-arms steam.
+// 135C). Steam duration is a separate setting -- rest_v1.yml,
+// SteamSettings.duration: "This does not control steam-heater preheating" --
+// and 0 there means "no timer", so setTargetSteamDuration never calls this.
+// Off (argument 0) remembers the current temperature; on (anything else)
+// returns to it.
 //
 // The temperature to come back to is read from the workflow at the moment we
 // switch off -- one GET, only on that transition. With no remembered value the
@@ -1639,6 +1898,20 @@ async function steamHeaterFor(duration) {
         const current = (await getWorkflow().catch(() => null))?.steamSettings?.targetTemperature;
         if (current > 0) await persistSharedValue(STEAM_TEMP_LAST_VALUE_KEY, current);
         return { targetTemperature: 0 };
+    }
+    // Re-arm only from off. A temperature already above 0 was set by the user or
+    // another app since we last remembered one, and is not ours to put back (#143).
+    const current = (await getWorkflow().catch(() => null))?.steamSettings?.targetTemperature;
+    if (current > 0) return {};
+    // A selected DYE2 recipe that carries a steam temperature wins over the
+    // remembered one (same DYE2 gate as recipeHoldsDial in profileManager.js).
+    if (localStorage.getItem('streamline.dye2Enabled') === 'true') {
+        const [sel, recipes] = await Promise.all([
+            getKVValue(DYE2_KV_NAMESPACE, 'selection').catch(() => null),
+            getDye2KvArray('recipes').catch(() => null),
+        ]);
+        const recipeTemp = selectedRecipeSteamTemp(sel, recipes);
+        if (recipeTemp != null) return { targetTemperature: recipeTemp };
     }
     const remembered = await readSharedValue(STEAM_TEMP_LAST_VALUE_KEY);
     return remembered > 0 ? { targetTemperature: Math.round(remembered) } : {};
@@ -1654,38 +1927,29 @@ async function steamHeaterFor(duration) {
 export async function setTargetSteamDuration(duration) {
     if (isAutoSteamActive()) throw new Error('Use a pitcher preset in Auto mode, or switch to Flow or Time.');
     const value = parseFloat(duration);
-    await persistSharedValue(STEAM_DURATION_LAST_VALUE_KEY, value);
-    return updateWorkflow({ steamSettings: { duration: value, ...(await steamHeaterFor(value)) } });
+    return pushRemembered(STEAM_DURATION_LAST_VALUE_KEY, value, async () => updateWorkflow({ steamSettings: { duration: value } }, 'api.steamDuration'));
 }
 
 export function isAutoSteamActive() {
     return readAutoSteamSession(localStorage.getItem(AUTO_STEAM_SESSION_KEY)).active === true;
 }
 
-export async function getCalibrationHeaterTemperature() {
-    const saved = readAutoSteamSession(localStorage.getItem(AUTO_STEAM_SESSION_KEY));
-    const value = saved.active && saved.manual?.targetTemperature > 0
-        ? saved.manual.targetTemperature : await readSharedValue(STEAM_TEMP_LAST_VALUE_KEY);
-    return Number.isInteger(value) && value >= 135 && value <= 165 ? value : null;
-}
-
 export async function writeAutoSteamSettings(steam) {
-    return updateWorkflow({ steamSettings: clampAutoSteamSettings(steam) });
+    return updateWorkflow({ steamSettings: clampAutoSteamSettings(steam) }, 'api.autoSteam');
 }
 
 // Steam-heater switch for procedures that must not run against a hot steam
-// boiler (descaling). Same remember/restore rule as setTargetSteamDuration:
+// boiler (descaling) and for the Settings > Calibration > Steam toggle:
 // switching off stores the current target, switching back on returns to it.
 // The duration is deliberately untouched, so the user's steam time survives.
 export async function setSteamHeaterEnabled(enabled) {
-    return updateWorkflow({ steamSettings: await steamHeaterFor(enabled ? 1 : 0) });
+    return updateWorkflow({ steamSettings: await steamHeaterFor(enabled ? 1 : 0) }, 'api.steamHeater');
 }
 
 export async function setTargetSteamFlow(flow) {
     if (isAutoSteamActive()) throw new Error('Use a pitcher preset in Auto mode, or switch to Flow or Time.');
     const value = parseFloat(flow);
-    await persistSharedValue(STEAM_FLOW_LAST_VALUE_KEY, value);
-    return updateWorkflow({ steamSettings: { flow: value } });
+    return pushRemembered(STEAM_FLOW_LAST_VALUE_KEY, value, () => updateWorkflow({ steamSettings: { flow: value } }, 'api.steamFlow'));
 }
 
 // Re-push the remembered steam values wherever Rea's workflow record disagrees
@@ -1719,8 +1983,8 @@ export async function setStopAtTemperature(celsius) {
     // persisting it would erase the temperature they tuned; the armed/off
     // state itself is skin-local (streamline.steamStopMode), not a KV value.
     // KV first, machine second, for the same reason as setTargetSteamDuration.
-    if (value > 0) await persistSharedValue(MILK_STOP_LAST_VALUE_KEY, value);
-    return updateWorkflow({ steamSettings: { stopAtTemperature: value } });
+    const send = () => updateWorkflow({ steamSettings: { stopAtTemperature: value } }, 'api.steamStopAt');
+    return value > 0 ? pushRemembered(MILK_STOP_LAST_VALUE_KEY, value, send) : send();
 }
 
 export async function getReaSettings() {
@@ -1864,6 +2128,44 @@ export async function setLedStrip(state) {
 export async function commitLedStrip() {
     const response = await fetch(`${API_BASE_URL}/machine/ledStrip/commit`, { method: 'POST' });
     if (!response.ok) throw new Error(`Failed to commit LED strip (status ${response.status})`);
+    return true;
+}
+
+// Bengle live preview: lights the strips at a colour WITHOUT storing it. The
+// four stored palette registers are untouched, so GET /machine/ledStrip never
+// reports a preview back -- preview state belongs to the page, not the machine.
+// It is also the only way to show an asleep colour on an awake machine, since
+// firmware applies a stored colour only when the machine is already in that
+// state.
+//
+// 404 means the connected machine is not a Bengle. That is a capability answer,
+// not a failure, so it comes back as false for the caller to hide the control
+// rather than as a thrown error.
+//
+// Each colour is exactly 12 hex characters (16-bit RRRRGGGGBBBB); anything else
+// is rejected with 400 before a machine-write slot is taken. Callers debounce:
+// on firmware older than Bengle#114 the live registers are not yet PERM_RW, so
+// every changed frame is a flash write.
+export async function previewLedStrip(colours) {
+    const response = await fetch(`${API_BASE_URL}/machine/ledStrip/preview`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(colours),
+    });
+    if (response.status === 404) return false;
+    if (!response.ok) throw new Error(`Failed to preview LED strip (status ${response.status})`);
+    return true;
+}
+
+// End the preview and put the stored palette back. Without this a preview
+// stands until the next sleep/wake transition, so every exit seam owes one.
+// 503 is Decaid saying it could not read the stored palette back; there is
+// nothing to retry from here and the next transition settles it, so it is
+// reported as false rather than thrown.
+export async function clearLedStripPreview() {
+    const response = await fetch(`${API_BASE_URL}/machine/ledStrip/preview/clear`, { method: 'POST' });
+    if (response.status === 404 || response.status === 503) return false;
+    if (!response.ok) throw new Error(`Failed to clear LED strip preview (status ${response.status})`);
     return true;
 }
 
@@ -2147,6 +2449,15 @@ export async function getShotIds() {
     if (!response.ok) {
         throw new Error('Failed to get shot ids');
     }
+    return response.json();
+}
+
+// Newest shot's metadata (no measurements) -- cheap probe for "did a shot land
+// while we were away". Returns null when there is none or the server answers
+// non-OK; a network failure throws, so callers must catch.
+export async function getLatestShotSummary() {
+    const response = await fetch(`${API_BASE_URL}/shots/latest`);
+    if (!response.ok) return null;
     return response.json();
 }
 
@@ -2493,6 +2804,7 @@ function pluginEndpointError(pluginId, endpoint, status, errorBody) {
         : `Failed to call plugin endpoint ${pluginId}/${endpoint}. Status: ${status}${errorBody ? `, Body: ${errorBody}` : ''}`;
     const error = new Error(message);
     error.status = status;
+    error.endpoint = endpoint;
     if (typeof details?.code === 'string') error.code = details.code;
     return error;
 }
@@ -2523,24 +2835,6 @@ export async function callPluginEndpoint(pluginId, endpoint, body, method = 'POS
     }
 }
 
-export async function verifyVisualizerCredentials(username, password) {
-    try {
-        const response = await fetch(`${API_BASE_URL}/plugins/visualizer.reaplugin/verifyCredentials`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ username, password }),
-        });
-        if (!response.ok) {
-            throw new Error(`API Error: ${response.status}`);
-        }
-        const result = await response.json();
-        return result.valid;
-    } catch (error) {
-        logger.error('Failed to verify Visualizer credentials:', error);
-        return false; // Assume invalid on error
-    }
-}
-
 export async function getDisplayState() {
     try {
         const response = await fetch(`${API_BASE_URL}/display`);
@@ -2553,10 +2847,6 @@ export async function getDisplayState() {
         throw error;
     }
 }
-
-/** Brightness used while the machine sleeps when "screen off" is switched off.
- *  Dim enough to read as asleep, bright enough to see the screensaver. */
-const SAVER_BRIGHTNESS_DEFAULT = 10;
 
 /** Black screen saver: a full black cover at brightness 0 instead of the image
  *  screensaver. Mutually exclusive with it -- the settings toggles enforce that --
@@ -2575,8 +2865,27 @@ export function setBlackScreenSaver(enabled) {
     return !!enabled;
 }
 
+export function isCustomSaverBrightness() {
+    return localStorage.getItem(SAVER_BRIGHTNESS_CUSTOM_KEY) === 'true';
+}
+
+export function setCustomSaverBrightnessEnabled(enabled) {
+    localStorage.setItem(SAVER_BRIGHTNESS_CUSTOM_KEY, enabled ? 'true' : 'false');
+    return !!enabled;
+}
+
+export function setSaverBrightness(value) {
+    const level = resolveSaverBrightness({ custom: true, stored: value });
+    localStorage.setItem(SAVER_BRIGHTNESS_KEY, String(level));
+    return level;
+}
+
 export function getSaverBrightness() {
-    return isBlackScreenSaver() ? 0 : SAVER_BRIGHTNESS_DEFAULT;
+    if (isBlackScreenSaver()) return 0;
+    return resolveSaverBrightness(parseSaverBrightnessSetting(
+        localStorage.getItem(SAVER_BRIGHTNESS_CUSTOM_KEY),
+        localStorage.getItem(SAVER_BRIGHTNESS_KEY),
+    ));
 }
 
 export function dimDisplay() {
@@ -2588,6 +2897,10 @@ export function dimDisplay() {
         const current = lastDisplayState?.requestedBrightness;
         if (typeof current === 'number' && current !== getSaverBrightness()) {
             brightnessBeforeDim = current;
+        } else if (brightnessBeforeDim === null && lastRestoredBrightness !== null
+            && lastRestoredBrightness !== getSaverBrightness()) {
+            // restore -> quick re-dim: the socket has not echoed the restored level yet.
+            brightnessBeforeDim = lastRestoredBrightness;
         }
         sendDisplayCommand({
             command: 'setBrightness',
@@ -2607,10 +2920,12 @@ export function restoreDisplay() {
         // to its app_brightness setting for the same reason (de1plus/utils.tcl:496).
         // The remembered level is the fallback: it survives an app restart, where
         // the in-memory capture does not.
+        const level = brightnessBeforeDim ?? rememberedBrightness ?? 100;
         sendDisplayCommand({
             command: 'setBrightness',
-            brightness: brightnessBeforeDim ?? rememberedBrightness ?? 100
+            brightness: level
         });
+        lastRestoredBrightness = level;
         brightnessBeforeDim = null;
     } catch (error) {
         logger.error('Error restoring display:', error);
@@ -2956,17 +3271,6 @@ export async function getDecentAccountStatus() {
     return { loggedIn: !!body?.loggedIn };
 }
 
-export async function installPluginFromBranch(repo, branch = 'main') {
-    const response = await fetch(`${API_BASE_URL}/plugins/install/github-branch`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ repo, branch })
-    });
-    const body = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(body.error || `Failed to install ${repo}: ${response.status} ${response.statusText}`);
-    return body;
-}
-
 export async function installPluginFromRelease(repo, { assetName, includePrerelease } = {}) {
     const response = await fetch(`${API_BASE_URL}/plugins/install/github-release`, {
         method: 'POST',
@@ -3029,12 +3333,47 @@ export async function updateSkins() {
     return response.json();
 }
 
+// Decaid answers a refused or failed submission with a JSON body that says why
+// -- "Failed to create GitHub issue" when GitHub refused it, a connection
+// message when the tablet has no route to github.com, "You must be logged in to
+// your Decent account", "Feedback service is not configured". Throwing the
+// status alone turned every one of those into "Error: HTTP 500" on screen, which
+// told the user nothing and told us nothing either.
 export async function submitFeedback(payload) {
     const res = await fetch(`${API_BASE_URL}/feedback`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
     });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return res.json();
+    const body = await res.json().catch(() => null);
+    if (!res.ok || body?.success === false) {
+        const reason = body?.errorMessage || body?.message || body?.error;
+        const error = new Error(reason ? `${reason} (HTTP ${res.status})` : `HTTP ${res.status}`);
+        error.status = res.status;
+        throw error;
+    }
+    return body || {};
+}
+
+// Stream a Derek answer through Decaid's relay. Calls onEvent({event, data})
+// per SSE frame; resolves when the stream ends. Abort via `signal`.
+export async function streamDerekAnswer(query, onEvent, signal) {
+    const res = await fetch(`${API_BASE_URL}/derek/answers/stream`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query, include_documents: true, include_videos: true }),
+        signal,
+    });
+    if (!res.ok) throw new Error(`Derek HTTP ${res.status}`);
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const parsed = parseSse(buffer);
+        buffer = parsed.rest;
+        parsed.events.forEach(onEvent);
+    }
 }

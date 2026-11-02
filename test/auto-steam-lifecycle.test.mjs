@@ -97,4 +97,3 @@ test('a failed capability query visibly fails safe to manual', async () => {
     assert.equal(disabled, 1);
     assert.match(errors[0], /Using manual steam/);
 });
-

@@ -1,24 +1,33 @@
-import { pluginSettingsUrl } from '../src/modules/plugin-settings-navigation.js';
 import { readFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { pluginUiUrl as buildPluginUiUrl, isPluginSettingVisible, pluginViewModel, escapeHtml } from '../src/settings/plugin-view.js';
 
 // The Plugins settings page links each plugin to its own web UI. Decaid routes
 // /api/v1/plugins/<id>/<endpoint> from the manifest's api declarations, so a link
 // is only real when the manifest declares an http endpoint named "ui" -- anything
-// else 404s. settings.js can't be imported under node (browser globals), so the
-// function is lifted out of the source, as in settings-sync.test.mjs.
+// else 404s. URL construction is DOM-free and imported directly for testing.
 
 const source = readFileSync(new URL('../src/settings/settings.js', import.meta.url), 'utf8');
-const match = source.match(/^function pluginUiUrl\(plugin\) \{[\s\S]*?\r?\n\}/m);
-assert.ok(match, 'pluginUiUrl not found in settings.js');
-const pluginUiUrl = new Function('API_BASE_URL', 'pluginSettingsUrl', 'window', `${match[0]}\nreturn pluginUiUrl;`)('http://x:8080/api/v1', pluginSettingsUrl, { location: { href: 'http://x:43210/?page=settings' } });
+// escapeHtml is defined once, in the DOM-free plugin-view.js, and imported by
+// settings.js -- lift it from where it actually lives.
+const viewSource = readFileSync(new URL('../src/settings/plugin-view.js', import.meta.url), 'utf8');
+const pluginUiUrl = plugin => buildPluginUiUrl(plugin, 'http://x:8080/api/v1');
 
 test('a plugin declaring a ui endpoint gets a link to it', () => {
     assert.equal(
         pluginUiUrl({ id: 'settings.reaplugin', api: [{ id: 'ui', type: 'http', data: {} }] }),
         'http://x:8080/api/v1/plugins/settings.reaplugin/ui',
     );
+});
+
+test('an overlay link carries embed and theme, and no returnTo', () => {
+    const plugin = { id: 'p.reaplugin', api: [{ id: 'ui', type: 'http' }] };
+    assert.equal(
+        buildPluginUiUrl(plugin, 'http://x:8080/api/v1', 'http://skin/', { view: 'main', returnPage: null, embedTheme: 'light' }),
+        'http://x:8080/api/v1/plugins/p.reaplugin/ui?embed=1&theme=light&view=main',
+    );
+    assert.ok(buildPluginUiUrl(plugin, 'http://x:8080/api/v1', null, { embedTheme: 'nonsense' }).includes('theme=dark'));
 });
 
 test('the link is built off the configured bridge host, not a literal localhost', () => {
@@ -47,6 +56,43 @@ test('an id needing escaping stays intact in the path', () => {
     assert.equal(url, 'http://x:8080/api/v1/plugins/odd%20id.reaplugin/ui');
 });
 
+test('Open carries the complete settings route across skin and API ports', () => {
+    const plugin = { id: 'custom.reaplugin', api: [{ id: 'ui', type: 'http' }] };
+    const url = new URL(buildPluginUiUrl(plugin, 'http://localhost:8080/api/v1',
+        'http://localhost:24803/index.html?page=settings'));
+    assert.equal(url.origin, 'http://localhost:8080');
+    assert.equal(url.pathname, '/api/v1/plugins/custom.reaplugin/ui');
+    assert.equal(url.searchParams.get('returnTo'), 'http://localhost:24803/index.html?page=settings');
+});
+
+test('returnTo uses the settings route even if the router has not updated the address yet', () => {
+    const plugin = { id: 'custom.reaplugin', api: [{ id: 'ui', type: 'http' }] };
+    const url = new URL(buildPluginUiUrl(plugin, 'https://tablet.example/api/v1',
+        'https://tablet.example:8443/skins/streamline/index.html?mode=dark&page=index#position'));
+    assert.equal(url.searchParams.get('returnTo'),
+        'https://tablet.example:8443/skins/streamline/index.html?mode=dark&page=settings#position');
+    assert.deepEqual([...url.searchParams.keys()], ['returnTo']);
+});
+
+test('returnTo preserves a remote device address and safely encodes query delimiters', () => {
+    const plugin = { id: 'odd id.reaplugin', api: [{ id: 'ui', type: 'http' }] };
+    const current = 'http://192.168.1.20:24804/index.html?page=settings&label=A%26B';
+    const url = new URL(buildPluginUiUrl(plugin, 'http://192.168.1.20:8080/api/v1', current));
+    assert.equal(url.pathname, '/api/v1/plugins/odd%20id.reaplugin/ui');
+    assert.equal(url.searchParams.get('returnTo'), current);
+    assert.equal(url.searchParams.has('label'), false);
+});
+
+test('an invalid return address does not break the existing Open link', () => {
+    const plugin = { id: 'custom.reaplugin', api: [{ id: 'ui', type: 'http' }] };
+    for (const current of [undefined, '', 'invalid', 'javascript:alert(1)', 'http://name:password@host/']) {
+        assert.equal(buildPluginUiUrl(plugin, 'http://x:8080/api/v1', current),
+            'http://x:8080/api/v1/plugins/custom.reaplugin/ui');
+    }
+    assert.equal(buildPluginUiUrl({ id: 'bare.reaplugin' }, 'http://x:8080/api/v1',
+        'http://x:24803/?page=settings'), null);
+});
+
 // ── Shot Uploader controls are built from the plugin's manifest ──────────────
 //
 // The page used to hand-write its labels and its control list, so it could not
@@ -56,20 +102,21 @@ test('an id needing escaping stays intact in the path', () => {
 // declares, whichever version that is. The schema below is 0.2.1's.
 
 const shotUpload = (() => {
-    const lift = (re, name) => {
-        const m = source.match(re);
-        assert.ok(m, `${name} not found in settings.js`);
+    const lift = (re, name, from = source) => {
+        const m = from.match(re);
+        assert.ok(m, `${name} not found in source`);
         return m[0].replace('export ', '');
     };
     const body = [
-        lift(/function escapeHtml\(str\) \{[\s\S]*?\r?\n\}/, 'escapeHtml'),
+        lift(/export function escapeHtml\(str\) \{[\s\S]*?\r?\n\}/, 'escapeHtml', viewSource),
         lift(/export function pluginSettingLabel\(key\) \{[\s\S]*?\r?\n\}/, 'pluginSettingLabel'),
+        lift(/export function pluginSettingDisplayLabel\(key, schema\) \{[\s\S]*?\r?\n\}/, 'pluginSettingDisplayLabel'),
         lift(/export function renderPluginSettingControl\(key, schema, idPrefix = 'shotupload'\) \{[\s\S]*?\r?\n\}/, 'renderPluginSettingControl'),
     ].join('\n');
     // getTranslation is identity here: untranslated strings fall back to the
     // source string, so the manifest text is what reaches the page.
-    return new Function('getTranslation',
-        `${body}\nreturn { renderPluginSettingControl, pluginSettingLabel };`)(k => k);
+    return new Function('getTranslation', 'isPluginSettingVisible',
+        `${body}\nreturn { renderPluginSettingControl, pluginSettingLabel };`)(k => k, isPluginSettingVisible);
 })();
 
 // The manifest shot-upload 0.2.1 actually ships.
@@ -124,11 +171,64 @@ test('each declared type gets its own widget', () => {
     assert.match(num, /type="number" id="shotupload-setting-LengthThreshold"/);
 });
 
+test('an enum renders a closed list of the manifest values', () => {
+    // The API rejects a value outside `values`, so free text would let the page
+    // offer something the bridge refuses to store.
+    const html = shotUpload.renderPluginSettingControl('Roast', { type: 'enum', values: ['Light', 'Dark'] });
+    assert.match(html, /<select id="shotupload-setting-Roast"[^>]*data-setting-type="enum"/);
+    assert.match(html, /<option value="Light">Light<\/option>/);
+    assert.match(html, /<option value="Dark">Dark<\/option>/);
+});
+
+test('an enum missing its values list renders nothing rather than an empty menu', () => {
+    assert.equal(shotUpload.renderPluginSettingControl('Roast', { type: 'enum' }), '');
+});
+
 test('a type with no widget renders nothing rather than a broken control', () => {
     // The caller logs this, which is the prompt to add the widget. A half-drawn
     // control that silently discards writes would be worse than an absent one.
-    assert.equal(shotUpload.renderPluginSettingControl('Roast', { type: 'enum', values: ['Light'] }), '');
+    assert.equal(shotUpload.renderPluginSettingControl('Mystery', { type: 'colour' }), '');
     assert.equal(shotUpload.renderPluginSettingControl('Missing', undefined), '');
+});
+
+test('hidden fields render no input, label or help text for every supported type', () => {
+    for (const type of ['number', 'boolean', 'string', 'enum']) {
+        assert.equal(shotUpload.renderPluginSettingControl('Internal', {
+            type, values: ['a', 'b'], label: 'Internal state', description: 'Managed by custom UI', hidden: true,
+        }), '');
+    }
+    assert.equal(shotUpload.renderPluginSettingControl('Secret', {
+        type: 'string', secure: true, hidden: true,
+    }), '');
+    assert.match(shotUpload.renderPluginSettingControl('Visible', { type: 'number', hidden: false }),
+        /data-setting-key="Visible"/);
+});
+
+test("the manifest's own label wins over the name derived from the storage key", () => {
+    // PluginSettingSchema.label exists so a form can read "Upload shots
+    // automatically" instead of "AutoUpload".
+    const labelled = shotUpload.renderPluginSettingControl('AutoUpload', {
+        type: 'boolean', label: 'Upload shots automatically',
+    });
+    assert.match(labelled, /Upload shots automatically/);
+    assert.doesNotMatch(labelled, />Auto Upload</);
+});
+
+test('an absent, empty or whitespace label falls back to the split key', () => {
+    // The spec says clients fall back, so a manifest written before labels
+    // existed renders exactly as it did before.
+    for (const schema of [{ type: 'boolean' }, { type: 'boolean', label: '' }, { type: 'boolean', label: '   ' }]) {
+        assert.match(shotUpload.renderPluginSettingControl('AutoUpload', schema), />Auto Upload</);
+    }
+});
+
+test('a secure setting is typed apart from a plain string so its writes differ', () => {
+    // A secure value comes back as { isSet } and must never be assigned into
+    // the field or echoed back as the credential; the write path keys off this.
+    const secret = shotUpload.renderPluginSettingControl('Password', { type: 'string', secure: true });
+    const open = shotUpload.renderPluginSettingControl('ServerUrl', { type: 'string' });
+    assert.match(secret, /data-setting-type="secure"/);
+    assert.match(open, /data-setting-type="string"/);
 });
 
 test('a secure string is not rendered in the clear', () => {
@@ -167,6 +267,100 @@ const descMatch = source.match(/^function pluginDescription\(plugin\) \{[\s\S]*?
 assert.ok(descMatch, 'pluginDescription not found in settings.js');
 const pluginDescription = new Function(`${descMatch[0]}\nreturn pluginDescription;`)();
 
+test('a card with only custom-UI settings keeps Open, enable and version controls without raw fields', () => {
+    const match = source.match(/^function renderPluginCard\(pluginId, plugins, \{ asPage = false \} = \{\}\) \{[\s\S]*?\r?\n\}/m);
+    assert.ok(match, 'renderPluginCard not found');
+    const render = new Function('pluginCardOverride', 'pluginViewModel', 'getTranslation',
+        'pluginDescription', 'pluginUiUrl', 'API_BASE_URL', 'window', 'escapeHtml',
+        'renderPluginSettingControl', 'logger', `${match[0]}\nreturn renderPluginCard;`)(
+        () => ({}), pluginViewModel, k => k, pluginDescription, buildPluginUiUrl,
+        'http://localhost:8080/api/v1', { location: { href: 'http://localhost:24803/index.html?page=settings' } },
+        escapeHtml, shotUpload.renderPluginSettingControl, { warn() { assert.fail('hidden fields are not unsupported types'); } });
+    const plugin = {
+        id: 'custom.reaplugin', name: 'Custom settings', loaded: true,
+        api: [{ id: 'ui', type: 'http' }],
+        settings: { flowReadings: { type: 'string', hidden: true, default: '[]' } },
+    };
+    const html = render(plugin.id, [plugin], { asPage: true });
+    assert.match(html, /data-i18n-key="Open"/);
+    assert.match(html, /plugin-enable-toggle" checked/);
+    assert.match(html, /data-role="plugin-version-info"/);
+    assert.doesNotMatch(html, /flowReadings|data-setting-key/);
+    // Open is a button, not a link: a plugin whose skin answer declares
+    // `settingsOpen` gets a dialog over Settings instead of losing the page
+    // (issue #173). The URL rides on the element as the fallback target, and is
+    // still the full settings route, returnTo included.
+    assert.match(html, /<button type="button" data-role="plugin-open"/);
+    assert.doesNotMatch(html, /<a href="[^"]*plugins\/custom\.reaplugin\/ui/);
+    const fallbackUrl = html.match(/data-plugin-url="([^"]+)"/)[1].replace(/&amp;/g, '&');
+    assert.equal(new URL(fallbackUrl).searchParams.get('returnTo'),
+        'http://localhost:24803/index.html?page=settings');
+
+    plugin.settings.normal = { type: 'boolean', default: false };
+    assert.match(render(plugin.id, [plugin]), /data-setting-key="normal"/);
+});
+
+// ── What a tap on Open does ────────────────────────────────────────────────
+//
+// The declaration is read on the tap, not when the card is drawn: the list
+// draws a card per installed plugin, so reading every plugin's `skin` answer
+// to decide how to draw one button would cost a request per plugin. A plugin
+// that declares no `skin` endpoint is never asked, and any failure navigates.
+
+test('Open reads the declaration only from a loaded plugin that serves skin', () => {
+    const match = source.match(/^async function readSettingsOpen\(plugin\) \{[\s\S]*?\r?\n\}/m);
+    const declares = source.match(/^function declaresSkinEndpoint\(plugin\) \{[\s\S]*?\r?\n\}/m);
+    assert.ok(match && declares, 'readSettingsOpen not found');
+    const calls = [];
+    const read = new Function('callPluginEndpoint', 'parseSkinAnswer', 'logger', 'setTimeout',
+        `${declares[0]}\n${match[0]}\nreturn readSettingsOpen;`)(
+        (id, endpoint, body, method) => { calls.push([id, endpoint, method]); return Promise.resolve({ version: 1, surfaces: [], settingsOpen: { type: 'open', presentation: 'overlay' } }); },
+        answer => ({ settingsOpen: answer?.settingsOpen || null }),
+        { debug() {} }, () => 0);
+
+    const ui = [{ id: 'ui', type: 'http' }];
+    const skin = [{ id: 'ui', type: 'http' }, { id: 'skin', type: 'http' }];
+    return Promise.all([
+        read({ id: 'a.reaplugin', loaded: true, api: skin }),
+        read({ id: 'b.reaplugin', loaded: true, api: ui }),       // no skin endpoint
+        read({ id: 'c.reaplugin', loaded: false, api: skin }),    // not loaded
+        read(null),
+    ]).then(([withSkin, noSkin, notLoaded, none]) => {
+        assert.deepEqual(withSkin, { type: 'open', presentation: 'overlay' });
+        assert.equal(noSkin, null);
+        assert.equal(notLoaded, null);
+        assert.equal(none, null);
+        assert.deepEqual(calls, [['a.reaplugin', 'skin', 'GET']], 'only the plugin that serves skin is asked');
+    });
+});
+
+test('a skin read that fails or declares nothing leaves Open navigating', () => {
+    const match = source.match(/^async function readSettingsOpen\(plugin\) \{[\s\S]*?\r?\n\}/m);
+    const declares = source.match(/^function declaresSkinEndpoint\(plugin\) \{[\s\S]*?\r?\n\}/m);
+    const build = (answer) => new Function('callPluginEndpoint', 'parseSkinAnswer', 'logger', 'setTimeout',
+        `${declares[0]}\n${match[0]}\nreturn readSettingsOpen;`)(
+        () => (answer instanceof Error ? Promise.reject(answer) : Promise.resolve(answer)),
+        a => ({ settingsOpen: a?.settingsOpen || null }),
+        { debug() {} }, () => 0);
+    const plugin = { id: 'a.reaplugin', loaded: true, api: [{ id: 'skin', type: 'http' }] };
+    return Promise.all([
+        build(new Error('bridge down'))(plugin),
+        build({ version: 1, surfaces: [] })(plugin),
+        build(null)(plugin),
+    ]).then(results => assert.deepEqual(results, [null, null, null]));
+});
+
+test('the fallback and the overlay share one read, and the overlay is loaded lazily', () => {
+    const bind = source.match(/^function bindPluginOpenButton\(cardEl, plugin\) \{[\s\S]*?\r?\n\}/m);
+    assert.ok(bind, 'bindPluginOpenButton not found');
+    // No declaration: today's navigation, to the URL on the element.
+    assert.match(bind[0], /if \(!action\) \{\s*\r?\n\s*window\.location\.assign\(pageUrl\);/);
+    // The dashboard's overlay module is imported on demand: the settings page
+    // must not pull it in just to draw a card.
+    assert.match(bind[0], /await import\('\.\.\/modules\/plugin-overlay\.js'\)/);
+    assert.match(bind[0], /openPluginOverlay\(plugin, action, pageUrl/);
+});
+
 test('a bridge ui URL is dropped from the end of a description', () => {
     assert.equal(
         pluginDescription({ description: 'Shows settings in a page. http://localhost:8080/api/v1/plugins/settings.reaplugin/ui' }),
@@ -191,9 +385,162 @@ test('a missing description reads as empty, not "undefined"', () => {
     assert.equal(pluginDescription(null), '');
 });
 
-
-
-test('calculator Open button supplies the calling settings page as returnTo', () => {
-    const url = new URL(pluginUiUrl({ id: 'calibrated-steam.reaplugin', api: [{ id: 'ui', type: 'http' }] }));
-    assert.equal(url.searchParams.get('returnTo'), 'http://x:43210/?page=settings');
+test('plugin endpoint errors expose safe JSON messages and status metadata', () => {
+    const apiSource = readFileSync(new URL('../src/modules/api.js', import.meta.url), 'utf8');
+    const match = apiSource.match(/function pluginEndpointError\(pluginId, endpoint, status, errorBody\) \{[\s\S]*?\r?\n\}/);
+    assert.ok(match, 'pluginEndpointError not found in api.js');
+    const pluginEndpointError = new Function(`${match[0]}\nreturn pluginEndpointError;`)();
+    const error = pluginEndpointError('calibrated-steam.reaplugin', 'calculate', 422,
+        JSON.stringify({ code: 'invalid_milk_weight', message: 'Milk < 10 g · Medium pitcher' }));
+    assert.equal(error.message, 'Milk < 10 g · Medium pitcher');
+    assert.equal(error.status, 422);
+    assert.equal(error.code, 'invalid_milk_weight');
 });
+
+// ─── Update status: what the card is allowed to claim ───────────────────────
+//
+// The pill used to read "Up to date" for anything loaded with no pendingUpdate.
+// pendingUpdate only holds an update Decaid refused to auto-install because it
+// asks for new permissions, so that was "nothing is being held back" dressed up
+// as "nothing newer exists" — and for a local-folder install, which Decaid never
+// checks at all, it was simply false. (Real case: DYE2 0.1.8 from a folder,
+// claiming up to date while v0.1.11 was published.)
+import { pluginStatus, pluginStatusLabel, isManagedPluginSource, minutesSince,
+    shouldCheckPluginUpdates, PLUGIN_UPDATE_COOLDOWN_MS } from '../src/settings/plugin-view.js';
+
+const NOW = Date.parse('2026-09-22T12:00:00Z');
+const ago = ms => new Date(NOW - ms).toISOString();
+const tracked = (extra = {}) => ({ kind: 'github_release', repo: 'owner/repo', lastChecked: ago(60000), lastError: null, ...extra });
+const one = (plugin) => [{ id: 'p.reaplugin', loaded: true, source: null, pendingUpdate: null, ...plugin }];
+
+test('a checked, current plugin is the only thing called up to date', () => {
+    assert.equal(pluginStatus(one({ source: tracked() }), 'p.reaplugin'), 'enabled');
+    assert.equal(pluginStatusLabel('enabled'), 'Up to date');
+});
+
+test('a local install says it cannot be checked instead of claiming it is current', () => {
+    for (const kind of ['local_folder', 'local_zip']) {
+        assert.equal(pluginStatus(one({ source: { kind, repo: null } }), 'p.reaplugin'), 'untracked', kind);
+    }
+    assert.equal(pluginStatusLabel('untracked'), 'Cannot check for updates');
+});
+
+// A plugin with no source at all came with the app: Decaid's own settings,
+// visualizer, time-to-ready and friends have no repo of their own and move when
+// Decaid does. Calling that "cannot check for updates" reads as a fault when
+// nothing is wrong. The three bundled plugins that DO ship separately
+// (dye2, shot-upload, dcamp) get a real source seeded by Decaid, so they are
+// checkable and never land here.
+test('a plugin that ships with Decaid is not treated as a broken install', () => {
+    assert.equal(pluginStatus(one({ source: null }), 'p.reaplugin'), 'bundled');
+    assert.equal(pluginStatusLabel('bundled'), 'Ships with Decaid');
+});
+
+test('a plugin never checked yet does not claim to be current', () => {
+    assert.equal(pluginStatus(one({ source: tracked({ lastChecked: null }) }), 'p.reaplugin'), 'never-checked');
+    assert.equal(pluginStatus(one({ source: tracked({ lastChecked: 'not a date' }) }), 'p.reaplugin'), 'never-checked');
+});
+
+test('a failed check is reported, not swallowed behind an up-to-date pill', () => {
+    const rateLimited = tracked({ lastError: 'GitHub API 403: rate limit exceeded' });
+    assert.equal(pluginStatus(one({ source: rateLimited }), 'p.reaplugin'), 'check-failed');
+});
+
+test('the earlier states still win over the new ones', () => {
+    assert.equal(pluginStatus(null, 'p.reaplugin'), 'unreachable');
+    assert.equal(pluginStatus([], 'p.reaplugin'), 'not-installed');
+    assert.equal(pluginStatus(one({ loaded: false, source: tracked() }), 'p.reaplugin'), 'disabled');
+    assert.equal(pluginStatus(one({ source: tracked(), pendingUpdate: { version: '2.0.0' } }), 'p.reaplugin'), 'update-pending',
+        'a held-back update outranks how recently we checked');
+});
+
+test('only GitHub-backed sources are checkable', () => {
+    assert.equal(isManagedPluginSource({ kind: 'github_release' }), true);
+    assert.equal(isManagedPluginSource({ kind: 'github_branch' }), true);
+    assert.equal(isManagedPluginSource({ kind: 'local_folder' }), false);
+    assert.equal(isManagedPluginSource(null), false);
+});
+
+test('minutesSince floors, never goes negative, and admits when it does not know', () => {
+    assert.equal(minutesSince(ago(90 * 1000), NOW), 1);
+    assert.equal(minutesSince(new Date(NOW + 60000).toISOString(), NOW), 0, 'a clock skew is not negative minutes');
+    assert.equal(minutesSince(null, NOW), null);
+    assert.equal(minutesSince('whenever', NOW), null);
+});
+
+// ─── When opening the page is allowed to ask GitHub ─────────────────────────
+
+test('opening the page checks when a managed plugin is stale', () => {
+    const plugins = one({ source: tracked({ lastChecked: ago(PLUGIN_UPDATE_COOLDOWN_MS + 1000) }) });
+    assert.equal(shouldCheckPluginUpdates(plugins, { now: NOW, lastRunAt: null }), true);
+});
+
+test('a plugin Decaid checked moments ago is not re-checked', () => {
+    const plugins = one({ source: tracked({ lastChecked: ago(60 * 1000) }) });
+    assert.equal(shouldCheckPluginUpdates(plugins, { now: NOW, lastRunAt: null }), false);
+});
+
+test('a plugin never checked is reason enough to check', () => {
+    const plugins = one({ source: tracked({ lastChecked: null }) });
+    assert.equal(shouldCheckPluginUpdates(plugins, { now: NOW, lastRunAt: null }), true);
+});
+
+test('re-entering the page inside the cooldown does not ask again', () => {
+    const plugins = one({ source: tracked({ lastChecked: null }) });
+    assert.equal(shouldCheckPluginUpdates(plugins, { now: NOW, lastRunAt: NOW - 1000 }), false);
+    assert.equal(shouldCheckPluginUpdates(plugins, { now: NOW, lastRunAt: NOW - PLUGIN_UPDATE_COOLDOWN_MS - 1 }), true);
+});
+
+test('nothing checkable means no request at all', () => {
+    assert.equal(shouldCheckPluginUpdates([], { now: NOW }), false);
+    assert.equal(shouldCheckPluginUpdates(one({ source: { kind: 'local_folder' } }), { now: NOW }), false,
+        'a folder install can never answer, so asking only spends rate limit');
+    assert.equal(shouldCheckPluginUpdates(null, { now: NOW }), false);
+});
+
+test('a dashboard link returns to the dashboard and can select a plugin view', () => {
+    const plugin = { id: 'p.reaplugin', api: [{ id: 'ui', type: 'http' }] };
+    const base = 'http://x:8080/api/v1';
+    const url = new URL(buildPluginUiUrl(plugin, base, 'http://x:8044/?page=settings', { view: 'main', returnPage: null }));
+    assert.equal(url.searchParams.get('view'), 'main');
+    assert.equal(url.searchParams.get('returnTo'), 'http://x:8044/');
+    // The view still goes through when there is nothing safe to return to.
+    assert.equal(buildPluginUiUrl(plugin, base, 'javascript:alert(1)', { view: 'next' }), `${base}/plugins/p.reaplugin/ui?view=next`);
+});
+
+// ── Visualizer account gate ──────────────────────────────────────────────────
+// The manual "Upload to Visualizer" entry is offered only to a logged-in
+// account: the plugin owns the credentials, so its settings are the only test.
+{
+    const { visualizerAccountConfigured } = await import('../src/modules/visualizer-account.js');
+
+    test('a logged-in account is offered the upload', () => {
+        // Secure password: state only, never plaintext (decaid #588).
+        assert.equal(visualizerAccountConfigured({ Username: 'mark', Password: { isSet: true } }), true);
+        // Older decaid still answers with the string.
+        assert.equal(visualizerAccountConfigured({ Username: 'mark', Password: 'hunter2' }), true);
+    });
+
+    test('anything short of a working login is not', () => {
+        const cases = {
+            'no settings at all (plugin absent)': undefined,
+            'read failed': null,
+            'nothing configured': {},
+            'username only': { Username: 'mark' },
+            'password only': { Password: { isSet: true } },
+            'password field present but unset': { Username: 'mark', Password: { isSet: false } },
+            'empty password string': { Username: 'mark', Password: '' },
+            'empty username': { Username: '', Password: { isSet: true } },
+            'account switched off': { Username: 'mark', Password: { isSet: true }, Enabled: false },
+        };
+        for (const [why, settings] of Object.entries(cases)) {
+            assert.equal(visualizerAccountConfigured(settings), false, why);
+        }
+    });
+
+    test('Enabled is only disqualifying when explicitly false', () => {
+        // An older plugin manifest has no Enabled field; absence must not read as off.
+        assert.equal(visualizerAccountConfigured({ Username: 'm', Password: { isSet: true }, Enabled: undefined }), true);
+        assert.equal(visualizerAccountConfigured({ Username: 'm', Password: { isSet: true }, Enabled: true }), true);
+    });
+}

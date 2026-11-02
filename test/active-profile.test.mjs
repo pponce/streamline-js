@@ -48,7 +48,7 @@ test('the selector re-resolves a fallback selection from the workflow', async ()
     const source = readFileSync(new URL('../src/modules/profile_selector.js', import.meta.url), 'utf8');
 
     // The fallback (first row) is what marks the selection as untrustworthy.
-    assert.match(source, /selectionIsFallback = !initialItem;/);
+    assert.match(source, /selectionIsFallback = !initialKey;/);
 
     const correction = source.match(/if \(selectionIsFallback\) \{[\s\S]*?\n    \}/);
     assert.ok(correction, 'no workflow correction after the profiles land');
@@ -57,4 +57,24 @@ test('the selector re-resolves a fallback selection from the workflow', async ()
     // Re-selection goes through renderProfiles so the row highlight, the notes
     // and plotProfile() all move together.
     assert.match(correction[0], /selectedProfileKey = null;\s*\n\s*renderProfiles\(\);/);
+});
+
+// ── Superseded (hidden) versions must not be bound as the active profile ───
+test('a visible record outranks a hidden same-title record, whatever the order', () => {
+    const edited = {
+        'profile:old': { profile: { title: 'Mine' }, visibility: 'hidden' },
+        'profile:new': { profile: { title: 'Mine' }, visibility: 'visible' },
+    };
+    assert.equal(resolveProfileKeyByTitle(edited, 'Mine'), 'profile:new');
+    const reversed = { 'profile:new': edited['profile:new'], 'profile:old': edited['profile:old'] };
+    assert.equal(resolveProfileKeyByTitle(reversed, 'Mine'), 'profile:new');
+});
+
+test('visibility ranks above the non-default preference; hidden is the last resort', () => {
+    const recs = {
+        'profile:hf': { profile: { title: 'X' }, visibility: 'hidden' },
+        'profile:vd': { profile: { title: 'X' }, visibility: 'visible', isDefault: true },
+    };
+    assert.equal(resolveProfileKeyByTitle(recs, 'X'), 'profile:vd');
+    assert.equal(resolveProfileKeyByTitle({ 'profile:hf': recs['profile:hf'] }, 'X'), 'profile:hf');
 });

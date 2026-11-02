@@ -12,8 +12,11 @@ import {
     loadProfileOverrides,
     saveProfileOverride,
     clearProfileOverride,
+    removeProfileOverrideKeys,
+    ensureProfileOverridesLoaded,
     getProfileOverride,
     applyOverridesToRecords,
+    overrideMergeBase,
 } from '../src/modules/profile-overrides.js';
 
 function fakeKv(initial = {}) {
@@ -21,6 +24,12 @@ function fakeKv(initial = {}) {
     const calls = [];
     setKvClient({
         getKVAll: async (ns) => { calls.push(['getAll', ns]); return { ...store }; },
+        getKVValue: async (ns, key) => {
+            calls.push(['get', ns, key]);
+            const k = encodeURIComponent(key);
+            if (!(k in store)) throw new Error('KV getValue failed: 404');
+            return store[k];
+        },
         setKVValue: async (ns, key, value) => { calls.push(['set', ns, key, value]); store[encodeURIComponent(key)] = value; },
         deleteKVValue: async (ns, key) => { calls.push(['delete', ns, key]); delete store[encodeURIComponent(key)]; },
     });
@@ -95,6 +104,66 @@ test('a record with no metadata at all still gets its overrides', async () => {
     assert.deepEqual(records['profile:abc'].metadata, { targetYield: 36 });
 });
 
+// Regression: a write replaces the whole KV entry for that profile, so a page
+// that edits a profile without the main page's boot behind it (the profile
+// editor's flow calibration, for one) would have merged onto an empty map and
+// erased every number the profile already had.
+test('a write before the namespace is loaded keeps the values already in KV', async () => {
+    const kv = fakeKv({ 'profile%3Aabc': { targetSteamDuration: 10, targetSteamFlow: 0.8 } });
+    // deliberately NO loadProfileOverrides() first
+    const merged = await saveProfileOverride('profile:abc', { weightFlowMultiplier: 1.4 });
+    assert.deepEqual(merged, { targetSteamDuration: 10, targetSteamFlow: 0.8, weightFlowMultiplier: 1.4 });
+    assert.deepEqual(kv.store['profile%3Aabc'], merged);
+});
+
+test('the namespace is pulled in once, not on every write', async () => {
+    const kv = fakeKv();
+    await ensureProfileOverridesLoaded();
+    await ensureProfileOverridesLoaded();
+    await saveProfileOverride('profile:abc', { targetYield: 36 });
+    assert.equal(kv.calls.filter(c => c[0] === 'getAll').length, 1);
+});
+
+test('per-profile flow calibration is stored alongside the tile values', async () => {
+    const kv = fakeKv();
+    await loadProfileOverrides();
+    const saved = await saveProfileOverride('profile:abc', {
+        targetDoseWeight: 18, weightFlowMultiplier: 1.4, volumeFlowMultiplier: 0.5,
+    });
+    assert.deepEqual(saved, { targetDoseWeight: 18, weightFlowMultiplier: 1.4, volumeFlowMultiplier: 0.5 });
+    assert.deepEqual(kv.store['profile%3Aabc'], saved);
+});
+
+// Turning the editor's flow-calibration switch back off has to *remove* the
+// keys: saveProfileOverride merges, so writing them as undefined would leave
+// the old numbers in place and the profile would keep overriding the global.
+test('clearing one group of keys leaves the rest of the override alone', async () => {
+    const kv = fakeKv();
+    await loadProfileOverrides();
+    await saveProfileOverride('profile:abc', {
+        targetDoseWeight: 18, weightFlowMultiplier: 1.4, volumeFlowMultiplier: 0.5,
+    });
+    const left = await removeProfileOverrideKeys('profile:abc', ['weightFlowMultiplier', 'volumeFlowMultiplier']);
+    assert.deepEqual(left, { targetDoseWeight: 18 });
+    assert.deepEqual(kv.store['profile%3Aabc'], { targetDoseWeight: 18 });
+});
+
+test('removing the last key deletes the KV entry instead of storing an empty object', async () => {
+    const kv = fakeKv();
+    await loadProfileOverrides();
+    await saveProfileOverride('profile:abc', { weightFlowMultiplier: 1.4 });
+    await removeProfileOverrideKeys('profile:abc', ['weightFlowMultiplier', 'volumeFlowMultiplier']);
+    assert.equal(getProfileOverride('profile:abc'), null);
+    assert.deepEqual(kv.store, {});
+});
+
+test('removing keys from a profile that has no override is a no-op', async () => {
+    const kv = fakeKv();
+    await loadProfileOverrides();
+    assert.equal(await removeProfileOverrideKeys('profile:zzz', ['weightFlowMultiplier']), null);
+    assert.deepEqual(kv.calls.filter(c => c[0] !== 'getAll' && c[0] !== 'get'), []);
+});
+
 test('reset removes the override from KV and memory', async () => {
     const kv = fakeKv({ 'profile%3Aabc': { targetYield: 36 } });
     await loadProfileOverrides();
@@ -132,4 +201,71 @@ test('the full-screen numpad path for steam duration/flow saves the per-profile 
         'the numpad steam-duration branch must save its value as a per-profile override');
     assert.match(flowBranch, /saveContextToActiveProfile\?\.\(\{\s*targetSteamFlow:/,
         'the numpad steam-flow branch must save its value as a per-profile override');
+});
+
+// Another tablet saved a different field after this one booted: the write must
+// keep it and apply only the changed field.
+test('a save re-reads the stored override and keeps fields saved elsewhere', async () => {
+    const kv = fakeKv({ 'profile%3Aabc': { targetDoseWeight: 18 } });
+    await loadProfileOverrides();
+    kv.store['profile%3Aabc'] = { targetDoseWeight: 18, grinderSetting: '2.00' }; // other tablet
+    const merged = await saveProfileOverride('profile:abc', { targetYield: 36 });
+    assert.deepEqual(merged, { targetDoseWeight: 18, grinderSetting: '2.00', targetYield: 36 });
+    assert.deepEqual(kv.store['profile%3Aabc'], merged);
+});
+
+test('the changed field beats the remote value for that field only', async () => {
+    const kv = fakeKv({ 'profile%3Aabc': { targetDoseWeight: 18 } });
+    await loadProfileOverrides();
+    kv.store['profile%3Aabc'] = { targetDoseWeight: 19, grinderSetting: '2.00' };
+    const merged = await saveProfileOverride('profile:abc', { targetDoseWeight: 20 });
+    assert.deepEqual(merged, { targetDoseWeight: 20, grinderSetting: '2.00' });
+});
+
+test('an override removed elsewhere is not resurrected from the boot copy', async () => {
+    const kv = fakeKv({ 'profile%3Aabc': { targetDoseWeight: 18 } });
+    await loadProfileOverrides();
+    delete kv.store['profile%3Aabc'];
+    assert.deepEqual(await saveProfileOverride('profile:abc', { targetYield: 36 }), { targetYield: 36 });
+});
+
+test('a failed re-read falls back to the in-memory copy', async () => {
+    const kv = fakeKv({ 'profile%3Aabc': { targetDoseWeight: 18 } });
+    await loadProfileOverrides();
+    setKvClient({
+        getKVAll: async () => ({ 'profile%3Aabc': { targetDoseWeight: 18 } }),
+        getKVValue: async () => { throw new Error('KV getValue failed: 503'); },
+        setKVValue: async (ns, key, value) => { kv.store[encodeURIComponent(key)] = value; },
+    });
+    await loadProfileOverrides();
+    assert.deepEqual(await saveProfileOverride('profile:abc', { targetYield: 36 }), { targetDoseWeight: 18, targetYield: 36 });
+});
+
+test('overrideMergeBase: fresh read wins, local only when the read failed', () => {
+    assert.deepEqual(overrideMergeBase({ readOk: true, remote: { grinderSetting: '1' }, local: { targetYield: 9 } }), { grinderSetting: '1' });
+    assert.deepEqual(overrideMergeBase({ readOk: true, remote: null, local: { targetYield: 9 } }), {});
+    assert.deepEqual(overrideMergeBase({ readOk: false, local: { targetYield: 9 } }), { targetYield: 9 });
+    assert.deepEqual(overrideMergeBase({ readOk: false }), {});
+});
+
+test('two overlapping saves of different fields for one profile both survive', async () => {
+    const kv = fakeKv();
+    await loadProfileOverrides();
+    const store = kv.store;
+    let gets = 0;
+    setKvClient({
+        getKVAll: async () => ({}),
+        getKVValue: async (ns, key) => {
+            await new Promise(r => setTimeout(r, gets++ === 0 ? 20 : 0));
+            const k = encodeURIComponent(key);
+            if (!(k in store)) throw new Error('KV getValue failed: 404');
+            return store[k];
+        },
+        setKVValue: async (ns, key, value) => { store[encodeURIComponent(key)] = value; },
+    });
+    await Promise.all([
+        saveProfileOverride('profile:abc', { targetDoseWeight: 18 }),
+        saveProfileOverride('profile:abc', { targetYield: 36 }),
+    ]);
+    assert.deepEqual(store['profile%3Aabc'], { targetDoseWeight: 18, targetYield: 36 });
 });

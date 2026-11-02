@@ -1,17 +1,20 @@
 import * as chart from './chart.js';
 import { logger } from './logger.js';
-import { openDB, getLatestShotSummaries, getLatestCachedShotSummaries, getLatestCachedShot, getShot, addShot, addShots, deleteShot as idbDeleteShot, clearShots } from './idb.js';
-import { API_BASE_URL } from './api.js';
-import { createHistoryPager } from './history-pager.js';
+import { openDB, getLatestShotSummaries, getLatestCachedShotSummaries, getLatestCachedShot, getShot, addShot, addShots, deleteShot as idbDeleteShot, pruneShotsInRange, clearShots } from './idb.js';
+import { API_BASE_URL, getPlugins, getPluginSettings, callPluginEndpoint } from './api.js';
+import { createHistoryPager, isShotAlreadyDeleted } from './history-pager.js';
 import { renderPastShot, clearShotData } from './shotData.js';
 import { getTranslation } from './i18n.js';
 import { translateProfileTitle } from './profileManager.js';
 import { generateShotSummary } from './shotSummary.js';
 import { openContextMenu } from './context-menu.js';
 import { showToast, setupPressAndHold } from './ui.js';
-import { isVisualizerEnabled, uploadShotToVisualizer } from './visualizer.js';
-
-const DEREK_URL = 'https://derek.decentespresso.com/';
+import { pluginMenuEntries } from './plugin-menu-items.js';
+import { ASSISTED_DIALIN_PLUGIN_ID, findAssistedDialInPlugin, buildAssistedDialInUrl } from './assisted-dialin.js';
+import { openBeanScaleCaptureModal } from './bean-scale-modal.js';
+import { openBeanSelectionModal } from './bean-selection-modal.js';
+import { VISUALIZER_PLUGIN_ID, visualizerAccountConfigured } from './visualizer-account.js';
+import { openPluginOverlay, isDye2Enabled } from './dyeStrip.js';
 
 const PAGE_SIZE = 20;
 let shots = [];
@@ -86,13 +89,26 @@ const historyPager = createHistoryPager({
         return data;
     },
     fetchSummaryPage: (offset, limit) => getLatestShotSummaries(limit, offset),
-    fetchCachedPage: (offset, limit) => getLatestCachedShotSummaries(limit, offset)
+    fetchCachedPage: (offset, limit) => getLatestCachedShotSummaries(limit, offset),
+    pruneShots: pruneShotsInRange
 });
 
 function applyHistoryPage(page) {
     const selectedId = shots[currentShotIndex]?.id;
     shots = page.shots;
-    if (selectedId) currentShotIndex = shots.findIndex(shot => shot.id === selectedId);
+    if (selectedId) {
+        const index = shots.findIndex(shot => shot.id === selectedId);
+        if (index !== -1) {
+            currentShotIndex = index;
+        } else if (shots.length === 0) {
+            currentShotIndex = -1;
+        } else {
+            // Selected shot was pruned: land on the neighbour AND repaint it so
+            // the on-screen shot is the one Delete/edit act on.
+            currentShotIndex = Math.min(currentShotIndex, shots.length - 1);
+            displayShot(currentShotIndex).catch(error => logger.warn('Could not repaint neighbour shot:', error));
+        }
+    }
     historyHasMore = page.hasMore;
     page.errors.forEach(error => logger.warn('Could not load shot history source:', error));
 }
@@ -246,6 +262,35 @@ export function refreshCurrentShot() {
     }
 }
 
+// After DYE2's edit-shot page closes, bring just that shot up to date instead of
+// reloading the whole window (the user may be pages deep in history). A 404 is a
+// delete made there; anything else is the saved record, whose profile/dose/grind
+// this panel shows. Keeps the selected position, so returning lands where they left.
+export async function refreshShotAfterDye2Edit(id) {
+    if (!id) return;
+    const response = await fetch(`${API_BASE_URL}/shots/${id}`);
+    if (response.status === 404) {
+        await idbDeleteShot(id);
+        shots = historyPager.remove(id);
+        if (shots.length === 0) {
+            chart.clearChart();
+            clearShotData();
+            document.getElementById('history-prev-btn')?.classList.add('invisible');
+            document.getElementById('history-next-btn')?.classList.add('invisible');
+        } else {
+            await displayShot(Math.min(currentShotIndex, shots.length - 1));
+        }
+        return;
+    }
+    if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+    const updated = await response.json();
+    const index = shots.findIndex(shot => shot.id === id);
+    if (index === -1) return;
+    shots = historyPager.update({ ...shots[index], ...updated });
+    await addShots([shots.find(shot => shot.id === id)]);
+    await displayShot(shots.findIndex(shot => shot.id === id));
+}
+
 // Ensure the current shot has its measurements loaded (the list endpoint
 // strips them; the summary needs the full record).
 async function ensureCurrentShotMeasurements() {
@@ -278,8 +323,36 @@ async function copyText(text) {
     }
 }
 
-// Build the markdown summary of the displayed shot (loading measurements as
-// needed). Returns null and toasts if there's nothing to summarize.
+// Launch the plugin for the displayed shot. The plugin fetches the shot by ID
+// and owns analysis/feedback; Streamline only verifies the installed manifest.
+async function openAssistedDialIn(action, beanCapture = null) {
+    const shot = shots[currentShotIndex];
+    if (!shot?.id) {
+        showToast(getTranslation('No shot selected'), 2400, 'warning');
+        return;
+    }
+    try {
+        const plugins = await getPlugins();
+        const plugin = findAssistedDialInPlugin(plugins);
+        if (!plugin) {
+            showToast(getTranslation('Assisted dial-in plugin is not installed or enabled'), 4000, 'warning');
+            return;
+        }
+        const returnUrl = `${window.location.origin}${window.location.pathname}${window.location.search}`;
+        const url = buildAssistedDialInUrl(API_BASE_URL, plugin, {
+            shotId: shot.id,
+            action,
+            returnUrl,
+            beanCapture,
+        });
+        if (!url) throw new Error(`Invalid ${ASSISTED_DIALIN_PLUGIN_ID} manifest`);
+        window.location.href = url;
+    } catch (error) {
+        logger.warn('Assisted dial-in launch failed:', error);
+        showToast(getTranslation('Could not open assisted dial-in'), 4000, 'error');
+    }
+}
+
 async function buildCurrentShotSummary() {
     if (currentShotIndex < 0) { showToast(getTranslation('No shot selected'), 2400, 'warning'); return null; }
     const shot = await ensureCurrentShotMeasurements();
@@ -296,9 +369,48 @@ async function copyMd(md) {
 // setupPressAndHold helper (same one profile cards use). The nav arrows stop
 // their own press from bubbling so navigation taps still work.
 //
-// We build the summary up front so both actions act on a ready string: "Discuss
-// with Derek" is a link item (anchor) — the user's tap opens the OS browser with
-// the Derek URL (gh#384) and copies the summary on the same tap to paste.
+// Summary actions load measurements only when selected; plugin actions can open
+// directly from a selected shot even when its measurements are not cached.
+let dialInAvailable = false;
+function refreshDialInAvailability() {
+    getPlugins().then(plugins => { dialInAvailable = !!findAssistedDialInPlugin(plugins); });
+}
+
+// Manual Visualizer upload is offered only to someone actually logged in: the
+// plugin owns the account, so its own settings are the test. Same cached shape
+// as the dial-in flag above, so the menu never waits on a request to open.
+let visualizerLoggedIn = false;
+function refreshVisualizerAvailability() {
+    getPluginSettings(VISUALIZER_PLUGIN_ID)
+        .then(settings => { visualizerLoggedIn = visualizerAccountConfigured(settings); })
+        .catch(() => { visualizerLoggedIn = false; }); // not installed, or unreachable
+}
+
+// The four text lines are the only tap target: DYE2's edit page opens from them, while
+// the block around them is layout and the arrows keep their own buttons.
+const SHOT_HISTORY_EDIT_TAP_SELECTOR =
+    '#history-date, #history-profile-name, #history-dose-in, #history-grind-size';
+
+// Tap a shot-history text line -> DYE2's edit-shot page for the shot on screen.
+// Gated on the DYE2 master switch, so with DYE2 off the panel keeps its long-press
+// menu only. DYE2 saves/deletes and comes back through the overlay's `return` URL;
+// the close hook then repaints this panel with whatever actually landed on the bridge.
+function openShotInDye2() {
+    if (!isDye2Enabled()) return;
+    const shot = shots[currentShotIndex];
+    if (!shot?.id) {
+        showToast(getTranslation('No shot selected'), 2400, 'warning');
+        return;
+    }
+    openPluginOverlay('edit-shot', { shotId: shot.id }, (refresh, editedShotId) => {
+        if (!refresh) return;
+        // DYE2 hands back the shot it was showing on the way out: the arrows may have
+        // moved it off the one we opened, so refresh that row, not our opening shot.
+        refreshShotAfterDye2Edit(editedShotId || shot.id).catch(error =>
+            logger.warn('Could not repaint the shot after editing it in DYE2:', error));
+    });
+}
+
 function setupHistoryLongPress() {
     const panel = document.getElementById('shot-history-panel');
     if (!panel) return;
@@ -312,39 +424,89 @@ function setupHistoryLongPress() {
             btn?.addEventListener(ev, (e) => e.stopPropagation()));
     });
 
-    setupPressAndHold(panel, () => {}, async () => {
-        const md = await buildCurrentShotSummary();
-        if (md == null) return;
+    refreshDialInAvailability();
+    refreshVisualizerAvailability();
+    setupPressAndHold(panel, (event) => {
+        // Only the four info lines open DYE2: an arrow tap bubbles here too, and the
+        // block's own padding is not a control. A long press is swallowed by
+        // setupPressAndHold.
+        if (!event?.target?.closest?.(SHOT_HISTORY_EDIT_TAP_SELECTOR)) return;
+        openShotInDye2();
+    }, () => {
+        // Dial-in entries only appear when the plugin is installed and loaded, so
+        // nobody taps one just to get a "not installed" toast. Uses the cached
+        // answer so the menu opens instantly; the refresh catches installs for next time.
+        const hasDialIn = dialInAvailable;
+        const canUpload = visualizerLoggedIn;
+        refreshDialInAvailability();
+        refreshVisualizerAvailability();
         const items = [
-            { label: getTranslation('Discuss with Derek'), href: DEREK_URL, onSelect: () => copyMd(md) },
-            { label: getTranslation('Copy Shot Summary'), onSelect: () => copyMd(md) },
+            {
+                label: getTranslation('Discuss with Derek'),
+                onSelect: async () => {
+                    const md = await buildCurrentShotSummary();
+                    if (md != null) import('./derek-modal.js').then((m) => m.openDerekModal(md, { onOpenExternal: () => copyMd(md) }));
+                },
+            },
+            {
+                label: getTranslation('Copy Shot Summary'),
+                onSelect: async () => {
+                    const md = await buildCurrentShotSummary();
+                    if (md != null) copyMd(md);
+                },
+            },
         ];
-        // Manual upload: the one on screen, whichever the user has paged to.
-        // Offered whenever Visualizer is switched on — with auto-upload off this
-        // is the only way up, and with it on it re-sends a shot that was missed.
-        if (isVisualizerEnabled()) {
+        if (hasDialIn) {
+            items.push(
+                {
+                    label: getTranslation('Select coffee batch for next shot'),
+                    onSelect: () => openBeanSelectionModal({
+                        onSaved: () => showToast(getTranslation('Coffee for next shot updated'), 2400, 'success'),
+                    }).catch(error => {
+                        logger.warn('Coffee batch selection failed:', error);
+                        showToast(getTranslation('Could not open coffee selection'), 4000, 'error');
+                    }),
+                },
+                { label: getTranslation('Assisted dial-in analysis'), onSelect: () => openAssistedDialIn('analyze') },
+                { label: getTranslation('Assisted dial-in feedback'), onSelect: () => openAssistedDialIn('feedback') },
+                {
+                    label: getTranslation('Capture bean weight'),
+                    onSelect: () => openBeanScaleCaptureModal({
+                        onCapture: capture => openAssistedDialIn('feedback', capture),
+                    }).catch(error => {
+                        logger.warn('Bean scale capture failed:', error);
+                        showToast(getTranslation('Could not open bean scale capture'), 4000, 'error');
+                    }),
+                },
+            );
+        }
+        // Only for an account that logged in: without one the upload can only fail
+        // with a credentials error, and the plugin's settings already say so.
+        if (canUpload) {
             items.push({
                 label: getTranslation('Upload to Visualizer'),
                 onSelect: () => uploadCurrentShotToVisualizer(),
             });
         }
+        // Entries plugins add (kind `menu-item`, menu `shot-history`) for the shot on screen.
+        const shotId = shots[currentShotIndex]?.id;
+        if (shotId) items.push(...pluginMenuEntries('shot-history', { shotId: String(shotId) }));
         openContextMenu(panel, items);
     });
 }
 
-// Upload the shot on screen. The plugin fetches it from Decaid by id, so the
-// measurements do not have to be loaded here.
+// Upload the shot on screen now, whatever the plugin's auto-upload setting is.
+// The plugin fetches the shot from Decaid by id and pushes it on; its own error
+// message (too short, offline, credentials) is what the user sees.
 async function uploadCurrentShotToVisualizer() {
     const shot = shots[currentShotIndex];
-    if (!shot?.id) { showToast(getTranslation('No shot selected'), 2400, 'warning'); return; }
+    if (!shot?.id) return;
     showToast(getTranslation('Uploading to Visualizer…'), 2000, 'info');
     try {
-        await uploadShotToVisualizer(shot.id);
+        await callPluginEndpoint(VISUALIZER_PLUGIN_ID, 'upload', { shotId: shot.id });
         showToast(getTranslation('Shot uploaded to Visualizer'), 2400, 'success');
     } catch (error) {
         logger.warn('Manual Visualizer upload failed:', error);
-        // The plugin's own reason is the useful part: too short, bad credentials,
-        // offline. It arrives inside the api.js wrapper's message.
         showToast(`${getTranslation('Upload to Visualizer failed')}: ${error.message}`, 4000, 'error');
     }
 }
@@ -411,7 +573,16 @@ export function getNewestShotId() {
 // A single fixed-delay reload races that write and silently shows the previous
 // shot. Poll the list until a shot newer than `knownNewestId` appears, then
 // render it. ponytail: fixed retry budget, not a server-side watcher.
-export async function refreshToNewestShot(knownNewestId, tries = 6, intervalMs = 2000, expectedId = null) {
+let newestRefreshInFlight = null;
+
+export function refreshToNewestShot(knownNewestId, tries = 6, intervalMs = 2000, expectedId = null) {
+    if (newestRefreshInFlight) return newestRefreshInFlight;
+    newestRefreshInFlight = runRefreshToNewestShot(knownNewestId, tries, intervalMs, expectedId)
+        .finally(() => { newestRefreshInFlight = null; });
+    return newestRefreshInFlight;
+}
+
+async function runRefreshToNewestShot(knownNewestId, tries, intervalMs, expectedId) {
     for (let i = 0; i < tries; i++) {
         await loadShotHistory();
         // Success = the expected shot id is on top (exact, from the shotState
@@ -470,7 +641,7 @@ export async function updateShot(id, updates) {
 export async function deleteCurrentShot() {
     const shot = shots[currentShotIndex];
     const response = await fetch(`${API_BASE_URL}/shots/${shot.id}`, { method: 'DELETE' });
-    if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+    if (!response.ok && !isShotAlreadyDeleted(response.status)) throw new Error(`HTTP error! status: ${response.status}`);
     await idbDeleteShot(shot.id);
     shots = historyPager.remove(shot.id);
     if (shots.length === 0) {

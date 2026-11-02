@@ -28,4 +28,3 @@ export function clampAutoSteamSettings(steam) {
         ...(stopAtTemperature === undefined ? {} : { stopAtTemperature }),
     };
 }
-

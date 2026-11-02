@@ -30,4 +30,3 @@ test('Auto is added only by the capability query result', () => {
     assert.deepEqual(steamModeCycle({ autoAvailable: queryAutoSteamCapability([compatible]).available }), ['time', 'auto', 'flow']);
     assert.deepEqual(steamModeCycle({ autoAvailable: true, milkAvailable: true }), ['temperature', 'auto', 'flow']);
 });
-

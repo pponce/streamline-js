@@ -28,7 +28,7 @@ const SETTINGS_TREE = Object.freeze(
 
 const CATEGORY_LOADERS = Object.freeze({
     quickadjustments: () => import('./categories/quick-adjustments.js'),
-    bluetooth: () => import('./categories/legacy-category.js'),
+    bluetooth: () => import('./categories/connections.js'),
     calibration: () => import('./categories/legacy-category.js'),
     machine: () => import('./categories/legacy-category.js'),
     maintenance: () => import('./categories/maintenance.js'),
@@ -110,9 +110,7 @@ async function renderCategory(mainCategory, category) {
     if (!content) return;
     const sequence = ++renderSequence;
     try {
-        const module = category === 'autosteam'
-            ? await import('./categories/auto-steam.js')
-            : await CATEGORY_LOADERS[mainCategory]();
+        const module = await CATEGORY_LOADERS[mainCategory]();
         if (sequence !== renderSequence) return;
         currentCleanup = await module.mountSettingsCategory({
             container: content,
@@ -124,7 +122,7 @@ async function renderCategory(mainCategory, category) {
         });
     } catch (error) {
         if (sequence !== renderSequence) return;
-        content.innerHTML = `<div class="flex flex-col items-center justify-center h-full gap-[24px]" role="alert"><p class="text-red-500 text-[24px]">Failed to load settings</p><button type="button" data-retry-category class="bg-[#385a92] h-[72px] px-[48px] rounded-[10px] text-white text-[24px] font-bold">Retry</button></div>`;
+        content.innerHTML = `<div class="flex flex-col items-center justify-center h-full gap-[24px]" role="alert"><p class="text-red-500 text-[24px]">Failed to load settings</p><button type="button" data-retry-category class="bg-[var(--button-primary-bg)] h-[72px] px-[48px] rounded-[10px] text-white text-[24px] font-bold">Retry</button></div>`;
         content.querySelector('[data-retry-category]')?.addEventListener('click', () => renderCategory(mainCategory, category), { once: true });
     }
 }
